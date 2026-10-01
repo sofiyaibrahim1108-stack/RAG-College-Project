@@ -4,8 +4,7 @@ import {
   Square,
   Paperclip,
   Cloud,
-  Sparkles,
-  Loader2
+  Sparkles
 } from "lucide-react";
 import { useChat } from "../../context/ChatContext";
 
@@ -14,7 +13,6 @@ export function ChatInput() {
     sendMessage,
     isStreaming,
     stopGeneration,
-    streamStatusText,
     setShowUploadModal,
     setShowDriveModal
   } = useChat();
@@ -77,14 +75,6 @@ export function ChatInput() {
       {isDragging && (
         <div className="mb-2 p-3 bg-blue-500/10 border-2 border-dashed border-blue-500 rounded-2xl text-center text-xs text-blue-600 dark:text-blue-400 font-medium animate-pulse">
           Drop PDF, DOC, DOCX, TXT, CSV, XLS, XLSX, PPT, PPTX, MD, JSON, HTML, or XML file here
-        </div>
-      )}
-
-      {/* Dynamic retrieval status indicator */}
-      {isStreaming && streamStatusText && (
-        <div className="mb-2 flex items-center justify-center space-x-2 text-xs text-blue-600 dark:text-blue-400 animate-pulse">
-          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-          <span>{streamStatusText}</span>
         </div>
       )}
 

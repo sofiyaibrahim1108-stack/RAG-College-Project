@@ -7,7 +7,7 @@ let activeBaseUrl = ENV.SIGLIP_SERVICE_URL;
 async function requestWithFallback(method, path, data, options = {}) {
   const candidateUrls = [
     activeBaseUrl,
-    activeBaseUrl.includes("5001") ? "http://127.0.0.1:8000" : "http://127.0.0.1:5001"
+    "http://127.0.0.1:8000"
   ];
   // Deduplicate
   const uniqueUrls = [...new Set(candidateUrls)];

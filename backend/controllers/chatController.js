@@ -1,4 +1,4 @@
-import { ragGraph } from "../graph/ragGraph.js";
+import { ragGraph, isVisualQuery } from "../graph/ragGraph.js";
 import { Message } from "../models/Message.js";
 import { Conversation } from "../models/Conversation.js";
 import { routeDepartment } from "../services/router.js";
@@ -38,10 +38,10 @@ export async function askQuestion(req, res) {
       timings: result.timings
     });
   } catch (error) {
-    console.error(`[ChatController Error] ${error.message}`);
+    console.error(`[ChatController Error] ${error.stack || error.message}`);
     res.status(500).json({
       success: false,
-      error: error.message,
+      error: "An unexpected error occurred while processing your request.",
       fallbackAnswer: "An unexpected error occurred while processing your request."
     });
   }
@@ -90,7 +90,7 @@ export async function askQuestionStream(req, res) {
 
     // 2. Department Router
     const tRouter = Date.now();
-    sendEvent("status", { message: "Routing to domain expertise..." });
+    sendEvent("status", { message: "Searching your documents..." });
     const routeResult = await routeDepartment(question, history);
     timings.router = Date.now() - tRouter;
     sendEvent("routed", {
@@ -101,31 +101,40 @@ export async function askQuestionStream(req, res) {
 
     // 3. Text Embedding & Retrieval
     const tEmb = Date.now();
-    sendEvent("status", { message: "Generating embeddings..." });
     const textEmb = await generateTextEmbedding(question);
     timings.textEmbedding = Date.now() - tEmb;
 
     const tRet = Date.now();
-    sendEvent("status", { message: "Retrieving relevant knowledge excerpts..." });
-    const textChunks = await retrieveRelevantTextChunks(textEmb, routeResult.departments);
+    const textChunks = await retrieveRelevantTextChunks(
+      textEmb,
+      routeResult.departments,
+      undefined,
+      undefined,
+      question
+    );
     timings.textRetrieval = Date.now() - tRet;
     const sources = formatSources(textChunks);
 
-    // 4. Image Embedding & Retrieval via SigLIP2
-    const tSiglip = Date.now();
-    sendEvent("status", { message: "Searching relevant visual diagrams..." });
+    // 4. Image Embedding & Retrieval via SigLIP2 (only for queries with visual/diagram intent)
     let images = [];
     let imageCitations = [];
-    try {
-      const siglipEmb = await siglipClient.embedText(question);
-      timings.siglipEmbedding = Date.now() - tSiglip;
+    if (isVisualQuery(question)) {
+      const tSiglip = Date.now();
+      sendEvent("status", { message: "Searching visual diagrams..." });
+      try {
+        const siglipEmb = await siglipClient.embedText(question);
+        timings.siglipEmbedding = Date.now() - tSiglip;
 
-      const tImgRet = Date.now();
-      images = await retrieveRelevantImages(siglipEmb, routeResult.departments);
-      timings.imageRetrieval = Date.now() - tImgRet;
-      imageCitations = formatImageCitations(images);
-    } catch (e) {
-      console.warn(`[Stream SigLIP notice] ${e.message}`);
+        const tImgRet = Date.now();
+        images = await retrieveRelevantImages(siglipEmb, routeResult.departments);
+        timings.imageRetrieval = Date.now() - tImgRet;
+        imageCitations = formatImageCitations(images);
+      } catch (e) {
+        console.warn(`[Stream SigLIP notice] ${e.message}`);
+      }
+    } else {
+      timings.siglipEmbedding = 0;
+      timings.imageRetrieval = 0;
     }
 
     // 5. Build context
@@ -134,16 +143,44 @@ export async function askQuestionStream(req, res) {
     timings.contextBuilder = Date.now() - tCtx;
 
     // 6. Stream LLM answer
-    sendEvent("status", { message: "Formulating grounded response..." });
-    const tLLM = Date.now();
     let fullAnswer = "";
+    let finalSources = sources;
+    let finalImageCitations = imageCitations;
 
-    await streamAnswer(question, context.contextPrompt, history, (token) => {
-      fullAnswer += token;
-      sendEvent("token", { token });
-    });
-    timings.llm = Date.now() - tLLM;
+    if (context.contextPrompt === "NO_DOCUMENTS_FOUND" || (textChunks.length === 0 && images.length === 0)) {
+      fullAnswer = "I don't have enough information.";
+      sendEvent("token", { token: fullAnswer });
+      timings.llm = 0;
+      finalSources = [];
+      finalImageCitations = [];
+    } else {
+      sendEvent("status", { message: "Generating grounded response..." });
+      const tLLM = Date.now();
+
+      await streamAnswer(question, context.contextPrompt, history, (token) => {
+        fullAnswer += token;
+        sendEvent("token", { token });
+      });
+      timings.llm = Date.now() - tLLM;
+
+      if (!fullAnswer || fullAnswer.trim().startsWith("I don't have enough information")) {
+        fullAnswer = "I don't have enough information.";
+        finalSources = [];
+        finalImageCitations = [];
+      }
+    }
+
     timings.total = Date.now() - tTotal;
+
+    console.log(`[Timing]`);
+    console.log(`Department Router: ${timings.router ?? 0} ms`);
+    console.log(`Text Embedding: ${timings.textEmbedding ?? 0} ms`);
+    console.log(`Text Retrieval: ${timings.textRetrieval ?? 0} ms`);
+    console.log(`Image Embedding: ${timings.siglipEmbedding ?? 0} ms`);
+    console.log(`Image Retrieval: ${timings.imageRetrieval ?? 0} ms`);
+    console.log(`Context Building: ${timings.contextBuilder ?? 0} ms`);
+    console.log(`LLM Generation: ${timings.llm ?? 0} ms`);
+    console.log(`Total: ${timings.total ?? 0} ms`);
 
     // 7. Save conversation
     await Message.create({
@@ -157,8 +194,8 @@ export async function askQuestionStream(req, res) {
       role: "assistant",
       content: fullAnswer,
       routedDepartments: routeResult.departments,
-      sources,
-      images: imageCitations,
+      sources: finalSources,
+      images: finalImageCitations,
       timings
     });
 
@@ -168,15 +205,15 @@ export async function askQuestionStream(req, res) {
     sendEvent("complete", {
       messageId: assistantMsg._id,
       answer: fullAnswer,
-      sources,
-      images: imageCitations,
+      sources: finalSources,
+      images: finalImageCitations,
       timings
     });
 
     res.end();
   } catch (error) {
-    console.error(`[askQuestionStream error] ${error.message}`);
-    sendEvent("error", { message: error.message });
+    console.error(`[askQuestionStream error] ${error.stack || error.message}`);
+    sendEvent("error", { message: "An unexpected error occurred while processing your request." });
     res.end();
   }
 }

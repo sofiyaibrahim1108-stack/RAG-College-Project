@@ -7,8 +7,7 @@ import { processDocument } from "./documentProcessor.js";
 
 // Scopes required for Google Drive browsing and downloading
 const SCOPES = [
-  "https://www.googleapis.com/auth/drive.readonly",
-  "https://www.googleapis.com/auth/userinfo.profile"
+  "https://www.googleapis.com/auth/drive.readonly"
 ];
 
 export class DriveService {

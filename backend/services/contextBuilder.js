@@ -16,11 +16,20 @@ export function buildRAGContext(textChunks = [], images = []) {
   // 1. Text chunks section
   if (textChunks.length > 0) {
     contextSections.push("=== DOCUMENT EXCERPTS ===");
-    textChunks.forEach((chunk, index) => {
+    const seenContents = new Set();
+    let sourceIndex = 1;
+
+    textChunks.forEach((chunk) => {
+      const cleanContent = (chunk.content || "").trim();
+      if (!cleanContent) return;
+      if (seenContents.has(cleanContent)) return;
+      seenContents.add(cleanContent);
+
       const pageInfo = chunk.pageNumber ? ` (Page ${chunk.pageNumber})` : "";
       contextSections.push(
-        `[Source ${index + 1}]: ${chunk.documentName}${pageInfo}\n${chunk.content.trim()}`
+        `[Source ${sourceIndex}]: ${chunk.documentName}${pageInfo}\n${cleanContent}`
       );
+      sourceIndex++;
     });
   }
 

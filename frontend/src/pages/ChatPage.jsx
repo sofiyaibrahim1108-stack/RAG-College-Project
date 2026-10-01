@@ -36,9 +36,11 @@ export function ChatPage() {
   // Auto-scroll to bottom on new messages
   useEffect(() => {
     if (!showScrollBottom) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      messagesEndRef.current?.scrollIntoView({
+        behavior: isStreaming ? "auto" : "smooth"
+      });
     }
-  }, [messages, showScrollBottom]);
+  }, [messages, showScrollBottom, isStreaming]);
 
   function handleScroll() {
     if (containerRef.current) {

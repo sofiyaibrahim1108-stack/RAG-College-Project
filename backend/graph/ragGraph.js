@@ -94,7 +94,13 @@ async function textEmbeddingNode(state) {
 async function textRetrievalNode(state) {
   const t0 = Date.now();
   try {
-    const chunks = await retrieveRelevantTextChunks(state.queryEmbedding, state.routedDepartments);
+    const chunks = await retrieveRelevantTextChunks(
+      state.queryEmbedding,
+      state.routedDepartments,
+      undefined,
+      undefined,
+      state.question
+    );
     const duration = Date.now() - t0;
     console.log(`[Timing] Text Retrieval: ${duration} ms`);
 
@@ -114,9 +120,25 @@ async function textRetrievalNode(state) {
 }
 
 /**
+ * Determines whether a query has visual/diagram intent to avoid unnecessary SigLIP calls
+ */
+export function isVisualQuery(question) {
+  if (!question) return false;
+  const visualRegex = /\b(diagram|diagrams|figure|figures|image|images|screenshot|screenshots|picture|pictures|flowchart|flowcharts|architecture|chart|charts|graph|graphs|illustration|illustrations|photo|photos|drawing|drawings|visual|visuals|blueprint|map|layout)\b/i;
+  return visualRegex.test(question);
+}
+
+/**
  * 5. Node: imageEmbedding
  */
 async function imageEmbeddingNode(state) {
+  if (!isVisualQuery(state.question)) {
+    return {
+      siglipQueryEmbedding: [],
+      timings: { siglipEmbedding: 0 }
+    };
+  }
+
   const t0 = Date.now();
   try {
     const siglipEmb = await siglipClient.embedText(state.question);
@@ -140,6 +162,14 @@ async function imageEmbeddingNode(state) {
  * 6. Node: imageRetrieval
  */
 async function imageRetrievalNode(state) {
+  if (!state.siglipQueryEmbedding || state.siglipQueryEmbedding.length === 0) {
+    return {
+      retrievedImages: [],
+      imageCitations: [],
+      timings: { imageRetrieval: 0 }
+    };
+  }
+
   const t0 = Date.now();
   try {
     const images = await retrieveRelevantImages(state.siglipQueryEmbedding, state.routedDepartments);
@@ -181,6 +211,18 @@ async function contextBuilderNode(state) {
  */
 async function generateAnswerNode(state) {
   const t0 = Date.now();
+
+  // If no relevant documents were found, return the exact fallback immediately without calling the LLM
+  if (state.contextPrompt === "NO_DOCUMENTS_FOUND" || (!state.retrievedChunks?.length && !state.retrievedImages?.length)) {
+    console.log(`[Node: generateAnswer] No relevant documents found. Skipping LLM call.`);
+    return {
+      finalAnswer: "I don't have enough information.",
+      sources: [],
+      imageCitations: [],
+      timings: { llm: 0 }
+    };
+  }
+
   try {
     const answer = await generateAnswer(
       state.question,
@@ -190,8 +232,14 @@ async function generateAnswerNode(state) {
     const duration = Date.now() - t0;
     console.log(`[Timing] LLM: ${duration} ms`);
 
+    const isMissingInfo = !answer || answer.trim().startsWith("I don't have enough information");
+    const finalAnswer = isMissingInfo ? "I don't have enough information." : answer;
+
     return {
-      finalAnswer: answer,
+      finalAnswer,
+      // If the answer is that info is missing, do not show citations
+      sources: isMissingInfo ? [] : state.sources,
+      imageCitations: isMissingInfo ? [] : state.imageCitations,
       timings: { llm: duration }
     };
   } catch (err) {
@@ -245,8 +293,18 @@ async function saveConversationNode(state) {
   }
 
   const duration = Date.now() - t0;
-  const total = Object.values(state.timings || {}).reduce((acc, v) => acc + (typeof v === "number" ? v : 0), 0) + duration;
-  console.log(`[Timing] Total: ${total} ms`);
+  const timings = state.timings || {};
+  const total = Object.values(timings).reduce((acc, v) => acc + (typeof v === "number" ? v : 0), 0) + duration;
+
+  console.log(`[Timing]`);
+  console.log(`Department Router: ${timings.router ?? 0} ms`);
+  console.log(`Text Embedding: ${timings.textEmbedding ?? 0} ms`);
+  console.log(`Text Retrieval: ${timings.textRetrieval ?? 0} ms`);
+  console.log(`Image Embedding: ${timings.siglipEmbedding ?? 0} ms`);
+  console.log(`Image Retrieval: ${timings.imageRetrieval ?? 0} ms`);
+  console.log(`Context Building: ${timings.contextBuilder ?? 0} ms`);
+  console.log(`LLM Generation: ${timings.llm ?? 0} ms`);
+  console.log(`Total: ${total} ms`);
 
   return {
     conversationId: convId,

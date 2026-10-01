@@ -24,6 +24,7 @@ export function ChatProvider({ children }) {
   const [showUploadModal, setShowUploadModal] = useState(false);
 
   const abortControllerRef = useRef(null);
+  const skipNextMessageLoadRef = useRef(false);
 
   // Apply theme to html root
   useEffect(() => {
@@ -46,6 +47,10 @@ export function ChatProvider({ children }) {
 
   // When current conversation changes, load its messages
   useEffect(() => {
+    if (skipNextMessageLoadRef.current) {
+      skipNextMessageLoadRef.current = false;
+      return;
+    }
     if (currentConversationId) {
       loadMessages(currentConversationId);
     } else {
@@ -152,26 +157,33 @@ export function ChatProvider({ children }) {
     }
     setIsStreaming(false);
     setStreamStatusText("");
+    setMessages((prev) =>
+      prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false, statusText: "" } : m))
+    );
   }
 
-  async function sendMessage(questionText) {
+  async function sendMessage(questionText, options = {}) {
     const text = (questionText || "").trim();
     if (!text || isStreaming) return;
 
-    // Add user message to UI immediately
+    const { isRegenerate = false } = options;
+
+    // Unique IDs for user and assistant messages
+    const uniqueSuffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const tempUserMsg = {
-      _id: `temp_user_${Date.now()}`,
+      _id: `temp_user_${uniqueSuffix}`,
       role: "user",
       content: text,
       createdAt: new Date().toISOString()
     };
 
-    // Add placeholder assistant message
-    const tempAssistantId = `temp_asst_${Date.now()}`;
+    const tempAssistantId = `temp_asst_${uniqueSuffix}`;
     const tempAssistantMsg = {
       _id: tempAssistantId,
       role: "assistant",
       content: "",
+      statusText: "Searching your documents...",
+      isStreaming: true,
       routedDepartments: [],
       sources: [],
       images: [],
@@ -179,9 +191,14 @@ export function ChatProvider({ children }) {
       createdAt: new Date().toISOString()
     };
 
-    setMessages((prev) => [...prev, tempUserMsg, tempAssistantMsg]);
+    if (isRegenerate) {
+      setMessages((prev) => [...prev, tempAssistantMsg]);
+    } else {
+      setMessages((prev) => [...prev, tempUserMsg, tempAssistantMsg]);
+    }
+
     setIsStreaming(true);
-    setStreamStatusText("Initializing knowledge retrieval...");
+    setStreamStatusText("Searching your documents...");
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -194,12 +211,18 @@ export function ChatProvider({ children }) {
       {
         onConversationId: (convId) => {
           if (!currentConversationId) {
+            skipNextMessageLoadRef.current = true;
             setCurrentConversationId(convId);
             loadConversations();
           }
         },
         onStatus: (statusMsg) => {
           setStreamStatusText(statusMsg);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m._id === tempAssistantId ? { ...m, statusText: statusMsg } : m
+            )
+          );
         },
         onRouted: ({ departments }) => {
           setActiveDepartments(departments);
@@ -213,7 +236,9 @@ export function ChatProvider({ children }) {
           streamedContent += token;
           setMessages((prev) =>
             prev.map((m) =>
-              m._id === tempAssistantId ? { ...m, content: streamedContent } : m
+              m._id === tempAssistantId
+                ? { ...m, content: streamedContent, isStreaming: true, statusText: "" }
+                : m
             )
           );
         },
@@ -232,7 +257,9 @@ export function ChatProvider({ children }) {
                       content: data.answer || streamedContent,
                       sources: data.sources || [],
                       images: data.images || [],
-                      timings: data.timings || {}
+                      timings: data.timings || {},
+                      isStreaming: false,
+                      statusText: ""
                     }
                   : m
               )
@@ -249,7 +276,10 @@ export function ChatProvider({ children }) {
               m._id === tempAssistantId
                 ? {
                     ...m,
-                    content: `Error: ${errMsg}. Please ensure Ollama and the Python SigLIP service are running.`
+                    content: `Error: ${errMsg}. Please ensure Ollama and the Python SigLIP service are running.`,
+                    isStreaming: false,
+                    statusText: "",
+                    isError: true
                   }
                 : m
             )
@@ -285,7 +315,7 @@ export function ChatProvider({ children }) {
       return prev;
     });
 
-    sendMessage(lastUserMsg.content);
+    sendMessage(lastUserMsg.content, { isRegenerate: true });
   }
 
   async function resendEditedMessage(msgIndex, newContent) {
