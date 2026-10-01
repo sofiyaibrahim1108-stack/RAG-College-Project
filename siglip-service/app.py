@@ -119,7 +119,31 @@ async def embed_images(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/extract/pdf-visuals")
+async def extract_pdf_visuals(request: Request):
+    try:
+        body = await request.json()
+        pdf_path = body.get("pdf_path")
+        output_dir = body.get("output_dir")
+
+        if not pdf_path or not os.path.exists(pdf_path):
+            raise HTTPException(status_code=404, detail=f"PDF not found at {pdf_path}")
+        if not output_dir:
+            raise HTTPException(status_code=400, detail="Must provide output_dir")
+
+        images = siglip_service.extract_pdf_visuals(pdf_path, output_dir)
+        return {
+            "success": True,
+            "images": images,
+            "count": len(images)
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     print(f"Starting SigLIP microservice on port {port}...")
     uvicorn.run("app:app", host="127.0.0.1", port=port, reload=False)
+

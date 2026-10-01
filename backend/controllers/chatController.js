@@ -7,7 +7,7 @@ import { retrieveRelevantTextChunks } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
 import { retrieveRelevantImages } from "../services/imageRetrieval.js";
 import { buildRAGContext } from "../services/contextBuilder.js";
-import { streamAnswer } from "../services/llm.js";
+import { streamAnswer, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate } from "../services/llm.js";
 import { formatSources, formatImageCitations } from "../utils/citations.js";
 
 /**
@@ -126,7 +126,13 @@ export async function askQuestionStream(req, res) {
         timings.siglipEmbedding = Date.now() - tSiglip;
 
         const tImgRet = Date.now();
-        images = await retrieveRelevantImages(siglipEmb, routeResult.departments);
+        images = await retrieveRelevantImages(
+          siglipEmb,
+          routeResult.departments,
+          undefined,
+          undefined,
+          question
+        );
         timings.imageRetrieval = Date.now() - tImgRet;
         imageCitations = formatImageCitations(images);
       } catch (e) {
@@ -147,8 +153,12 @@ export async function askQuestionStream(req, res) {
     let finalSources = sources;
     let finalImageCitations = imageCitations;
 
-    if (context.contextPrompt === "NO_DOCUMENTS_FOUND" || (textChunks.length === 0 && images.length === 0)) {
-      fullAnswer = "I don't have enough information.";
+    // Pre-LLM Evidence Support Gate
+    const gate = checkEvidenceSupportGate(question, context.contextPrompt);
+
+    if (!gate.supported) {
+      console.log(`[Evidence Gate Stream] Question "${question}" rejected: ${gate.reason}. Skipping LLM stream.`);
+      fullAnswer = FALLBACK_MESSAGE;
       sendEvent("token", { token: fullAnswer });
       timings.llm = 0;
       finalSources = [];
@@ -163,8 +173,8 @@ export async function askQuestionStream(req, res) {
       });
       timings.llm = Date.now() - tLLM;
 
-      if (!fullAnswer || fullAnswer.trim().startsWith("I don't have enough information")) {
-        fullAnswer = "I don't have enough information.";
+      if (isFallbackAnswer(fullAnswer)) {
+        fullAnswer = FALLBACK_MESSAGE;
         finalSources = [];
         finalImageCitations = [];
       }

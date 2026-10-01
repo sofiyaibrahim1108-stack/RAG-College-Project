@@ -81,7 +81,10 @@ export function chunkDocumentPages(pages, documentMeta) {
   let globalChunkIndex = 0;
 
   for (const page of pages) {
-    const rawChunks = recursiveSplitText(page.text);
+    let rawChunks = recursiveSplitText(page.text);
+    if (rawChunks.length === 0 && page.text && page.text.trim().length > 0) {
+      rawChunks = [page.text.trim()];
+    }
     for (const chunkText of rawChunks) {
       let structuredContent = chunkText;
       // Prepend structural header if chunk doesn't already have one

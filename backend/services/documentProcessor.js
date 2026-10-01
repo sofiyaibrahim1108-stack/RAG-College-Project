@@ -93,8 +93,18 @@ async function processPdf(filePath, outputDir, docName) {
     });
   }
 
-  // Extract embedded images
-  const images = extractImagesFromPdfBuffer(dataBuffer, outputDir, docName);
+  // Extract embedded images and vector diagrams via multimodal microservice
+  let images = [];
+  try {
+    images = await siglipClient.extractPdfVisuals(filePath, outputDir);
+  } catch (err) {
+    console.warn(`[DocumentProcessor] Notice during microservice PDF visual extraction: ${err.message}`);
+  }
+
+  // Fallback to binary buffer scan if microservice returned no images
+  if (!images || images.length === 0) {
+    images = extractImagesFromPdfBuffer(dataBuffer, outputDir, docName);
+  }
 
   return { pages, images, numPages: parsed.numpages || pages.length };
 }
@@ -624,7 +634,11 @@ export async function processDocument(documentId) {
     const savedImages = [];
     for (const img of extractedData.images) {
       try {
-        const siglipEmb = await siglipClient.embedImage(img.filePath);
+        const siglipEmb =
+          img.embedding && Array.isArray(img.embedding) && img.embedding.length > 0
+            ? img.embedding
+            : await siglipClient.embedImage(img.filePath);
+
         const imageRecord = await ImageModel.create({
           imageId: img.imageId,
           documentId: document._id,
@@ -634,7 +648,9 @@ export async function processDocument(documentId) {
           imagePath: img.filePath,
           mimeType: img.mimeType,
           department: document.department || "General",
-          embedding: siglipEmb
+          embedding: siglipEmb,
+          caption: img.caption || "",
+          description: img.description || ""
         });
         savedImages.push(imageRecord);
       } catch (imgErr) {

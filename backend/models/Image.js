@@ -25,7 +25,9 @@ const ImageSchema = new mongoose.Schema(
     embedding: {
       type: [Number],
       required: true
-    }
+    },
+    caption: { type: String, default: "" },
+    description: { type: String, default: "" }
   },
   { timestamps: true }
 );

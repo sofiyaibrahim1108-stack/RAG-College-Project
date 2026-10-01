@@ -40,7 +40,7 @@ class SigLIPService:
         self.load_model()
         if not text or not text.strip():
             text = " "
-        inputs = self.processor(text=[text], return_tensors="pt", padding=True)
+        inputs = self.processor(text=[text], padding="max_length", return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad():
             output = self.model.get_text_features(**inputs)
@@ -88,6 +88,106 @@ class SigLIPService:
             features = self._extract_tensor(output)
             features = features / features.norm(dim=-1, keepdim=True)
         return features.cpu().tolist()
+
+    def extract_pdf_visuals(self, pdf_path: str, output_dir: str):
+        """
+        Extracts both embedded raster images and full-page vector diagrams (flowcharts, architecture, etc.)
+        from a PDF, associating them with their true page numbers, captions, and SigLIP2 embeddings.
+        """
+        import uuid
+        import pymupdf
+
+        os.makedirs(output_dir, exist_ok=True)
+        doc = pymupdf.open(pdf_path)
+        extracted = []
+        img_counter = 1
+
+        for pno in range(len(doc)):
+            page = doc[pno]
+            page_num = pno + 1
+            page_text = page.get_text().strip()
+
+            # 1. Check for embedded raster images (screenshots, photos, plots)
+            img_list = page.get_images(full=True)
+            if img_list:
+                for idx, img_info in enumerate(img_list):
+                    xref = img_info[0]
+                    base_image = doc.extract_image(xref)
+                    ext = base_image.get("ext", "png").lower()
+                    img_bytes = base_image.get("image", b"")
+
+                    # Skip tiny decorative icons, bullets, or separators (< 1KB)
+                    if len(img_bytes) < 1024:
+                        continue
+
+                    filename = f"pdf_img_{img_counter}.{ext}"
+                    file_path = os.path.join(output_dir, filename)
+                    with open(file_path, "wb") as f:
+                        f.write(img_bytes)
+
+                    # Extract caption from page text
+                    lines = [l.strip() for l in page_text.split("\n") if l.strip() and not l.strip().isdigit()]
+                    caption = lines[0] if lines else f"Figure on Page {page_num}"
+                    if len(lines) > 1 and len(lines[1]) < 90:
+                        caption += " - " + lines[1]
+
+                    # Description provides visual elements grounding context
+                    desc = page_text[:600].replace("\n", " ").strip()
+
+                    try:
+                        emb = self.embed_image(file_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to embed {filename}: {e}")
+                        emb = []
+
+                    extracted.append({
+                        "imageId": str(uuid.uuid4()),
+                        "filename": filename,
+                        "filePath": file_path,
+                        "pageNumber": page_num,
+                        "mimeType": f"image/{ext}" if ext != "jpg" else "image/jpeg",
+                        "caption": caption,
+                        "description": desc,
+                        "embedding": emb
+                    })
+                    img_counter += 1
+
+            # 2. Check for vector diagrams / flowcharts drawn via PDF vector graphics (e.g. System Flow, Data Flow)
+            drawings = page.get_drawings()
+            if drawings and len(drawings) >= 10 and not img_list:
+                filename = f"pdf_diagram_p{page_num}.png"
+                file_path = os.path.join(output_dir, filename)
+
+                # Render page at 150 DPI for crisp visual presentation
+                pix = page.get_pixmap(dpi=150)
+                pix.save(file_path)
+
+                lines = [l.strip() for l in page_text.split("\n") if l.strip() and not l.strip().isdigit()]
+                caption = lines[0] if lines else f"Diagram on Page {page_num}"
+                if len(lines) > 1 and len(lines[1]) < 90:
+                    caption += " - " + lines[1]
+
+                desc = page_text.replace("\n", " ").strip()
+
+                try:
+                    emb = self.embed_image(file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to embed diagram {filename}: {e}")
+                    emb = []
+
+                extracted.append({
+                    "imageId": str(uuid.uuid4()),
+                    "filename": filename,
+                    "filePath": file_path,
+                    "pageNumber": page_num,
+                    "mimeType": "image/png",
+                    "caption": caption,
+                    "description": desc,
+                    "embedding": emb
+                })
+
+        logger.info(f"Extracted {len(extracted)} visuals from PDF {pdf_path}")
+        return extracted
 
 # Singleton instance
 siglip_service = SigLIPService()

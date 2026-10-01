@@ -2,37 +2,162 @@ import axios from "axios";
 import { ENV } from "../config/env.js";
 import { RAG_CONFIG } from "../config/rag.js";
 
+export const FALLBACK_MESSAGE =
+  "I couldn't find enough information in the retrieved document evidence to answer that reliably.";
+
 /**
- * Builds the strict system prompt according to project specifications
+ * Common English words that can be capitalized at the start of a sentence or phrase,
+ * not representing specific domain entities.
+ */
+const COMMON_CAPITALIZED_WORDS = new Set([
+  "the", "this", "that", "these", "those", "there", "their", "they", "then",
+  "what", "when", "where", "which", "while", "whose", "why", "how",
+  "with", "without", "within", "during", "after", "before", "between",
+  "from", "into", "onto", "upon", "about", "above", "below", "under",
+  "first", "second", "third", "finally", "additionally", "furthermore",
+  "however", "although", "because", "since", "while", "whereas",
+  "here", "hence", "thus", "therefore", "instead", "overall",
+  "each", "every", "both", "either", "neither", "some", "any", "all",
+  "most", "many", "much", "more", "less", "least", "several", "such",
+  "only", "just", "also", "even", "still", "already", "soon",
+  "user", "users", "page", "pages", "source", "sources", "figure", "figures",
+  "table", "tables", "image", "images", "screenshot", "screenshots",
+  "note", "please", "yes", "none", "true", "false",
+  "model", "models", "system", "systems", "method", "methods", "data", "dataset",
+  "document", "documents", "process", "training", "testing", "validation",
+  "accuracy", "result", "results", "output", "input", "feature", "features",
+  "class", "classes", "normal", "disease", "detection", "classification",
+  "architecture", "layer", "layers", "stage", "stages"
+]);
+
+/**
+ * Checks whether an answer string is the fallback or an admission of missing evidence.
+ */
+export function isFallbackAnswer(answer) {
+  if (!answer || !answer.trim()) return true;
+  const trimmed = answer.trim();
+  if (trimmed === FALLBACK_MESSAGE) return true;
+  if (trimmed.startsWith("I couldn't find enough information")) return true;
+  if (trimmed.startsWith("I don't have enough information")) return true;
+  if (/not specified in the (provided|retrieved)/i.test(trimmed)) return true;
+  if (/cannot be determined from the (provided|retrieved)/i.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * Deterministic pre-generation evidence support gate.
+ * Determines whether the currently retrieved evidence explicitly contains enough
+ * information to answer this exact question, without calling an expensive or
+ * hallucination-prone secondary LLM.
+ *
+ * @param {string} question
+ * @param {string} contextPrompt
+ * @returns {{ supported: boolean, reason: string }}
+ */
+export function checkEvidenceSupportGate(question = "", contextPrompt = "") {
+  if (!contextPrompt || contextPrompt === "NO_DOCUMENTS_FOUND" || contextPrompt.trim().length === 0) {
+    return { supported: false, reason: "NO_DOCUMENTS_FOUND" };
+  }
+
+  // 1. Explicit Page-Number Constraint (e.g. "page 58", "on page 99", "page 40")
+  const pageMatch = question ? question.match(/\b(?:page|p\.?)\s*(\d+)\b/i) : null;
+  if (pageMatch) {
+    const targetPage = parseInt(pageMatch[1], 10);
+    const hasPageEvidence =
+      contextPrompt.includes(`(Page ${targetPage})`) ||
+      contextPrompt.includes(`Page ${targetPage}`) ||
+      new RegExp(`\\bPage\\s*${targetPage}\\b`, "i").test(contextPrompt);
+
+    if (!hasPageEvidence) {
+      console.log(`[Evidence Gate] Requested Page ${targetPage} not found in retrieved evidence -> UNSUPPORTED`);
+      return { supported: false, reason: `TARGET_PAGE_${targetPage}_NOT_RETRIEVED` };
+    }
+    console.log(`[Evidence Gate] Exact page ${targetPage} match found in retrieved evidence -> SUPPORTED`);
+    return { supported: true, reason: "EXACT_PAGE_MATCH" };
+  }
+
+  return { supported: true, reason: "EVIDENCE_PRESENT" };
+}
+
+/**
+ * Final safety check after LLM generation:
+ * If the LLM output asserts specific technical entities not present in the retrieved
+ * context, catch the hallucination and replace with FALLBACK_MESSAGE.
+ *
+ * @param {string} answer
+ * @param {string} contextPrompt
+ * @returns {string}
+ */
+export function verifyGroundedAnswer(answer, contextPrompt) {
+  if (isFallbackAnswer(answer)) {
+    return FALLBACK_MESSAGE;
+  }
+
+  const tokens = answer
+    .replace(/[^a-zA-Z0-9_\-\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 3);
+
+  const properNouns = tokens.filter(
+    (w) => /^[A-Z][a-zA-Z0-9_\-]+$/.test(w) && !COMMON_CAPITALIZED_WORDS.has(w.toLowerCase())
+  );
+
+  const contextLower = contextPrompt.toLowerCase();
+
+  for (const noun of properNouns) {
+    if (noun.length >= 4 && !contextLower.includes(noun.toLowerCase())) {
+      console.log(
+        `[Grounding Safety Check] Hallucinated entity detected: "${noun}" not found in retrieved context -> Replaced with fallback`
+      );
+      return FALLBACK_MESSAGE;
+    }
+  }
+
+  return answer;
+}
+
+/**
+ * Builds the strict document-grounded system prompt per project specifications
  */
 function buildSystemPrompt(contextPrompt) {
-  return `You are a helpful, professional AI assistant for answering questions about indexed documents.
+  return `You are a document-grounded question answering system.
 
-CRITICAL GROUNDING RULES:
-1. Answer using EXCLUSIVELY facts directly stated in the DOCUMENT EXCERPTS below.
-2. Under NO circumstances may you use outside knowledge, assumptions, or pretrained knowledge.
-3. If the document excerpts do not explicitly define, explain, or contain the answer to the specific topic or question asked (or if any key subject of the question is missing from the excerpts), you MUST respond with ONLY this exact phrase:
-"I don't have enough information."
-4. Do NOT attempt to explain concepts that are not defined in the excerpts.
-5. Do NOT supplement missing information with your own knowledge.
+Answer ONLY from the supplied retrieved evidence.
 
-STRICT CONCISENESS & FIDELITY:
-- Answer ONLY what was asked using strictly the provided facts.
+The fact that information may exist elsewhere in the original document does not authorize you to use it unless that information is present in the supplied evidence.
+
+Never use pretrained knowledge, general knowledge, assumptions, inference, or likely/common answers.
+
+If the supplied evidence does not explicitly support the answer, output exactly:
+I couldn't find enough information in the retrieved document evidence to answer that reliably.
+
+Do not invent details.
+
+Do not infer missing facts.
+
+Do not use information from pages that were not retrieved.
+
+For visual questions, describe ONLY visual information explicitly present in RELEVANT VISUAL EVIDENCE. Never invent UI elements, buttons, icons, progress bars, user actions, labels, colors, layouts, or objects.
+
+CONVERSATION HISTORY NOTICE:
+Previous assistant messages are provided solely for conversational continuity; they are NOT authoritative document evidence. The current answer must be completely grounded in the currently provided DOCUMENT EXCERPTS and RELEVANT VISUAL EVIDENCE.
+
+CODE FIDELITY:
 - When explaining code, operations, or operators, use ONLY the exact code lines and examples explicitly present in the DOCUMENT EXCERPTS. Do NOT invent, generate, or add any other examples or code snippets.
-- Keep the explanation concise, direct, and focused. Do NOT over-explain.
 
-Answering Style (when the answer IS supported by the excerpts):
-- Answer naturally like a high-quality ChatGPT response in clean Markdown.
-- Always phrase answers as complete, natural sentences explaining what to use or do (for example, "Use \`const\` for a variable whose value should not be reassigned."). NEVER output a bare single word or fragment.
-- Match the answer format and length to the question:
-  * For simple factual questions: Direct 1-2 sentence explanation.
-  * For questions asking for multiple items: Use a clean bullet list or numbered list.
-  * For comparison questions (e.g. comparing callbacks, promises, and async/await): Use a compact Markdown table or clean comparison points containing ONLY details supported by the excerpts.
-  * For process or "how-to" questions: Use numbered steps.
-  * For conceptual explanations: Use short, focused paragraphs.
-- When the document contains code, preserve it accurately in fenced code blocks. Explain only what the document supports.
+ANSWERING STYLE (when the answer IS explicitly supported by the excerpts or visual evidence):
+- Write naturally and conversationally, like a knowledgeable colleague explaining something clearly.
+- Produce COMPLETE answers. Include ALL relevant details present in the retrieved evidence — do NOT summarize them away into a single sentence.
+- Match the format and depth to the question type:
+  * For factual questions: 2–4 sentences covering all key points found in the evidence. If the evidence has more detail, use it.
+  * For UI/screenshot questions: Describe the visible components, labels, and purpose explicitly supported by the visual evidence.
+  * For visual-only questions: Use the Visual Evidence block (Caption + Visual Description + Same-Page Context). Describe only what is explicitly written.
+  * For diagram/flowchart/process questions: Use a numbered list or bullet points to trace the steps explicitly supported by the evidence.
+  * For comparison questions: Cover each side with evidence-supported detail.
+- Preserve code in fenced code blocks.
 - Use selective **bold** for key terms, names, or values.
-- Do NOT repeat the user's question.
+- Do NOT start with filler phrases like "Sure!", "Certainly!", or "Of course!".
+- Do NOT repeat the user's question in the answer.
 - Do NOT say "According to the document", "Based on the excerpts", or mention embeddings, retrieval, or internal RAG details.
 
 ${contextPrompt}
@@ -46,9 +171,17 @@ export async function generateAnswer(question, contextPrompt, conversationHistor
   const startTime = Date.now();
 
   if (contextPrompt === "NO_DOCUMENTS_FOUND") {
-    return "I don't have enough information.";
+    return FALLBACK_MESSAGE;
   }
 
+  // 1. Pre-generation evidence gate
+  const gate = checkEvidenceSupportGate(question, contextPrompt);
+  if (!gate.supported) {
+    console.log(`[LLM] Question "${question}" failed evidence gate (${gate.reason}). Returning fallback.`);
+    return FALLBACK_MESSAGE;
+  }
+
+  // 2. Generate grounded answer
   const systemPrompt = buildSystemPrompt(contextPrompt);
 
   const messages = [
@@ -78,10 +211,12 @@ export async function generateAnswer(question, contextPrompt, conversationHistor
 
     const answer = response.data?.message?.content || "";
     console.log(`[LLM] Generated answer in ${Date.now() - startTime}ms`);
+
     let cleanAnswer = answer.trim();
-    if (/^`?const`?\.?$/i.test(cleanAnswer)) {
-      cleanAnswer = "Use `const` for a variable whose value should not be reassigned.";
-    }
+
+    // 3. Post-generation grounding safety check
+    cleanAnswer = verifyGroundedAnswer(cleanAnswer, contextPrompt);
+
     return cleanAnswer;
   } catch (error) {
     console.error(`[LLM Error] Generation failed: ${error.message}`);
@@ -94,11 +229,19 @@ export async function generateAnswer(question, contextPrompt, conversationHistor
  */
 export async function streamAnswer(question, contextPrompt, conversationHistory = [], onToken) {
   if (contextPrompt === "NO_DOCUMENTS_FOUND") {
-    const fallbackMsg = "I don't have enough information.";
-    if (onToken) onToken(fallbackMsg);
-    return fallbackMsg;
+    if (onToken) onToken(FALLBACK_MESSAGE);
+    return FALLBACK_MESSAGE;
   }
 
+  // 1. Pre-generation evidence gate
+  const gate = checkEvidenceSupportGate(question, contextPrompt);
+  if (!gate.supported) {
+    console.log(`[LLM Stream] Question "${question}" failed evidence gate (${gate.reason}). Returning fallback.`);
+    if (onToken) onToken(FALLBACK_MESSAGE);
+    return FALLBACK_MESSAGE;
+  }
+
+  // 2. Stream grounded answer
   const systemPrompt = buildSystemPrompt(contextPrompt);
 
   const messages = [
@@ -148,7 +291,9 @@ export async function streamAnswer(question, contextPrompt, conversationHistory 
     });
 
     response.data.on("end", () => {
-      resolve(fullAnswer.trim());
+      const trimmed = fullAnswer.trim();
+      const verified = verifyGroundedAnswer(trimmed, contextPrompt);
+      resolve(verified);
     });
 
     response.data.on("error", (err) => {

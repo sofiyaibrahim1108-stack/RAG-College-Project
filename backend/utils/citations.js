@@ -35,6 +35,8 @@ export function formatImageCitations(images = []) {
     documentName: img.documentName,
     pageNumber: img.pageNumber || 1,
     filename: img.filename,
+    caption: img.caption || "",
+    description: img.description || "",
     imagePath: `/api/documents/images/${img.documentId}/${img.filename}`,
     similarity: img.similarity
   }));

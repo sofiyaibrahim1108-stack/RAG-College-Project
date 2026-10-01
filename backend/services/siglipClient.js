@@ -101,5 +101,27 @@ export const siglipClient = {
       console.error(`[SigLIP Client] embedImagesBatch error: ${err.message}`);
       throw new Error(`SigLIP batch image embedding failed: ${err.message}`);
     }
+  },
+
+  /**
+   * Extract raster screenshots and vector diagrams from PDF with true page numbers, captions, and SigLIP embeddings
+   * @param {string} pdfPath
+   * @param {string} outputDir
+   * @returns {Promise<Array<Object>>}
+   */
+  async extractPdfVisuals(pdfPath, outputDir) {
+    try {
+      const res = await requestWithFallback(
+        "post",
+        "/extract/pdf-visuals",
+        { pdf_path: pdfPath, output_dir: outputDir },
+        { timeout: 60000 }
+      );
+      return res.data.images || [];
+    } catch (err) {
+      console.warn(`[SigLIP Client] extractPdfVisuals failed: ${err.message}`);
+      return [];
+    }
   }
 };
+

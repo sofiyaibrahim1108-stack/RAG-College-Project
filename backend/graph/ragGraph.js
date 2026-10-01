@@ -8,7 +8,7 @@ import { retrieveRelevantTextChunks } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
 import { retrieveRelevantImages } from "../services/imageRetrieval.js";
 import { buildRAGContext } from "../services/contextBuilder.js";
-import { generateAnswer } from "../services/llm.js";
+import { generateAnswer, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate } from "../services/llm.js";
 import { formatSources, formatImageCitations } from "../utils/citations.js";
 
 /**
@@ -124,7 +124,8 @@ async function textRetrievalNode(state) {
  */
 export function isVisualQuery(question) {
   if (!question) return false;
-  const visualRegex = /\b(diagram|diagrams|figure|figures|image|images|screenshot|screenshots|picture|pictures|flowchart|flowcharts|architecture|chart|charts|graph|graphs|illustration|illustrations|photo|photos|drawing|drawings|visual|visuals|blueprint|map|layout)\b/i;
+  const visualRegex =
+    /\b(diagram|diagrams|figure|figures|image|images|screenshot|screenshots|picture|pictures|flowchart|flowcharts|architecture|chart|charts|graph|graphs|illustration|illustrations|photo|photos|drawing|drawings|visual|visuals|blueprint|map|layout|ui|interface|form|screen|page\s*\d+)\b/i;
   return visualRegex.test(question);
 }
 
@@ -172,7 +173,13 @@ async function imageRetrievalNode(state) {
 
   const t0 = Date.now();
   try {
-    const images = await retrieveRelevantImages(state.siglipQueryEmbedding, state.routedDepartments);
+    const images = await retrieveRelevantImages(
+      state.siglipQueryEmbedding,
+      state.routedDepartments,
+      undefined,
+      undefined,
+      state.question
+    );
     const duration = Date.now() - t0;
     console.log(`[Timing] Image Retrieval: ${duration} ms`);
 
@@ -212,11 +219,13 @@ async function contextBuilderNode(state) {
 async function generateAnswerNode(state) {
   const t0 = Date.now();
 
-  // If no relevant documents were found, return the exact fallback immediately without calling the LLM
-  if (state.contextPrompt === "NO_DOCUMENTS_FOUND" || (!state.retrievedChunks?.length && !state.retrievedImages?.length)) {
-    console.log(`[Node: generateAnswer] No relevant documents found. Skipping LLM call.`);
+  // Pre-LLM Evidence Support Gate
+  const gate = checkEvidenceSupportGate(state.question, state.contextPrompt);
+  if (!gate.supported) {
+    console.log(`[Evidence Gate] Question "${state.question}" rejected: ${gate.reason}. Skipping LLM call.`);
+    console.log(`[RAG Decision] Final answer decision: FALLBACK (gate rejected: ${gate.reason})`);
     return {
-      finalAnswer: "I don't have enough information.",
+      finalAnswer: FALLBACK_MESSAGE,
       sources: [],
       imageCitations: [],
       timings: { llm: 0 }
@@ -232,8 +241,12 @@ async function generateAnswerNode(state) {
     const duration = Date.now() - t0;
     console.log(`[Timing] LLM: ${duration} ms`);
 
-    const isMissingInfo = !answer || answer.trim().startsWith("I don't have enough information");
-    const finalAnswer = isMissingInfo ? "I don't have enough information." : answer;
+    const isMissingInfo = isFallbackAnswer(answer);
+    const finalAnswer = isMissingInfo ? FALLBACK_MESSAGE : answer;
+
+    console.log(
+      `[RAG Decision] Final answer decision: ${isMissingInfo ? "FALLBACK (unsupported)" : "ANSWER (supported)"}`
+    );
 
     return {
       finalAnswer,

@@ -14,7 +14,8 @@ export async function retrieveRelevantImages(
   siglipQueryEmbedding,
   routedDepartments = [],
   topK = RAG_CONFIG.topKImages,
-  threshold = RAG_CONFIG.imageSimilarityThreshold
+  threshold = RAG_CONFIG.imageSimilarityThreshold,
+  queryText = ""
 ) {
   const startTime = Date.now();
 
@@ -29,13 +30,33 @@ export async function retrieveRelevantImages(
       : {};
 
   let candidates = await ImageModel.find(deptQuery)
-    .select("imageId documentId documentName pageNumber filename imagePath department embedding")
+    .select("imageId documentId documentName pageNumber filename imagePath department embedding caption description")
     .lean();
 
   if (candidates.length < topK) {
     candidates = await ImageModel.find({})
-      .select("imageId documentId documentName pageNumber filename imagePath department embedding")
+      .select("imageId documentId documentName pageNumber filename imagePath department embedding caption description")
       .lean();
+  }
+
+  // If question explicitly specifies a page number, ensure matching page images are included
+  const pageMatch = queryText ? queryText.match(/\b(?:page|p\.?)\s*(\d+)\b/i) : null;
+  const targetPage = pageMatch ? parseInt(pageMatch[1], 10) : null;
+
+  if (targetPage !== null) {
+    const pageImgs = await ImageModel.find({ pageNumber: targetPage })
+      .select("imageId documentId documentName pageNumber filename imagePath department embedding caption description")
+      .lean();
+    if (pageImgs.length > 0) {
+      const existingKeys = new Set(candidates.map((c) => `${c.documentName}_${c.filename}`));
+      for (const pi of pageImgs) {
+        const key = `${pi.documentName}_${pi.filename}`;
+        if (!existingKeys.has(key)) {
+          candidates.unshift(pi);
+          existingKeys.add(key);
+        }
+      }
+    }
   }
 
   if (candidates.length === 0) {
@@ -53,8 +74,40 @@ export async function retrieveRelevantImages(
     const dedupeKey = `${img.documentName}_${img.filename}`;
     if (seenFilenames.has(dedupeKey)) continue;
 
-    const sim = cosineSimilarity(siglipQueryEmbedding, img.embedding);
-    if (sim >= threshold) {
+    let sim = cosineSimilarity(siglipQueryEmbedding, img.embedding);
+    let isPageMatch = false;
+
+    // Hybrid keyword & page number alignment bonus
+    if (queryText) {
+      const qLower = queryText.toLowerCase();
+
+      // 1. Generic explicit page mention match: e.g. "page 58", "page 40"
+      const pageMatch = qLower.match(/\b(?:page|p\.?)\s*(\d+)\b/i);
+      if (pageMatch && parseInt(pageMatch[1], 10) === img.pageNumber) {
+        sim += 0.35;
+        isPageMatch = true;
+      }
+
+      // 2. Generic caption token overlap (no hardcoded keywords)
+      if (img.caption) {
+        const captionTerms = img.caption
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, " ")
+          .split(/\s+/)
+          .filter((w) => w.length >= 3);
+        if (captionTerms.length > 0) {
+          let matches = 0;
+          for (const term of captionTerms) {
+            if (qLower.includes(term)) matches++;
+          }
+          if (matches > 0) {
+            sim += Math.min(0.08, (matches / captionTerms.length) * 0.08);
+          }
+        }
+      }
+    }
+
+    if (sim >= threshold || isPageMatch) {
       scored.push({
         imageId: img.imageId,
         documentId: img.documentId,
@@ -63,20 +116,36 @@ export async function retrieveRelevantImages(
         filename: img.filename,
         imagePath: img.imagePath,
         department: img.department,
-        similarity: parseFloat(sim.toFixed(4))
+        caption: img.caption || "",
+        description: img.description || "",
+        similarity: parseFloat(sim.toFixed(4)),
+        _isPageMatch: isPageMatch
       });
       seenFilenames.add(dedupeKey);
     }
   }
 
-  // Sort descending by similarity
-  scored.sort((a, b) => b.similarity - a.similarity);
+  // Sort: explicit page matches first, then descending by similarity
+  scored.sort((a, b) => {
+    if (a._isPageMatch && !b._isPageMatch) return -1;
+    if (!a._isPageMatch && b._isPageMatch) return 1;
+    return b.similarity - a.similarity;
+  });
 
-  const results = scored.slice(0, topK);
+  const results = scored.slice(0, topK).map(({ _isPageMatch, ...rest }) => rest);
 
   console.log(
     `[ImageRetrieval] Retrieved ${results.length} images above threshold ${threshold} in ${Date.now() - startTime}ms`
   );
+
+  for (const img of results) {
+    console.log(
+      `[ImageRetrieval]   page=${img.pageNumber ?? "?"} ` +
+      `sim=${img.similarity.toFixed(4)} ` +
+      `cap="${(img.caption || "").slice(0, 50)}" ` +
+      `doc="${img.documentName}"`
+    );
+  }
 
   return results;
 }
