@@ -16,7 +16,15 @@ export const RAGStateAnnotation = Annotation.Root({
     reducer: (curr, update) => update ?? curr,
     default: () => []
   }),
+  queryType: Annotation({
+    reducer: (curr, update) => update ?? curr,
+    default: () => "document_qa"
+  }),
   routedDepartments: Annotation({
+    reducer: (curr, update) => update ?? curr,
+    default: () => []
+  }),
+  routerCandidates: Annotation({
     reducer: (curr, update) => update ?? curr,
     default: () => []
   }),
@@ -39,6 +47,10 @@ export const RAGStateAnnotation = Annotation.Root({
   retrievedImages: Annotation({
     reducer: (curr, update) => update ?? curr,
     default: () => []
+  }),
+  tabularResult: Annotation({
+    reducer: (curr, update) => update ?? curr,
+    default: () => null
   }),
   contextPrompt: Annotation({
     reducer: (curr, update) => update ?? curr,

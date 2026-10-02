@@ -2,6 +2,7 @@ import { ragGraph, isVisualQuery } from "../graph/ragGraph.js";
 import { Message } from "../models/Message.js";
 import { Conversation } from "../models/Conversation.js";
 import { routeDepartment } from "../services/router.js";
+import { processTabularQuery } from "../services/tabularProcessor.js";
 import { generateTextEmbedding } from "../services/embeddingService.js";
 import { retrieveRelevantTextChunks } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
@@ -31,7 +32,9 @@ export async function askQuestion(req, res) {
       success: true,
       conversationId: result.conversationId,
       answer: result.finalAnswer,
+      queryType: result.queryType,
       routedDepartments: result.routedDepartments,
+      candidates: result.routerCandidates,
       confidence: result.routerConfidence,
       sources: result.sources,
       images: result.imageCitations,
@@ -42,13 +45,13 @@ export async function askQuestion(req, res) {
     res.status(500).json({
       success: false,
       error: "An unexpected error occurred while processing your request.",
-      fallbackAnswer: "An unexpected error occurred while processing your request."
+      fallbackAnswer: FALLBACK_MESSAGE
     });
   }
 }
 
 /**
- * Server-Sent Events (SSE) streaming endpoint for real-time ChatGPT-like generation
+ * Server-Sent Events (SSE) streaming endpoint for real-time generation
  */
 export async function askQuestionStream(req, res) {
   const { question, conversationId } = req.body;
@@ -94,12 +97,42 @@ export async function askQuestionStream(req, res) {
     const routeResult = await routeDepartment(question, history);
     timings.router = Date.now() - tRouter;
     sendEvent("routed", {
+      queryType: routeResult.queryType,
       departments: routeResult.departments,
+      candidates: routeResult.candidates,
       confidence: routeResult.confidence,
       duration: timings.router
     });
 
-    // 3. Text Embedding & Retrieval
+    // Short-circuit for out_of_scope queries
+    if (routeResult.queryType === "out_of_scope") {
+      timings.total = Date.now() - tTotal;
+      sendEvent("token", { token: FALLBACK_MESSAGE });
+      sendEvent("complete", {
+        messageId: null,
+        answer: FALLBACK_MESSAGE,
+        sources: [],
+        images: [],
+        timings
+      });
+      res.end();
+      return;
+    }
+
+    // 3. Tabular processing if applicable
+    let tabularResult = null;
+    if (routeResult.queryType === "tabular") {
+      const tTab = Date.now();
+      sendEvent("status", { message: "Processing tabular calculations..." });
+      try {
+        tabularResult = await processTabularQuery(question, routeResult.departments);
+        timings.tabular = Date.now() - tTab;
+      } catch (e) {
+        console.warn(`[Stream Tabular notice] ${e.message}`);
+      }
+    }
+
+    // 4. Text Embedding & Retrieval
     const tEmb = Date.now();
     const textEmb = await generateTextEmbedding(question);
     timings.textEmbedding = Date.now() - tEmb;
@@ -108,17 +141,17 @@ export async function askQuestionStream(req, res) {
     const textChunks = await retrieveRelevantTextChunks(
       textEmb,
       routeResult.departments,
-      undefined,
+      5,
       undefined,
       question
     );
     timings.textRetrieval = Date.now() - tRet;
     const sources = formatSources(textChunks);
 
-    // 4. Image Embedding & Retrieval via SigLIP2 (only for queries with visual/diagram intent)
+    // 5. Image Embedding & Retrieval via SigLIP2
     let images = [];
     let imageCitations = [];
-    if (isVisualQuery(question)) {
+    if (routeResult.queryType === "visual_qa" || isVisualQuery(question)) {
       const tSiglip = Date.now();
       sendEvent("status", { message: "Searching visual diagrams..." });
       try {
@@ -129,7 +162,7 @@ export async function askQuestionStream(req, res) {
         images = await retrieveRelevantImages(
           siglipEmb,
           routeResult.departments,
-          undefined,
+          3,
           undefined,
           question
         );
@@ -143,18 +176,18 @@ export async function askQuestionStream(req, res) {
       timings.imageRetrieval = 0;
     }
 
-    // 5. Build context
+    // 6. Build context
     const tCtx = Date.now();
-    const context = buildRAGContext(textChunks, images);
+    const context = buildRAGContext(textChunks, images, tabularResult);
     timings.contextBuilder = Date.now() - tCtx;
 
-    // 6. Stream LLM answer
+    // 7. Stream LLM answer
     let fullAnswer = "";
     let finalSources = sources;
     let finalImageCitations = imageCitations;
 
     // Pre-LLM Evidence Support Gate
-    const gate = checkEvidenceSupportGate(question, context.contextPrompt);
+    const gate = checkEvidenceSupportGate(question, context.contextPrompt, routeResult.queryType);
 
     if (!gate.supported) {
       console.log(`[Evidence Gate Stream] Question "${question}" rejected: ${gate.reason}. Skipping LLM stream.`);
@@ -170,7 +203,7 @@ export async function askQuestionStream(req, res) {
       await streamAnswer(question, context.contextPrompt, history, (token) => {
         fullAnswer += token;
         sendEvent("token", { token });
-      });
+      }, routeResult.queryType);
       timings.llm = Date.now() - tLLM;
 
       if (isFallbackAnswer(fullAnswer)) {
@@ -182,17 +215,7 @@ export async function askQuestionStream(req, res) {
 
     timings.total = Date.now() - tTotal;
 
-    console.log(`[Timing]`);
-    console.log(`Department Router: ${timings.router ?? 0} ms`);
-    console.log(`Text Embedding: ${timings.textEmbedding ?? 0} ms`);
-    console.log(`Text Retrieval: ${timings.textRetrieval ?? 0} ms`);
-    console.log(`Image Embedding: ${timings.siglipEmbedding ?? 0} ms`);
-    console.log(`Image Retrieval: ${timings.imageRetrieval ?? 0} ms`);
-    console.log(`Context Building: ${timings.contextBuilder ?? 0} ms`);
-    console.log(`LLM Generation: ${timings.llm ?? 0} ms`);
-    console.log(`Total: ${timings.total ?? 0} ms`);
-
-    // 7. Save conversation
+    // 8. Save conversation
     await Message.create({
       conversationId: convId,
       role: "user",

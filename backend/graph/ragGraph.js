@@ -3,6 +3,7 @@ import { RAGStateAnnotation } from "./graphState.js";
 import { Message } from "../models/Message.js";
 import { Conversation } from "../models/Conversation.js";
 import { routeDepartment } from "../services/router.js";
+import { processTabularQuery } from "../services/tabularProcessor.js";
 import { generateTextEmbedding } from "../services/embeddingService.js";
 import { retrieveRelevantTextChunks } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
@@ -41,24 +42,29 @@ async function loadConversationHistoryNode(state) {
 }
 
 /**
- * 2. Node: departmentRouter
+ * 2. Node: router
+ * Determines target source/department and queryType (document_qa, tabular, visual_qa, out_of_scope)
  */
-async function departmentRouterNode(state) {
+async function routerNode(state) {
   const t0 = Date.now();
   try {
     const routeResult = await routeDepartment(state.question, state.conversationHistory);
     const duration = Date.now() - t0;
-    console.log(`[Timing] Router: ${duration} ms`);
+    console.log(`[Timing] Router: ${duration} ms (Type: ${routeResult.queryType}, Depts: [${routeResult.departments.join(", ")}])`);
 
     return {
+      queryType: routeResult.queryType,
       routedDepartments: routeResult.departments,
+      routerCandidates: routeResult.candidates,
       routerConfidence: routeResult.confidence,
       timings: { router: duration }
     };
   } catch (err) {
-    console.warn(`[Node: departmentRouter] Fallback triggered: ${err.message}`);
+    console.warn(`[Node: router] Fallback triggered: ${err.message}`);
     return {
-      routedDepartments: ["General"],
+      queryType: "document_qa",
+      routedDepartments: [],
+      routerCandidates: [],
       routerConfidence: 0.5,
       timings: { router: Date.now() - t0 }
     };
@@ -66,9 +72,41 @@ async function departmentRouterNode(state) {
 }
 
 /**
- * 3. Node: textEmbedding
+ * 3. Node: tabular
+ * For CSV/Excel questions, deterministic calculation node calculates from actual dataset
+ */
+async function tabularNode(state) {
+  if (state.queryType !== "tabular") {
+    return { tabularResult: null, timings: { tabular: 0 } };
+  }
+
+  const t0 = Date.now();
+  try {
+    const result = await processTabularQuery(state.question, state.routedDepartments);
+    const duration = Date.now() - t0;
+    console.log(`[Timing] Tabular Tool: ${duration} ms`);
+
+    return {
+      tabularResult: result,
+      timings: { tabular: duration }
+    };
+  } catch (err) {
+    console.warn(`[Node: tabular] Notice: ${err.message}`);
+    return {
+      tabularResult: null,
+      timings: { tabular: Date.now() - t0 }
+    };
+  }
+}
+
+/**
+ * 4. Node: textEmbedding
  */
 async function textEmbeddingNode(state) {
+  if (state.queryType === "out_of_scope") {
+    return { queryEmbedding: [], timings: { textEmbedding: 0 } };
+  }
+
   const t0 = Date.now();
   try {
     const embedding = await generateTextEmbedding(state.question);
@@ -89,15 +127,19 @@ async function textEmbeddingNode(state) {
 }
 
 /**
- * 4. Node: textRetrieval
+ * 5. Node: textRetrieval
  */
 async function textRetrievalNode(state) {
+  if (state.queryType === "out_of_scope" || !state.queryEmbedding || state.queryEmbedding.length === 0) {
+    return { retrievedChunks: [], sources: [], timings: { textRetrieval: 0 } };
+  }
+
   const t0 = Date.now();
   try {
     const chunks = await retrieveRelevantTextChunks(
       state.queryEmbedding,
       state.routedDepartments,
-      undefined,
+      5,
       undefined,
       state.question
     );
@@ -120,20 +162,21 @@ async function textRetrievalNode(state) {
 }
 
 /**
- * Determines whether a query has visual/diagram intent to avoid unnecessary SigLIP calls
+ * Determines whether a query has visual/diagram intent to run SigLIP
  */
 export function isVisualQuery(question) {
   if (!question) return false;
   const visualRegex =
-    /\b(diagram|diagrams|figure|figures|image|images|screenshot|screenshots|picture|pictures|flowchart|flowcharts|architecture|chart|charts|graph|graphs|illustration|illustrations|photo|photos|drawing|drawings|visual|visuals|blueprint|map|layout|ui|interface|form|screen|page\s*\d+)\b/i;
+    /\b(diagram|diagrams|figure|figures|image|images|screenshot|screenshots|picture|pictures|flowchart|flowcharts|chart|charts|photo|visual|confusion matrix|page\s*\d+\s*(?:show|contain|display))\b/i;
   return visualRegex.test(question);
 }
 
 /**
- * 5. Node: imageEmbedding
+ * 6. Node: imageEmbedding
  */
 async function imageEmbeddingNode(state) {
-  if (!isVisualQuery(state.question)) {
+  const shouldEmbed = state.queryType === "visual_qa" || isVisualQuery(state.question);
+  if (!shouldEmbed || state.queryType === "out_of_scope") {
     return {
       siglipQueryEmbedding: [],
       timings: { siglipEmbedding: 0 }
@@ -144,7 +187,7 @@ async function imageEmbeddingNode(state) {
   try {
     const siglipEmb = await siglipClient.embedText(state.question);
     const duration = Date.now() - t0;
-    console.log(`[Timing] SigLIP: ${duration} ms`);
+    console.log(`[Timing] SigLIP Embedding: ${duration} ms`);
 
     return {
       siglipQueryEmbedding: siglipEmb,
@@ -160,10 +203,11 @@ async function imageEmbeddingNode(state) {
 }
 
 /**
- * 6. Node: imageRetrieval
+ * 7. Node: imageRetrieval
  */
 async function imageRetrievalNode(state) {
-  if (!state.siglipQueryEmbedding || state.siglipQueryEmbedding.length === 0) {
+  const shouldRetrieve = state.queryType === "visual_qa" || isVisualQuery(state.question);
+  if (!shouldRetrieve || state.queryType === "out_of_scope") {
     return {
       retrievedImages: [],
       imageCitations: [],
@@ -176,7 +220,7 @@ async function imageRetrievalNode(state) {
     const images = await retrieveRelevantImages(
       state.siglipQueryEmbedding,
       state.routedDepartments,
-      undefined,
+      3,
       undefined,
       state.question
     );
@@ -199,11 +243,11 @@ async function imageRetrievalNode(state) {
 }
 
 /**
- * 7. Node: contextBuilder
+ * 8. Node: contextBuilder
  */
 async function contextBuilderNode(state) {
   const t0 = Date.now();
-  const context = buildRAGContext(state.retrievedChunks, state.retrievedImages);
+  const context = buildRAGContext(state.retrievedChunks, state.retrievedImages, state.tabularResult);
   const duration = Date.now() - t0;
   console.log(`[Timing] Context Builder: ${duration} ms`);
 
@@ -214,16 +258,26 @@ async function contextBuilderNode(state) {
 }
 
 /**
- * 8. Node: generateAnswer
+ * 9. Node: generateAnswer
  */
 async function generateAnswerNode(state) {
   const t0 = Date.now();
 
+  // Out of scope gate check
+  if (state.queryType === "out_of_scope") {
+    console.log(`[Evidence Gate] Query type is out_of_scope -> Returning fallback without calling generation model`);
+    return {
+      finalAnswer: FALLBACK_MESSAGE,
+      sources: [],
+      imageCitations: [],
+      timings: { llm: 0 }
+    };
+  }
+
   // Pre-LLM Evidence Support Gate
-  const gate = checkEvidenceSupportGate(state.question, state.contextPrompt);
+  const gate = checkEvidenceSupportGate(state.question, state.contextPrompt, state.queryType);
   if (!gate.supported) {
     console.log(`[Evidence Gate] Question "${state.question}" rejected: ${gate.reason}. Skipping LLM call.`);
-    console.log(`[RAG Decision] Final answer decision: FALLBACK (gate rejected: ${gate.reason})`);
     return {
       finalAnswer: FALLBACK_MESSAGE,
       sources: [],
@@ -236,43 +290,38 @@ async function generateAnswerNode(state) {
     const answer = await generateAnswer(
       state.question,
       state.contextPrompt,
-      state.conversationHistory
+      state.conversationHistory,
+      state.queryType
     );
     const duration = Date.now() - t0;
     console.log(`[Timing] LLM: ${duration} ms`);
 
-    const isMissingInfo = isFallbackAnswer(answer);
-    const finalAnswer = isMissingInfo ? FALLBACK_MESSAGE : answer;
-
-    console.log(
-      `[RAG Decision] Final answer decision: ${isMissingInfo ? "FALLBACK (unsupported)" : "ANSWER (supported)"}`
-    );
+    const isMissing = isFallbackAnswer(answer);
+    const finalAnswer = isMissing ? FALLBACK_MESSAGE : answer;
 
     return {
       finalAnswer,
-      // If the answer is that info is missing, do not show citations
-      sources: isMissingInfo ? [] : state.sources,
-      imageCitations: isMissingInfo ? [] : state.imageCitations,
+      sources: isMissing ? [] : state.sources,
+      imageCitations: isMissing ? [] : state.imageCitations,
       timings: { llm: duration }
     };
   } catch (err) {
     console.error(`[Node: generateAnswer] Error: ${err.message}`);
     return {
-      finalAnswer: "An error occurred while generating the answer. Please check if Ollama is running.",
+      finalAnswer: FALLBACK_MESSAGE,
       timings: { llm: Date.now() - t0 }
     };
   }
 }
 
 /**
- * 9. Node: saveConversation
+ * 10. Node: saveConversation
  */
 async function saveConversationNode(state) {
   const t0 = Date.now();
   let convId = state.conversationId;
 
   try {
-    // If no conversationId provided, create a new conversation
     if (!convId) {
       const titleSnippet = state.question.slice(0, 40);
       const newConv = await Conversation.create({
@@ -281,14 +330,12 @@ async function saveConversationNode(state) {
       convId = newConv._id.toString();
     }
 
-    // 1. Save user question
     await Message.create({
       conversationId: convId,
       role: "user",
       content: state.question
     });
 
-    // 2. Save assistant answer with sources and image citations
     await Message.create({
       conversationId: convId,
       role: "assistant",
@@ -299,7 +346,6 @@ async function saveConversationNode(state) {
       timings: state.timings
     });
 
-    // Touch conversation updatedAt
     await Conversation.findByIdAndUpdate(convId, { updatedAt: new Date() });
   } catch (err) {
     console.warn(`[Node: saveConversation] Warning: ${err.message}`);
@@ -308,16 +354,6 @@ async function saveConversationNode(state) {
   const duration = Date.now() - t0;
   const timings = state.timings || {};
   const total = Object.values(timings).reduce((acc, v) => acc + (typeof v === "number" ? v : 0), 0) + duration;
-
-  console.log(`[Timing]`);
-  console.log(`Department Router: ${timings.router ?? 0} ms`);
-  console.log(`Text Embedding: ${timings.textEmbedding ?? 0} ms`);
-  console.log(`Text Retrieval: ${timings.textRetrieval ?? 0} ms`);
-  console.log(`Image Embedding: ${timings.siglipEmbedding ?? 0} ms`);
-  console.log(`Image Retrieval: ${timings.imageRetrieval ?? 0} ms`);
-  console.log(`Context Building: ${timings.contextBuilder ?? 0} ms`);
-  console.log(`LLM Generation: ${timings.llm ?? 0} ms`);
-  console.log(`Total: ${total} ms`);
 
   return {
     conversationId: convId,
@@ -331,7 +367,8 @@ async function saveConversationNode(state) {
 export function createRAGGraph() {
   const workflow = new StateGraph(RAGStateAnnotation)
     .addNode("loadConversationHistory", loadConversationHistoryNode)
-    .addNode("departmentRouter", departmentRouterNode)
+    .addNode("router", routerNode)
+    .addNode("tabular", tabularNode)
     .addNode("textEmbedding", textEmbeddingNode)
     .addNode("textRetrieval", textRetrievalNode)
     .addNode("imageEmbedding", imageEmbeddingNode)
@@ -340,8 +377,9 @@ export function createRAGGraph() {
     .addNode("generateAnswer", generateAnswerNode)
     .addNode("saveConversation", saveConversationNode)
     .addEdge(START, "loadConversationHistory")
-    .addEdge("loadConversationHistory", "departmentRouter")
-    .addEdge("departmentRouter", "textEmbedding")
+    .addEdge("loadConversationHistory", "router")
+    .addEdge("router", "tabular")
+    .addEdge("tabular", "textEmbedding")
     .addEdge("textEmbedding", "textRetrieval")
     .addEdge("textRetrieval", "imageEmbedding")
     .addEdge("imageEmbedding", "imageRetrieval")

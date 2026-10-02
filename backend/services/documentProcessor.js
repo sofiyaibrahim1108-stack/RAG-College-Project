@@ -11,6 +11,7 @@ import { ImageModel } from "../models/Image.js";
 import { chunkDocumentPages } from "./chunkingService.js";
 import { generateBatchTextEmbeddings } from "./embeddingService.js";
 import { siglipClient } from "./siglipClient.js";
+import { extractOcrText } from "./ocrService.js";
 import { ENV } from "../config/env.js";
 
 /**
@@ -630,14 +631,24 @@ export async function processDocument(documentId) {
       `[DocumentProcessor] Extracted ${extractedData.pages.length} pages and ${extractedData.images.length} images from ${document.originalName}`
     );
 
-    // 1. Process and save images with SigLIP2 embeddings
+    // 1. Process and save images with SigLIP2 embeddings and OCR text extraction
     const savedImages = [];
+    const ocrChunks = [];
+
     for (const img of extractedData.images) {
       try {
         const siglipEmb =
           img.embedding && Array.isArray(img.embedding) && img.embedding.length > 0
             ? img.embedding
             : await siglipClient.embedImage(img.filePath);
+
+        // Deterministic OCR text extraction on image/screenshot
+        let ocrText = "";
+        try {
+          ocrText = await extractOcrText(img.filePath);
+        } catch (ocrErr) {
+          console.warn(`[DocumentProcessor] OCR extraction notice for ${img.filename}: ${ocrErr.message}`);
+        }
 
         const imageRecord = await ImageModel.create({
           imageId: img.imageId,
@@ -650,9 +661,25 @@ export async function processDocument(documentId) {
           department: document.department || "General",
           embedding: siglipEmb,
           caption: img.caption || "",
-          description: img.description || ""
+          description: img.description || "",
+          ocrText: ocrText || ""
         });
         savedImages.push(imageRecord);
+
+        // If screenshot contains recognizable text/numbers (e.g. confusion matrix, graphs),
+        // make it searchable evidence by adding an OCR chunk
+        if (ocrText && ocrText.trim().length >= 10) {
+          ocrChunks.push({
+            documentId: document._id,
+            documentName: document.originalName,
+            pageNumber: img.pageNumber || 1,
+            chunkIndex: 0, // will be reassigned below
+            content: `[Visual Screenshot Evidence (Page ${img.pageNumber})]:\n${ocrText.trim()}`,
+            department: document.department || "General",
+            sourceType: "visual_ocr",
+            sourcePath: img.filePath
+          });
+        }
       } catch (imgErr) {
         console.warn(`[DocumentProcessor] Failed to embed image ${img.filename}: ${imgErr.message}`);
       }
@@ -660,7 +687,13 @@ export async function processDocument(documentId) {
 
     // 2. Chunk text pages
     const chunkObjects = chunkDocumentPages(extractedData.pages, document);
-    console.log(`[DocumentProcessor] Generated ${chunkObjects.length} text chunks`);
+
+    // Append OCR chunks with consistent chunk indices
+    for (const oc of ocrChunks) {
+      oc.chunkIndex = chunkObjects.length;
+      chunkObjects.push(oc);
+    }
+    console.log(`[DocumentProcessor] Generated ${chunkObjects.length} text chunks (including ${ocrChunks.length} visual OCR chunks)`);
 
     if (chunkObjects.length > 0) {
       // 3. Generate Ollama text embeddings in batches

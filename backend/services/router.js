@@ -2,12 +2,25 @@ import axios from "axios";
 import { ENV } from "../config/env.js";
 import { Department } from "../models/Department.js";
 import { Document } from "../models/Document.js";
+import { DocumentChunk } from "../models/DocumentChunk.js";
 
-const PROGRAMMING_REGEX =
-  /\b(variable|variables|keyword|keywords|const|let|var|function|functions|closure|closures|hoisting|scope|promise|promises|callback|callbacks|async|await|reduce|filter|map|array|arrays|object|objects|string|boolean|undefined|null|symbol|bigint|try\s*\.\.\.\s*catch|catch|console\.log|datatype|datatypes|primitive|reassign|reassigned|syntax|code|coding|javascript|js|ecmascript|es6|operator|operators|loop|loops|if\s+else)\b/i;
+const GENERIC_ROUTER_STOPWORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+  "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+  "being", "have", "has", "had", "do", "does", "did", "it", "its",
+  "this", "that", "these", "those", "i", "me", "my", "we", "our",
+  "you", "your", "he", "she", "they", "them", "their", "who", "whom",
+  "whose", "which", "what", "when", "where", "how", "why",
+  "would", "could", "should", "will", "can", "may", "might",
+  "not", "no", "so", "if", "as", "up", "out", "about", "does",
+  "all", "any", "rag", "page", "pages", "sample", "document", "testing",
+  "each", "other", "into", "more", "such", "than", "then", "some", "only"
+]);
 
-const COLLEGE_REGEX =
-  /\b(college|campus|handbook|admission|admissions|tuition|hostel|faculty|professor|dean|principal|placement|curriculum|exam|exams|semester|library|scholarship|degree|btech|mtech|engineering|course|courses|sports|canteen|cafeteria|attendance|leave)\b/i;
+const UPPER_STOPWORDS = new Set([
+  "PAGE", "THE", "AND", "FOR", "OF", "IN", "ON", "AT", "TO", "IS", "IT",
+  "BY", "AS", "AN", "OR", "BE", "NO", "ALL", "NOT", "RAG", "WITH", "FROM", "THIS", "THAT"
+]);
 
 /**
  * Cleanly extracts JSON from an LLM response string
@@ -24,12 +37,13 @@ function extractJson(text) {
 }
 
 /**
- * Dynamically queries all unique departments and their indexed document profiles from MongoDB
+ * Dynamically queries all unique departments and their indexed document profiles from MongoDB.
+ * Computes prominent keywords and acronyms automatically from MongoDB chunks without hardcoding.
  */
-async function getDepartmentProfiles() {
+export async function getDepartmentProfiles() {
   try {
     const dbDepts = await Department.find().select("name description").lean();
-    const docs = await Document.find().select("title originalName department").lean();
+    const docs = await Document.find({ status: "completed" }).select("title originalName department fileType").lean();
 
     const deptMap = new Map();
     for (const d of dbDepts) {
@@ -37,7 +51,10 @@ async function getDepartmentProfiles() {
         deptMap.set(d.name.trim(), {
           name: d.name.trim(),
           description: d.description || "",
-          docs: []
+          docs: [],
+          fileTypes: [],
+          acronyms: [],
+          topTerms: []
         });
       }
     }
@@ -47,13 +64,63 @@ async function getDepartmentProfiles() {
       if (doc.department && typeof doc.department === "string") {
         const dName = doc.department.trim();
         if (!deptMap.has(dName)) {
-          deptMap.set(dName, { name: dName, description: "", docs: [] });
+          deptMap.set(dName, { name: dName, description: "", docs: [], fileTypes: [], acronyms: [], topTerms: [] });
         }
         const profile = deptMap.get(dName);
         const docName = doc.title || doc.originalName || "";
         if (docName && !profile.docs.includes(docName)) {
           profile.docs.push(docName);
         }
+        if (doc.fileType && !profile.fileTypes.includes(doc.fileType)) {
+          profile.fileTypes.push(doc.fileType);
+        }
+      }
+    }
+
+    // Extract dynamic acronyms and key terms from chunks for each department
+    for (const profile of deptMap.values()) {
+      try {
+        const sampleChunks = await DocumentChunk.find({ department: profile.name })
+          .limit(100)
+          .select("content")
+          .lean();
+
+        if (sampleChunks.length > 0) {
+          const rawText = sampleChunks.map((c) => c.content || "").join(" ");
+
+          // 1. Dynamic Acronyms (uppercase 2-6 letter words appearing >= 3 times)
+          const rawAcronyms = rawText.match(/\b[A-Z]{2,6}\b/g) || [];
+          const acrFreqs = {};
+          rawAcronyms.forEach((a) => {
+            const aLower = a.toLowerCase();
+            if (!GENERIC_ROUTER_STOPWORDS.has(aLower) && !UPPER_STOPWORDS.has(a)) {
+              acrFreqs[a] = (acrFreqs[a] || 0) + 1;
+            }
+          });
+          profile.acronyms = Object.entries(acrFreqs)
+            .filter(([_, count]) => count >= 3)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 8)
+            .map(([a]) => a);
+
+          // 2. Dynamic Top Terms
+          const words = rawText.toLowerCase().replace(/[^a-z0-9_\-\s]/g, " ").split(/\s+/).filter(
+            (w) => w.length >= 3 && !GENERIC_ROUTER_STOPWORDS.has(w)
+          );
+          const freqs = {};
+          words.forEach((w) => { freqs[w] = (freqs[w] || 0) + 1; });
+          profile.topTerms = Object.entries(freqs)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 15)
+            .map(([w]) => w);
+
+          if (!profile.description || profile.description.trim().length === 0) {
+            const combined = [...new Set([...profile.acronyms, ...profile.topTerms.slice(0, 8)])];
+            profile.description = `Key Topics: ${combined.join(", ")}`;
+          }
+        }
+      } catch (e) {
+        // ignore
       }
     }
 
@@ -65,77 +132,168 @@ async function getDepartmentProfiles() {
 }
 
 /**
- * Fast direct matcher against department names, keywords, and domain patterns
+ * Fast direct matcher against dynamically discovered department names, document names, and indexed acronyms
  */
-function fastDepartmentMatch(question, profiles = []) {
+function fastRouterMatch(question, profiles = []) {
   const q = (question || "").toLowerCase();
 
-  // 1. Direct department name inclusion (e.g. "javascript", "college information")
-  const directMatches = [];
+  // Detect explicit visual intent (exclude questions asking about counts like "total images")
+  const isVisual =
+    /\b(screenshot|screenshots|diagram|diagrams|figure|figures|chart|charts|photo|illustration|confusion matrix|flowchart|page\s*\d+\s*(?:show|contain|display))\b/i.test(q) ||
+    (/\b(image|images)\b/i.test(q) && !/\b(?:total|count|number|how many)\s+images\b/i.test(q));
+
+  // Detect explicit tabular calculation intent
+  const isTabular = /\b(highest|lowest|average total|grade distribution|how many students|max marks|min marks|total marks|highest total)\b/i.test(q);
+
+  // 1. Direct dynamic acronym match (e.g. \bDR\b, \bJS\b, \bXYZ\b)
+  for (const p of profiles) {
+    for (const acr of (p.acronyms || [])) {
+      // Short acronyms (<= 3 chars) match case-sensitively to avoid matching English words
+      const isMatch = acr.length <= 3
+        ? new RegExp(`\\b${acr}\\b`).test(question)
+        : new RegExp(`\\b${acr}\\b`, "i").test(question);
+
+      if (isMatch) {
+        let queryType = "document_qa";
+        if (isTabular) queryType = "tabular";
+        else if (isVisual) queryType = "visual_qa";
+
+        return {
+          queryType,
+          candidates: [{ department: p.name, confidence: 0.95 }],
+          departments: [p.name],
+          confidence: 0.95
+        };
+      }
+    }
+  }
+
+  // 2. Direct department name or document name match
+  const matchingDepts = [];
   for (const p of profiles) {
     const dLower = p.name.toLowerCase();
     if (q.includes(dLower)) {
-      directMatches.push(p.name);
-    }
-  }
-  if (directMatches.length > 0) {
-    return { departments: directMatches, confidence: 0.95 };
-  }
-
-  // 2. Domain pattern detection
-  const isProg = PROGRAMMING_REGEX.test(q);
-  const isCol = COLLEGE_REGEX.test(q);
-
-  if (isProg && isCol) {
-    const progDept = profiles.find(
-      (p) =>
-        /javascript|programming|code|software/i.test(p.name) ||
-        p.docs.some((doc) => /javascript|code|programming/i.test(doc))
-    );
-    const colDept = profiles.find(
-      (p) =>
-        /college|campus|university|academic/i.test(p.name) ||
-        p.docs.some((doc) => /college|handbook|campus/i.test(doc))
-    );
-    const matched = [];
-    if (progDept) matched.push(progDept.name);
-    if (colDept && !matched.includes(colDept.name)) matched.push(colDept.name);
-    if (matched.length > 0) {
-      return { departments: matched, confidence: 0.95 };
+      matchingDepts.push(p.name);
+    } else {
+      const dWords = dLower.split(/\s+/).filter((w) => w.length >= 4);
+      if (dWords.length > 0 && dWords.some((w) => q.includes(w))) {
+        if (!matchingDepts.includes(p.name)) matchingDepts.push(p.name);
+      }
+      for (const doc of p.docs) {
+        const docBase = doc.toLowerCase().replace(/\.[a-z0-9]+$/i, "").replace(/[_-]/g, " ");
+        if (docBase.length >= 4 && q.includes(docBase)) {
+          if (!matchingDepts.includes(p.name)) matchingDepts.push(p.name);
+        }
+        const docTokens = docBase.split(/\s+/).filter((w) => w.length >= 4);
+        if (docTokens.length > 0 && docTokens.some((w) => q.includes(w))) {
+          if (!matchingDepts.includes(p.name)) matchingDepts.push(p.name);
+        }
+      }
     }
   }
 
-  if (isProg && !isCol) {
-    const progDept = profiles.find(
-      (p) =>
-        /javascript|programming|code|software/i.test(p.name) ||
-        p.docs.some((doc) => /javascript|code|programming/i.test(doc))
+  if (matchingDepts.length > 0) {
+    let queryType = "document_qa";
+    if (isTabular) queryType = "tabular";
+    else if (isVisual) queryType = "visual_qa";
+
+    const candidates = matchingDepts.slice(0, 2).map((d, idx) => ({
+      department: d,
+      confidence: idx === 0 ? 0.95 : 0.4
+    }));
+
+    return {
+      queryType,
+      candidates,
+      departments: [matchingDepts[0]],
+      confidence: 0.95
+    };
+  }
+
+  // 3. Tabular department matching
+  if (isTabular) {
+    const tabularProfile = profiles.find((p) =>
+      p.fileTypes.some((ft) => ["csv", "xlsx", "xls"].includes(ft)) ||
+      p.docs.some((doc) => /\.(csv|xlsx|xls)$/i.test(doc))
     );
-    if (progDept) {
-      return { departments: [progDept.name], confidence: 0.95 };
+    if (tabularProfile) {
+      return {
+        queryType: "tabular",
+        candidates: [{ department: tabularProfile.name, confidence: 0.95 }],
+        departments: [tabularProfile.name],
+        confidence: 0.95
+      };
     }
   }
 
-  if (isCol && !isProg) {
-    const colDept = profiles.find(
-      (p) =>
-        /college|campus|university|academic/i.test(p.name) ||
-        p.docs.some((doc) => /college|handbook|campus/i.test(doc))
-    );
-    if (colDept) {
-      return { departments: [colDept.name], confidence: 0.95 };
+  // 4. Dynamic top-terms overlap scoring (0ms fallback before calling LLM)
+  const candidateScores = [];
+  const qWords = q
+    .replace(/[^a-z0-9_\-\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !GENERIC_ROUTER_STOPWORDS.has(w));
+
+  for (const p of profiles) {
+    let score = 0;
+    for (const term of (p.topTerms || [])) {
+      if (qWords.includes(term) || q.includes(term)) {
+        score += 1;
+      }
     }
+    for (const doc of p.docs) {
+      const docTerms = doc.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/);
+      for (const dt of docTerms) {
+        if (dt.length >= 4 && qWords.includes(dt)) {
+          score += 1.5;
+        }
+      }
+    }
+    if (score > 0) {
+      candidateScores.push({ department: p.name, score });
+    }
+  }
+
+  candidateScores.sort((a, b) => b.score - a.score);
+
+  if (candidateScores.length > 0 && candidateScores[0].score >= 1.0) {
+    const top = candidateScores[0];
+    const second = candidateScores[1];
+    const isHighConfidence = !second || top.score >= second.score * 1.5;
+    const confidence = isHighConfidence ? 0.90 : 0.65;
+    const depts = isHighConfidence ? [top.department] : [top.department, second.department];
+
+    let queryType = "document_qa";
+    if (isTabular) queryType = "tabular";
+    else if (isVisual) queryType = "visual_qa";
+
+    return {
+      queryType,
+      candidates: candidateScores.slice(0, 2).map((c) => ({
+        department: c.department,
+        confidence: c.department === top.department ? confidence : 0.5
+      })),
+      departments: depts,
+      confidence
+    };
   }
 
   return null;
 }
 
 /**
- * LLM-based Department / Topic Router
- * Dynamically queries available departments from MongoDB
+ * Enterprise Router: Determines target department/document source and query type.
+ * Returns top 2 candidate sources with confidence.
+ * If top candidate confidence is low (< 0.70), both are searched.
+ *
+ * Query Types:
+ * - document_qa
+ * - tabular
+ * - visual_qa
+ * - out_of_scope
+ *
  * @param {string} question
  * @param {Array<{ role: string, content: string }>} conversationHistory
- * @returns {Promise<{ departments: string[], confidence: number }>}
+ * @returns {Promise<{ queryType: string, candidates: Array<{ department: string, confidence: number }>, departments: string[], confidence: number }>}
  */
 export async function routeDepartment(question, conversationHistory = []) {
   const startTime = Date.now();
@@ -143,34 +301,30 @@ export async function routeDepartment(question, conversationHistory = []) {
 
   if (profiles.length === 0) {
     console.log(`[Router] No departments configured in database. Using broad search.`);
-    return { departments: [], confidence: 1.0 };
+    return {
+      queryType: "document_qa",
+      candidates: [],
+      departments: [],
+      confidence: 1.0
+    };
   }
 
   const allDeptNames = profiles.map((p) => p.name);
 
-  // 1. Fast path: Direct unambiguous matching without LLM call (0ms)
-  const fastMatch = fastDepartmentMatch(question, profiles);
+  // 1. Fast dynamic match without LLM call
+  const fastMatch = fastRouterMatch(question, profiles);
   if (fastMatch) {
     console.log(
-      `[Router Fast-Path] Direct match to [${fastMatch.departments.join(", ")}] in ${Date.now() - startTime}ms`
+      `[Router Fast-Path] Direct match to [${fastMatch.departments.join(", ")}] type=${fastMatch.queryType} in ${Date.now() - startTime}ms`
     );
     return fastMatch;
   }
 
-  // Check conversation history for reference questions (e.g. "what about that?")
+  // Conversation history reference context (used ONLY to resolve pronouns/references, NOT as facts)
   let historyText = "";
   if (conversationHistory && conversationHistory.length > 0) {
     const recent = conversationHistory.slice(-2);
     historyText = recent.map((m) => `${m.role}: ${m.content}`).join("\n");
-    if (question.split(/\s+/).length <= 6) {
-      const historyFastMatch = fastDepartmentMatch(historyText, profiles);
-      if (historyFastMatch) {
-        console.log(
-          `[Router Fast-Path] Resolved from conversation history [${historyFastMatch.departments.join(", ")}] in ${Date.now() - startTime}ms`
-        );
-        return historyFastMatch;
-      }
-    }
   }
 
   // 2. Dynamic Department Descriptions for LLM prompt
@@ -178,25 +332,34 @@ export async function routeDepartment(question, conversationHistory = []) {
     .map((p) => {
       const docsStr = p.docs.length > 0 ? ` (Documents: ${p.docs.join(", ")})` : "";
       const descStr = p.description ? ` - ${p.description}` : "";
-      return `- ${p.name}${docsStr}${descStr}`;
+      return `- "${p.name}"${docsStr}${descStr}`;
     })
     .join("\n");
 
-  const prompt = `You are a query router in an enterprise knowledge system.
-Match the user question to the department whose indexed documents contain the answer.
+  const prompt = `You are a query classifier and router in an enterprise knowledge system.
+Given the user question and the available departments/documents, determine:
+1. "queryType": exactly one of ["document_qa", "tabular", "visual_qa", "out_of_scope"]
+   - "tabular": questions asking for calculations (highest, lowest, average, total, count, sum, ranking, distribution) from CSV/spreadsheet files.
+   - "visual_qa": questions asking about screenshots, images, diagrams, confusion matrix, figures, charts, or what is shown on a specific page.
+   - "document_qa": questions seeking factual information, concepts, explanations, steps, training, or code from uploaded documents.
+   - "out_of_scope": ONLY questions completely unrelated to any uploaded department/document (e.g. cricket, celebrity gossip, world history, politics, outside trivia).
+2. "candidates": top 2 candidate departments from the Available Departments list with confidence scores (0.0 to 1.0).
 
-Available Departments:
+Available Departments and Documents:
 ${deptDescriptions}
 
-Routing Guidelines:
-- Questions about programming, syntax, variables (const, let, var), operators, functions, data types, closures, hoisting, scope, callbacks, promises, async/await, and error handling belong to programming/software departments (e.g., JavaScript).
-- Questions about college admissions, campus, fees, hostels, faculty, courses, handbook, and administration belong to College Information.
-- If the question spans multiple departments (e.g. asks about both programming and college information), include all relevant department names in the array: {"departments": ["JavaScript", "College Information"], "confidence": 0.95}.
-- If completely unrelated or none fit, return [].
+Routing Instructions:
+- Questions asking about neural network training, model architecture, medical screening, or disease systems belong to the corresponding technical department (e.g. Eye disease).
+- Questions asking about programming language syntax, variables, keywords, functions, or JavaScript belong to the software/code department (e.g. JavaScript).
+- Questions about college admissions, handbook, courses, placements, hostel, or college rules belong to College Information.
+- If uncertain between two departments, list both in candidates.
+- Never answer the question. Only classify and route.
 
 User Question: "${question}"
-${historyText ? `Conversation Context:\n${historyText}\n` : ""}
-Return ONLY a valid JSON object: {"departments": ["Name"], "confidence": 0.95}`;
+${historyText ? `Recent Conversation Context:\n${historyText}\n` : ""}
+
+Return ONLY a valid JSON object matching this schema:
+{"queryType": "document_qa", "candidates": [{"department": "Name", "confidence": 0.95}, {"department": "Name2", "confidence": 0.40}]}`;
 
   try {
     const response = await axios.post(
@@ -207,37 +370,86 @@ Return ONLY a valid JSON object: {"departments": ["Name"], "confidence": 0.95}`;
         stream: false,
         options: {
           temperature: 0.0,
-          num_predict: 40
+          num_predict: 120
         }
       },
-      { timeout: 8000 }
+      { timeout: 45000 }
     );
 
     const rawResponse = response.data?.response || "";
     const parsed = extractJson(rawResponse);
 
-    if (
-      parsed &&
-      Array.isArray(parsed.departments) &&
-      typeof parsed.confidence === "number"
-    ) {
-      const validDepts = parsed.departments.filter((d) =>
-        allDeptNames.some((avail) => avail.toLowerCase() === d.toLowerCase())
-      );
+    if (parsed) {
+      let queryType = parsed.queryType || "document_qa";
+      if (!["document_qa", "tabular", "visual_qa", "out_of_scope"].includes(queryType)) {
+        queryType = "document_qa";
+      }
+
+      // Check if question asks about visual features
+      if (/\b(screenshot|screenshots|diagram|figure|confusion matrix)\b/i.test(question)) {
+        queryType = "visual_qa";
+      }
+
+      let candidates = Array.isArray(parsed.candidates) ? parsed.candidates : [];
+      candidates = candidates
+        .filter((c) => c && typeof c.department === "string")
+        .map((c) => {
+          const matchedName = allDeptNames.find(
+            (avail) => avail.toLowerCase() === c.department.trim().toLowerCase()
+          );
+          return matchedName ? { department: matchedName, confidence: Number(c.confidence) || 0.5 } : null;
+        })
+        .filter(Boolean);
+
+      if (queryType === "out_of_scope" || candidates.length === 0) {
+        console.log(`[Router LLM] Classified as OUT_OF_SCOPE in ${Date.now() - startTime}ms`);
+        return {
+          queryType: "out_of_scope",
+          candidates: [],
+          departments: [],
+          confidence: 1.0
+        };
+      }
+
+      const topConfidence = candidates[0].confidence;
+
+      // If top confidence is low (< 0.70) and there's a second candidate, search both! Never hard-filter on a low-confidence guess.
+      let departmentsToSearch = [];
+      if (candidates.length >= 2 && topConfidence < 0.70) {
+        departmentsToSearch = [candidates[0].department, candidates[1].department];
+        console.log(
+          `[Router LLM] Low confidence (${topConfidence.toFixed(2)}). Searching both top candidates: [${departmentsToSearch.join(", ")}]`
+        );
+      } else {
+        departmentsToSearch = [candidates[0].department];
+      }
 
       console.log(
-        `[Router LLM] Classified into: [${validDepts.join(", ")}] with confidence ${parsed.confidence} (${Date.now() - startTime}ms)`
+        `[Router LLM] Routed queryType="${queryType}", depts=[${departmentsToSearch.join(", ")}], topConfidence=${topConfidence} in ${Date.now() - startTime}ms`
       );
+
       return {
-        departments: validDepts,
-        confidence: Math.min(1.0, Math.max(0.0, parsed.confidence))
+        queryType,
+        candidates,
+        departments: departmentsToSearch,
+        confidence: topConfidence
       };
     }
 
-    console.warn(`[Router Warning] Could not parse structured JSON from LLM: "${rawResponse}". Using broad search.`);
-    return { departments: allDeptNames, confidence: 0.5 };
+    console.warn(`[Router Warning] Could not parse JSON from LLM: "${rawResponse}". Using broad search.`);
+    return {
+      queryType: "document_qa",
+      candidates: allDeptNames.map((d) => ({ department: d, confidence: 0.5 })),
+      departments: allDeptNames,
+      confidence: 0.5
+    };
   } catch (error) {
     console.warn(`[Router Notice] LLM routing error (${error.message}). Using broad search.`);
-    return { departments: allDeptNames, confidence: 0.5 };
+    return {
+      queryType: "document_qa",
+      candidates: allDeptNames.map((d) => ({ department: d, confidence: 0.5 })),
+      departments: allDeptNames,
+      confidence: 0.5
+    };
   }
 }

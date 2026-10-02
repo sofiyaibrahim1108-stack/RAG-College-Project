@@ -1,21 +1,40 @@
 /**
  * Constructs the contextual prompt payload for the LLM
- * Combines retrieved text chunks, image references, and citations.
+ * Combines retrieved text chunks, image references, and deterministic tabular tool results.
+ * Clearly separates evidence categories with precise document and page citations.
+ *
+ * @param {Array<Object>} textChunks
+ * @param {Array<Object>} images
+ * @param {Object|null} tabularResult
+ * @returns {{ contextPrompt: string, textChunks: Array<Object>, images: Array<Object>, tabularResult: Object|null }}
  */
-export function buildRAGContext(textChunks = [], images = []) {
-  if (textChunks.length === 0 && images.length === 0) {
+export function buildRAGContext(textChunks = [], images = [], tabularResult = null) {
+  const hasChunks = Array.isArray(textChunks) && textChunks.length > 0;
+  const hasImages = Array.isArray(images) && images.length > 0;
+  const hasTabular = tabularResult && tabularResult.success;
+
+  if (!hasChunks && !hasImages && !hasTabular) {
     return {
       contextPrompt: "NO_DOCUMENTS_FOUND",
       textChunks: [],
-      images: []
+      images: [],
+      tabularResult: null
     };
   }
 
   const contextSections = [];
 
-  // 1. Text chunks section
+  // 1. Tabular Tool Result Section (Deterministic dataset calculations)
+  if (hasTabular) {
+    contextSections.push("=== TABULAR TOOL RESULT ===");
+    contextSections.push(
+      `Document: ${tabularResult.documentName}\nOperation: ${tabularResult.operation}\nCalculation Result:\n${tabularResult.summary}`
+    );
+  }
+
+  // 2. Document Excerpts Section
   const seenContents = new Set();
-  if (textChunks.length > 0) {
+  if (hasChunks) {
     contextSections.push("=== DOCUMENT EXCERPTS ===");
     let sourceIndex = 1;
 
@@ -25,55 +44,59 @@ export function buildRAGContext(textChunks = [], images = []) {
       if (seenContents.has(cleanContent)) return;
       seenContents.add(cleanContent);
 
-      const pageInfo = chunk.pageNumber ? ` (Page ${chunk.pageNumber})` : "";
+      const pageStr = chunk.pageNumber ? `Page ${chunk.pageNumber}` : "Page 1";
       contextSections.push(
-        `[Source ${sourceIndex}]: ${chunk.documentName}${pageInfo}\n${cleanContent}`
+        `[Source ${sourceIndex}] Document: ${chunk.documentName} | ${pageStr}\n${cleanContent}`
       );
       sourceIndex++;
     });
   }
 
-  // 2. Visual evidence section
-  if (images.length > 0) {
+  // 3. Relevant Visual Evidence Section
+  if (hasImages) {
     contextSections.push("=== RELEVANT VISUAL EVIDENCE ===");
     images.forEach((img, index) => {
-      const pageInfo = img.pageNumber ? ` (Page ${img.pageNumber})` : "";
-      const captionInfo = img.caption ? `\n  Caption: ${img.caption}` : "";
-      const simInfo = img.similarity ? `\n  Match Score: ${(img.similarity * 100).toFixed(0)}%` : "";
+      const pageStr = img.pageNumber ? `Page ${img.pageNumber}` : "Page 1";
+      const lines = [];
 
-      // Build description: use stored description if available
-      let descLines = [];
-      if (img.description && img.description.trim()) {
-        descLines.push(`  Visual Description: ${img.description.trim()}`);
+      lines.push(`[Visual Evidence ${index + 1}] Document: ${img.documentName} | ${pageStr} | File: ${img.filename}`);
+
+      if (img.caption && img.caption.trim()) {
+        lines.push(`Caption: ${img.caption.trim()}`);
       }
 
-      // Attach same-page text chunks ONLY when they belong to that exact visual/page
-      const usedKey = (c) => "__visual_ctx__" + (c.content || "").trim().slice(0, 40);
+      // Include OCR text extracted directly from inside the screenshot/image
+      if (img.ocrText && img.ocrText.trim()) {
+        lines.push(`OCR Extracted Text from Screenshot:\n${img.ocrText.trim()}`);
+      }
 
-      const samePageChunks = textChunks.filter(
-        (c) =>
-          c.pageNumber === img.pageNumber &&
-          c.documentName === img.documentName &&
-          !seenContents.has(usedKey(c))
-      );
+      if (img.description && img.description.trim() && (!img.ocrText || !img.description.includes(img.ocrText.slice(0, 50)))) {
+        lines.push(`Visual Description: ${img.description.trim()}`);
+      }
 
-      if (samePageChunks.length > 0) {
-        const pageCtx = samePageChunks
-          .map((c) => (c.content || "").trim())
-          .filter(Boolean)
-          .join(" ")
-          .slice(0, 600);
-        if (pageCtx) {
-          descLines.push(`  Same-Page Context: ${pageCtx}`);
-          samePageChunks.forEach((c) => seenContents.add(usedKey(c)));
+      // Attach same-page text chunks ONLY from the exact same document and exact same page
+      if (hasChunks) {
+        const samePageChunks = textChunks.filter(
+          (c) =>
+            c.pageNumber === img.pageNumber &&
+            c.documentName === img.documentName &&
+            !c.content?.startsWith("[Visual Screenshot Evidence")
+        );
+
+        if (samePageChunks.length > 0) {
+          const samePageText = samePageChunks
+            .map((c) => (c.content || "").trim())
+            .filter(Boolean)
+            .join("\n")
+            .slice(0, 500);
+
+          if (samePageText) {
+            lines.push(`Same-Page Context:\n${samePageText}`);
+          }
         }
       }
 
-      const descBlock = descLines.length > 0 ? "\n" + descLines.join("\n") : "";
-
-      contextSections.push(
-        `[Visual Evidence ${index + 1}]: ${img.documentName}${pageInfo}${captionInfo}${simInfo}${descBlock}`
-      );
+      contextSections.push(lines.join("\n"));
     });
   }
 
@@ -81,7 +104,8 @@ export function buildRAGContext(textChunks = [], images = []) {
 
   return {
     contextPrompt,
-    textChunks,
-    images
+    textChunks: textChunks || [],
+    images: images || [],
+    tabularResult
   };
 }

@@ -27,7 +27,8 @@ const ImageSchema = new mongoose.Schema(
       required: true
     },
     caption: { type: String, default: "" },
-    description: { type: String, default: "" }
+    description: { type: String, default: "" },
+    ocrText: { type: String, default: "" }
   },
   { timestamps: true }
 );
