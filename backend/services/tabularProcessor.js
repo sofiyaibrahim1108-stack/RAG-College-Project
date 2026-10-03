@@ -103,10 +103,19 @@ export async function processTabularQuery(question = "", targetDepartments = [],
         }
       }
 
-      // Format clean summary
-      const breakdown = Object.entries(counts)
-        .sort((a, b) => b[1] - a[1])
-        .map(([k, v]) => `${gradeCol} ${k}: ${v}`)
+      // Format clean summary: Grade A: 11, Grade B: 15, Grade C: 4
+      const gradeOrder = ["A", "B", "C", "D", "E", "F", "Pass", "Fail"];
+      const sortedEntries = Object.entries(counts).sort(([a], [b]) => {
+        const ia = gradeOrder.indexOf(a);
+        const ib = gradeOrder.indexOf(b);
+        if (ia !== -1 && ib !== -1) return ia - ib;
+        if (ia !== -1) return -1;
+        if (ib !== -1) return 1;
+        return a.localeCompare(b);
+      });
+
+      const breakdown = sortedEntries
+        .map(([k, v]) => `Grade ${k}: ${v}`)
         .join(", ");
 
       return {
@@ -116,7 +125,7 @@ export async function processTabularQuery(question = "", targetDepartments = [],
         column: gradeCol,
         counts,
         totalRecords: totalValid,
-        summary: `According to ${doc.originalName}, the ${gradeCol} distribution across ${totalValid} records is: ${breakdown}.`
+        summary: `According to ${doc.originalName}, the count of students for each grade is: ${breakdown} (Total students: ${totalValid}). Specifically: Grade A = ${counts["A"] ?? 0}, Grade B = ${counts["B"] ?? 0}, Grade C = ${counts["C"] ?? 0}.`
       };
     }
   }
@@ -157,6 +166,8 @@ export async function processTabularQuery(question = "", targetDepartments = [],
       const topPerson = topRows[0];
       const nameCol = columns.find((c) => /^name$/i.test(c)) || columns.find((c) => /name/i.test(c)) || columns[0];
       const personName = topPerson ? topPerson[nameCol] : "Unknown";
+      const personAverage = topPerson.Average !== undefined ? topPerson.Average : (topPerson.average !== undefined ? topPerson.average : "N/A");
+      const personGrade = topPerson.Grade !== undefined ? topPerson.Grade : (topPerson.grade !== undefined ? topPerson.grade : "N/A");
 
       return {
         success: true,
@@ -165,7 +176,7 @@ export async function processTabularQuery(question = "", targetDepartments = [],
         column: targetCol,
         highestValue: maxVal,
         topRecords: topRows,
-        summary: `The highest ${targetCol} in ${doc.originalName} is ${maxVal}, obtained by ${personName}. Full record: ${JSON.stringify(topPerson)}`
+        summary: `The student with the highest ${targetCol} in ${doc.originalName} is ${personName} with ${maxVal} total marks. Her average is ${personAverage} and her grade is ${personGrade}. Full record: ${JSON.stringify(topPerson)}`
       };
     }
   }

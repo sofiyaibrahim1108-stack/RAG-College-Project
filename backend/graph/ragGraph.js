@@ -50,7 +50,7 @@ async function routerNode(state) {
   try {
     const routeResult = await routeDepartment(state.question, state.conversationHistory);
     const duration = Date.now() - t0;
-    console.log(`[Timing] Router: ${duration} ms (Type: ${routeResult.queryType}, Depts: [${routeResult.departments.join(", ")}])`);
+    console.log(`[Router] ${duration}ms (Type: ${routeResult.queryType}, Depts: [${routeResult.departments.join(", ")}])`);
 
     return {
       queryType: routeResult.queryType,
@@ -144,12 +144,12 @@ async function textRetrievalNode(state) {
       state.question
     );
     const duration = Date.now() - t0;
-    console.log(`[Timing] Text Retrieval: ${duration} ms`);
+    console.log(`[Retrieval] ${duration}ms`);
 
     return {
       retrievedChunks: chunks,
       sources: formatSources(chunks),
-      timings: { textRetrieval: duration }
+      timings: { textRetrieval: duration, retrieval: duration }
     };
   } catch (err) {
     console.error(`[Node: textRetrieval] Error: ${err.message}`);
@@ -187,7 +187,7 @@ async function imageEmbeddingNode(state) {
   try {
     const siglipEmb = await siglipClient.embedText(state.question);
     const duration = Date.now() - t0;
-    console.log(`[Timing] SigLIP Embedding: ${duration} ms`);
+    console.log(`[Timing] SigLIP Embedding: ${duration}ms`);
 
     return {
       siglipQueryEmbedding: siglipEmb,
@@ -225,7 +225,7 @@ async function imageRetrievalNode(state) {
       state.question
     );
     const duration = Date.now() - t0;
-    console.log(`[Timing] Image Retrieval: ${duration} ms`);
+    console.log(`[ImageRetrieval] ${duration}ms`);
 
     return {
       retrievedImages: images,
@@ -247,9 +247,9 @@ async function imageRetrievalNode(state) {
  */
 async function contextBuilderNode(state) {
   const t0 = Date.now();
-  const context = buildRAGContext(state.retrievedChunks, state.retrievedImages, state.tabularResult);
+  const context = buildRAGContext(state.retrievedChunks, state.retrievedImages, state.tabularResult, state.question);
   const duration = Date.now() - t0;
-  console.log(`[Timing] Context Builder: ${duration} ms`);
+  console.log(`[ContextBuilder] ${duration}ms`);
 
   return {
     contextPrompt: context.contextPrompt,
@@ -264,37 +264,45 @@ async function generateAnswerNode(state) {
   const t0 = Date.now();
 
   // Out of scope gate check
+  const tGate = Date.now();
   if (state.queryType === "out_of_scope") {
-    console.log(`[Evidence Gate] Query type is out_of_scope -> Returning fallback without calling generation model`);
+    const gateDuration = Date.now() - tGate;
+    console.log(`[Evidence Gate] ${gateDuration}ms (out_of_scope)`);
+    console.log(`[Generation] 0ms`);
     return {
       finalAnswer: FALLBACK_MESSAGE,
       sources: [],
       imageCitations: [],
-      timings: { llm: 0 }
+      timings: { evidenceGate: gateDuration, generation: 0, llm: 0 }
     };
   }
 
   // Pre-LLM Evidence Support Gate
   const gate = checkEvidenceSupportGate(state.question, state.contextPrompt, state.queryType);
+  const gateDuration = Date.now() - tGate;
+  console.log(`[Evidence Gate] ${gateDuration}ms`);
+
   if (!gate.supported) {
     console.log(`[Evidence Gate] Question "${state.question}" rejected: ${gate.reason}. Skipping LLM call.`);
+    console.log(`[Generation] 0ms`);
     return {
       finalAnswer: FALLBACK_MESSAGE,
       sources: [],
       imageCitations: [],
-      timings: { llm: 0 }
+      timings: { evidenceGate: gateDuration, generation: 0, llm: 0 }
     };
   }
 
   try {
+    const tGen = Date.now();
     const answer = await generateAnswer(
       state.question,
       state.contextPrompt,
       state.conversationHistory,
       state.queryType
     );
-    const duration = Date.now() - t0;
-    console.log(`[Timing] LLM: ${duration} ms`);
+    const genDuration = Date.now() - tGen;
+    console.log(`[Generation] ${genDuration}ms`);
 
     const isMissing = isFallbackAnswer(answer);
     const finalAnswer = isMissing ? FALLBACK_MESSAGE : answer;
@@ -303,13 +311,13 @@ async function generateAnswerNode(state) {
       finalAnswer,
       sources: isMissing ? [] : state.sources,
       imageCitations: isMissing ? [] : state.imageCitations,
-      timings: { llm: duration }
+      timings: { evidenceGate: gateDuration, generation: genDuration, llm: genDuration }
     };
   } catch (err) {
     console.error(`[Node: generateAnswer] Error: ${err.message}`);
     return {
       finalAnswer: FALLBACK_MESSAGE,
-      timings: { llm: Date.now() - t0 }
+      timings: { evidenceGate: gateDuration, generation: Date.now() - t0, llm: Date.now() - t0 }
     };
   }
 }
@@ -354,6 +362,7 @@ async function saveConversationNode(state) {
   const duration = Date.now() - t0;
   const timings = state.timings || {};
   const total = Object.values(timings).reduce((acc, v) => acc + (typeof v === "number" ? v : 0), 0) + duration;
+  console.log(`[Total] ${total}ms`);
 
   return {
     conversationId: convId,

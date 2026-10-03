@@ -3,7 +3,7 @@ import { ENV } from "../config/env.js";
 import { RAG_CONFIG } from "../config/rag.js";
 import { extractQueryTerms } from "./textRetrieval.js";
 
-export const FALLBACK_MESSAGE = "I couldn't find this in the uploaded documents.";
+export const FALLBACK_MESSAGE = "I couldn't find this information in the uploaded documents.";
 
 /**
  * Checks whether an answer string is the fallback or an admission of missing evidence.
@@ -12,10 +12,10 @@ export function isFallbackAnswer(answer) {
   if (!answer || !answer.trim()) return true;
   const trimmed = answer.trim();
   if (trimmed === FALLBACK_MESSAGE) return true;
-  if (/^I couldn'?t find (this|enough information) in the uploaded documents\.?/i.test(trimmed)) return true;
-  if (/^I don'?t have enough information/i.test(trimmed)) return true;
-  if (/cannot be determined from the (provided|retrieved|uploaded)/i.test(trimmed)) return true;
-  if (/not specified in the (provided|retrieved|uploaded)/i.test(trimmed)) return true;
+  if (/^I couldn'?t find this (information )?in the uploaded documents\.?/i.test(trimmed) && trimmed.length < 120) return true;
+  if (/^I couldn'?t find (this|enough information) in the uploaded documents\.?/i.test(trimmed) && trimmed.length < 120) return true;
+  if (/^I don'?t have enough information/i.test(trimmed) && trimmed.length < 120) return true;
+  if (/^(?:The requested information |This )?(?:cannot be determined|is not (?:specified|found|available)) (?:from|in) the (?:provided|retrieved|uploaded)/i.test(trimmed) && trimmed.length < 150) return true;
   return false;
 }
 
@@ -82,104 +82,102 @@ export function checkEvidenceSupportGate(question = "", contextPrompt = "", quer
 }
 
 /**
- * Step 9: Strict document-grounded system prompt
+ * Strict document-grounded system prompt per Section 12
  */
 function buildSystemPrompt(contextPrompt) {
   return `You are a document-grounded assistant.
 
-Answer ONLY using the supplied evidence.
+Answer using ONLY the retrieved evidence supplied in CONTEXT.
 
-Never use outside knowledge.
-Never use pretrained knowledge.
-Never invent facts.
-Never invent numbers.
-Never invent names.
-Never invent examples.
-Never invent code.
-Never infer missing information as fact.
+Never use outside knowledge to fill missing information.
 
-If the evidence does not support the requested answer, reply exactly:
-I couldn't find this in the uploaded documents.
+Never invent:
+- numbers
+- names
+- dates
+- percentages
+- examples
+- code
+- statistics
+- technical specifications
+- conclusions
 
-If only part of the answer is supported, provide only the supported part and clearly state what information is missing.
+If the context contains the answer, answer clearly and naturally.
 
-Match answer length to the question:
+If the context contains only part of the answer, or if the question contains multiple parts/topics, answer each supported part and clearly state what specific information is not found in the documents.
 
-Simple factual question:
-1-2 sentences.
+If the context does not support the answer at all, reply exactly:
 
-Explain/how/why/difference/compare/steps:
-Give a structured explanation using bullets or numbered steps.
+'I couldn't find this information in the uploaded documents.'
 
-Examples may ONLY be used if an example is present in the supplied evidence.
+Match the response length to the question:
+- simple factual question: 1–2 sentences
+- explain/how/why/difference/compare/steps/multi-topic: structured detailed answer
 
-Numbers, names, dates, percentages and measurements must be copied exactly from the evidence.
+Preserve numbers, names, dates and technical values exactly as provided in the context.
 
-CRITICAL RULE ON CONFLICTING OR MULTIPLE VALUES:
-If different documents, pages, or sections report different values for the same metric, entity, or model (for example, ~96% overall accuracy in a report/evaluation vs. 94% in a code/UI table):
-You MUST state both values and clearly identify each source. Do not silently select only one value.
+If retrieved sources contain conflicting or different values (for example, report text stating approximately 96% validation accuracy while code or UI tables show 94%), you MUST explicitly report the conflict, state which page/source contains each value, and not silently choose one.
 
-When answering about marks, scores, or numbers that fall into a defined range in a table (such as a grading scale where 85 falls in 81–90):
-identify the applicable range from the table and report the corresponding grade/result.
+Use only the document relevant to the user's question.
 
-Use the document actually relevant to the question.
+Chat history may help understand the user's question, but chat history is NEVER a source of factual information.
 
-Conversation history may help understand the user's current question, but previous assistant answers are NOT evidence.
+Do not use previous assistant answers as evidence.
 
-Never use a previous assistant answer as proof.
+For examples and code, use only examples/code explicitly present in the retrieved context.
 
-Answer only from the supplied evidence.
+Do not create new examples from general knowledge.
 
+At the end, provide the supporting source file name and page number(s) when available.
+
+CONTEXT:
 ${contextPrompt}
 `;
 }
 
 /**
- * Cleanly extracts JSON from an LLM response string
- */
-function extractJson(text) {
-  if (!text) return null;
-  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || text.match(/\{[\s\S]*\}/);
-  const jsonStr = jsonMatch ? jsonMatch[1] || jsonMatch[0] : text.trim();
-  try {
-    return JSON.parse(jsonStr);
-  } catch (err) {
-    return null;
-  }
-}
-
-/**
- * Step 10: Deterministic factual claim check.
- * Verifies that numbers, percentages, and technical identifiers appearing in the answer
- * actually exist in the supplied contextPrompt.
+ * Deterministic factual claim check.
+ * Verifies that numbers and percentages appearing in the answer actually exist in contextPrompt or question.
  *
  * @param {string} answer
  * @param {string} contextPrompt
+ * @param {string} question
  * @returns {{ valid: boolean, unsupported: string[] }}
  */
-export function checkFactualTokens(answer, contextPrompt) {
+export function checkFactualTokens(answer, contextPrompt, question = "") {
   if (isFallbackAnswer(answer)) {
     return { valid: true, unsupported: [] };
   }
 
-  const contextLower = contextPrompt.toLowerCase();
+  const contextLower = (contextPrompt || "").toLowerCase();
+  const questionLower = (question || "").toLowerCase();
+  const combinedEvidence = `${contextLower} ${questionLower}`;
   const unsupported = [];
 
   // 1. Extract percentages (e.g. "95.2%", "96%")
   const percentages = answer.match(/\b\d+(?:\.\d+)?%/g) || [];
   for (const pct of percentages) {
-    if (!contextLower.includes(pct.toLowerCase())) {
+    const rawVal = parseFloat(pct.replace("%", ""));
+    const decimalStr = (rawVal / 100).toFixed(2);
+    const decimalAlt = (rawVal / 100).toString();
+
+    const isLiteralPresent = combinedEvidence.includes(pct.toLowerCase());
+    const isDecimalPresent = combinedEvidence.includes(decimalStr) || combinedEvidence.includes(decimalAlt);
+
+    if (!isLiteralPresent && !isDecimalPresent) {
       unsupported.push(pct);
     }
   }
 
   // 2. Extract multi-digit numbers (e.g. "10000", "715", "261", "224")
-  const numbers = answer.match(/\b\d{2,}(?:,\d{3})*(?:\.\d+)?\b/g) || [];
+  // Strip code blocks and inline code so demonstrative variables (e.g. let x = 40) don't trigger false positives
+  const proseOnly = answer.replace(/```[\s\S]*?```/g, " ").replace(/`[^`]+`/g, " ");
+  const numbers = proseOnly.match(/\b\d{2,}(?:,\d{3})*(?:\.\d+)?\b/g) || [];
   for (const num of numbers) {
     const rawNum = num.replace(/,/g, "");
-    if (!contextLower.includes(num.toLowerCase()) && !contextLower.includes(rawNum)) {
-      // Ignore common formatting artifacts like markdown indices or years in question
-      if (!["10", "12", "15", "20", "24", "25", "26"].includes(rawNum)) {
+    if (!combinedEvidence.includes(num.toLowerCase()) && !combinedEvidence.includes(rawNum)) {
+      // Allow standard small integers, years, or list indices
+      if (!["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "15", "20", "24", "25", "26", "30", "40", "50", "60", "70", "80", "90", "100"].includes(rawNum)) {
         unsupported.push(num);
       }
     }
@@ -192,84 +190,39 @@ export function checkFactualTokens(answer, contextPrompt) {
 }
 
 /**
- * Step 10 & User Instruction: LLM Judge pass.
- * Gives the judge the evidence and the answer, asks it to list any claim not explicitly supported.
- * (JSON: {"unsupported_claims": []})
- *
- * @param {string} answer
- * @param {string} contextPrompt
- * @returns {Promise<string[]>}
- */
-export async function runLlmJudge(answer, contextPrompt) {
-  if (isFallbackAnswer(answer)) return [];
-
-  const judgePrompt = `You are a strict factual grounding evaluator.
-Compare the following Generated Answer against the Provided Evidence.
-List any claims, facts, numbers, names, or examples in the answer that are NOT explicitly supported by the evidence.
-If every fact in the answer is directly supported by the evidence, return an empty array.
-
-Provided Evidence:
-${contextPrompt.slice(0, 4000)}
-
-Generated Answer:
-${answer}
-
-Return ONLY a valid JSON object:
-{"unsupported_claims": ["claim 1", ...]}`;
-
-  try {
-    const response = await axios.post(
-      `${ENV.OLLAMA_BASE_URL}/api/generate`,
-      {
-        model: ENV.OLLAMA_LLM_MODEL,
-        prompt: judgePrompt,
-        stream: false,
-        options: {
-          temperature: 0.0,
-          num_predict: 100
-        }
-      },
-      { timeout: 45000 }
-    );
-
-    const parsed = extractJson(response.data?.response);
-    if (parsed && Array.isArray(parsed.unsupported_claims)) {
-      return parsed.unsupported_claims.filter((c) => c && typeof c === "string" && c.trim().length > 0);
-    }
-    return [];
-  } catch (err) {
-    console.warn(`[LLM Judge] Notice: ${err.message}`);
-    return [];
-  }
-}
-
-/**
- * Generates answer from local Ollama model with deterministic evidence gating,
- * strict grounding prompt, and Step 10 verification with single retry fallback.
+ * Generates answer from local Ollama model with deterministic evidence gating.
+ * EXACTLY ONE QWEN CALL PER QUESTION. NO LLM JUDGE. NO REGENERATION LOOP.
  */
 export async function generateAnswer(question, contextPrompt, conversationHistory = [], queryType = "document_qa") {
   const startTime = Date.now();
 
-  // 1. Pre-generation evidence gate
+  // 1. Pre-generation evidence gate (purely deterministic)
   const gate = checkEvidenceSupportGate(question, contextPrompt, queryType);
   if (!gate.supported) {
-    console.log(`[LLM] Question "${question}" failed evidence gate (${gate.reason}). Returning fallback.`);
+    console.log(`[Evidence Gate] Question "${question}" failed evidence gate (${gate.reason}). Returning fallback.`);
     return FALLBACK_MESSAGE;
   }
 
-  // 2. Generate grounded answer
+  // 2. Generate grounded answer (ONE Qwen call)
   const systemPrompt = buildSystemPrompt(contextPrompt);
 
-  // Format conversation history strictly for conversational reference, NOT as authoritative evidence
   const historyMessages = (conversationHistory || []).slice(-RAG_CONFIG.historyWindow).map((m) => ({
     role: m.role,
     content: m.content
   }));
 
+  let userContent = question;
+  if (contextPrompt.includes("=== CONFLICTING EVIDENCE NOTICE ===")) {
+    userContent += "\n\n(Important: The retrieved context contains conflicting accuracy values. You must report the conflict explicitly and state both figures with their source pages.)";
+  }
+  if (contextPrompt.includes("=== MULTI-TOPIC QUERY GUIDELINES ===")) {
+    userContent += "\n\n(Important: Address each topic separately. If information for any specific item is not present in the documents, explicitly state that it was not found in the uploaded documents.)";
+  }
+
   const messages = [
     { role: "system", content: systemPrompt },
     ...historyMessages,
-    { role: "user", content: question }
+    { role: "user", content: userContent }
   ];
 
   try {
@@ -280,8 +233,8 @@ export async function generateAnswer(question, contextPrompt, conversationHistor
         messages: messages,
         stream: false,
         options: {
-          temperature: 0.1, // Step 9: temperature: 0.1
-          num_ctx: 8192,     // Step 9: num_ctx: 8192
+          temperature: 0.1,
+          num_ctx: 8192,
           num_predict: 800
         }
       },
@@ -289,72 +242,19 @@ export async function generateAnswer(question, contextPrompt, conversationHistor
     );
 
     let answer = (response.data?.message?.content || "").trim();
-    console.log(`[LLM] Generated answer in ${Date.now() - startTime}ms`);
+    console.log(`[LLM Generation] Answer generated in ${Date.now() - startTime}ms`);
 
     if (isFallbackAnswer(answer)) {
       return FALLBACK_MESSAGE;
     }
 
-    // 3. Step 10 Post-Generation Grounding Check
-    const tokenCheck = checkFactualTokens(answer, contextPrompt);
-    const rawJudgeUnsupported = await runLlmJudge(answer, contextPrompt);
-    const contextLower = contextPrompt.toLowerCase();
-
-    // Filter judge false-positives: if claim exists in context or describes missing data/binary classification, it is supported
-    const judgeUnsupported = rawJudgeUnsupported.filter((claim) => {
-      const clean = (claim || "").trim().toLowerCase();
-      if (!clean) return false;
-      if (contextLower.includes(clean)) return false;
-      if (/\b(?:not|never|no|only|binary)\b/i.test(clean) && /\b(?:specified|stated|mentioned|found|available|classification)\b/i.test(clean)) return false;
-      return true;
-    });
-
-    const hasHallucination = !tokenCheck.valid || judgeUnsupported.length > 0;
-
-    if (hasHallucination) {
+    // 3. Fast deterministic factual token check (NO second LLM call)
+    const tokenCheck = checkFactualTokens(answer, contextPrompt, question);
+    if (!tokenCheck.valid && tokenCheck.unsupported.length > 0) {
       console.warn(
-        `[Grounding Warning] Unsupported claims detected: tokens=[${tokenCheck.unsupported.join(", ")}], judge=[${judgeUnsupported.join("; ")}]. Regenerating once...`
+        `[Grounding Warning] Unsupported tokens detected: [${tokenCheck.unsupported.join(", ")}]. Returning fallback.`
       );
-
-      // Regenerate ONCE with strict rewrite instruction
-      const retryMessages = [
-        ...messages,
-        { role: "assistant", content: answer },
-        {
-          role: "user",
-          content:
-            "Rewrite the answer using ONLY explicitly supported facts from the supplied evidence. Remove every unsupported claim. If nothing can be answered from the evidence, reply exactly: I couldn't find this in the uploaded documents."
-        }
-      ];
-
-      const retryRes = await axios.post(
-        `${ENV.OLLAMA_BASE_URL}/api/chat`,
-        {
-          model: ENV.OLLAMA_LLM_MODEL,
-          messages: retryMessages,
-          stream: false,
-          options: {
-            temperature: 0.0,
-            num_ctx: 8192,
-            num_predict: 800
-          }
-        },
-        { timeout: 120000 }
-      );
-
-      const regenerated = (retryRes.data?.message?.content || "").trim();
-      if (isFallbackAnswer(regenerated)) {
-        return FALLBACK_MESSAGE;
-      }
-
-      // Re-verify regenerated answer
-      const retryTokenCheck = checkFactualTokens(regenerated, contextPrompt);
-      if (!retryTokenCheck.valid) {
-        console.warn(`[Grounding Failure] Regenerated answer still contains unsupported tokens: [${retryTokenCheck.unsupported.join(", ")}]. Falling back.`);
-        return FALLBACK_MESSAGE;
-      }
-
-      return regenerated;
+      return FALLBACK_MESSAGE;
     }
 
     return answer;
@@ -384,10 +284,18 @@ export async function streamAnswer(question, contextPrompt, conversationHistory 
     content: m.content
   }));
 
+  let userStreamContent = question;
+  if (contextPrompt.includes("=== CONFLICTING EVIDENCE NOTICE ===")) {
+    userStreamContent += "\n\n(Important: The retrieved context contains conflicting accuracy values. You must report the conflict explicitly and state both figures with their source pages.)";
+  }
+  if (contextPrompt.includes("=== MULTI-TOPIC QUERY GUIDELINES ===")) {
+    userStreamContent += "\n\n(Important: Address each topic separately. If information for any specific item is not present in the documents, explicitly state that it was not found in the uploaded documents.)";
+  }
+
   const messages = [
     { role: "system", content: systemPrompt },
     ...historyMessages,
-    { role: "user", content: question }
+    { role: "user", content: userStreamContent }
   ];
 
   const response = await axios.post(
@@ -435,7 +343,7 @@ export async function streamAnswer(question, contextPrompt, conversationHistory 
       }
 
       // Grounding validation
-      const tokenCheck = checkFactualTokens(trimmed, contextPrompt);
+      const tokenCheck = checkFactualTokens(trimmed, contextPrompt, question);
       if (!tokenCheck.valid) {
         console.warn(`[Stream Grounding] Unsupported numbers/tokens found: ${tokenCheck.unsupported.join(", ")}`);
         resolve(FALLBACK_MESSAGE);

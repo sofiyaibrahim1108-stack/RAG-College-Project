@@ -178,7 +178,7 @@ export async function askQuestionStream(req, res) {
 
     // 6. Build context
     const tCtx = Date.now();
-    const context = buildRAGContext(textChunks, images, tabularResult);
+    const context = buildRAGContext(textChunks, images, tabularResult, question);
     timings.contextBuilder = Date.now() - tCtx;
 
     // 7. Stream LLM answer
