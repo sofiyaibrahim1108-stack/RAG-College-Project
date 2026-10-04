@@ -2,6 +2,7 @@ import { Department } from "../models/Department.js";
 import { Document } from "../models/Document.js";
 import { DocumentChunk } from "../models/DocumentChunk.js";
 import { ImageModel } from "../models/Image.js";
+import { invalidateDepartmentProfilesCache } from "../services/router.js";
 
 /**
  * Get all departments with document count
@@ -81,6 +82,7 @@ export async function createDepartment(req, res) {
       description: description ? description.trim() : "",
       isTestData: Boolean(isTestData)
     });
+    try { invalidateDepartmentProfilesCache(); } catch (e) {}
 
     res.status(201).json({
       success: true,
@@ -140,6 +142,7 @@ export async function updateDepartment(req, res) {
         { $set: { department: department.name, departmentId: department._id } }
       );
     }
+    try { invalidateDepartmentProfilesCache(); } catch (e) {}
 
     res.json({
       success: true,
@@ -206,6 +209,7 @@ export async function deleteDepartment(req, res) {
     }
 
     await Department.findByIdAndDelete(department._id);
+    try { invalidateDepartmentProfilesCache(); } catch (e) {}
 
     res.json({
       success: true,

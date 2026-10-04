@@ -1,4 +1,5 @@
 import { ImageModel } from "../models/Image.js";
+import { DocumentChunk } from "../models/DocumentChunk.js";
 import { cosineSimilarity } from "../utils/similarity.js";
 import { RAG_CONFIG } from "../config/rag.js";
 
@@ -15,6 +16,7 @@ import { RAG_CONFIG } from "../config/rag.js";
  * @returns {Promise<Array<Object>>}
  */
 export async function retrieveRelevantImages(
+  
   siglipQueryEmbedding,
   routedDepartments = [],
   topK = RAG_CONFIG.topKImages,
@@ -23,6 +25,9 @@ export async function retrieveRelevantImages(
   filterMeta = {}
 ) {
   const startTime = Date.now();
+  console.log(
+  `[ImageRetrieval DEBUG] Called | candidates query starting | query="${queryText}"`
+);
 
   // Find candidate images strictly within the target scope
   const mongoQuery = {};
@@ -41,6 +46,10 @@ export async function retrieveRelevantImages(
   let candidates = await ImageModel.find(mongoQuery)
     .select("imageId documentId documentName pageNumber filename imagePath department embedding caption description ocrText")
     .lean();
+
+      console.log(
+    `[ImageRetrieval DEBUG] Candidates found: ${candidates.length}`
+  );
 
   if (candidates.length === 0) {
     return [];
@@ -139,3 +148,142 @@ export async function retrieveRelevantImages(
 
   return results;
 }
+
+/**
+ * Shared Multimodal Attachment Resolver
+ * Resolves images to attach based on:
+ * 1. Surviving image-derived chunks (with imageRef) from grounded text retrieval
+ * 2. SigLIP candidate signal with relative margin over document peers
+ *
+ * @param {Object} options
+ * @param {Array<Object>} options.survivingSources
+ * @param {Array<Object>} options.retrievedChunks
+ * @param {Array<Object>} [options.siglipCandidates]
+ * @param {number} [options.maxImages]
+ * @param {boolean} [options.isFallback]
+ * @returns {Promise<Array<Object>>}
+ */
+export async function resolveMultimodalAttachments({
+  survivingSources = [],
+  retrievedChunks = [],
+  maxImages = RAG_CONFIG.topKImages,
+  isFallback = false,
+  question = ""
+}) {
+  if (isFallback) {
+    console.log("[Multimodal] Attach: Fallback answer detected. No images attached.");
+    return [];
+  }
+
+  const attached = [];
+  const seenImageKeys = new Set();
+  const isExplicitPageRequest = /\b(?:page|p\.?)\s*\d+\b/i.test(question || "");
+
+  // Map surviving source keys by strict chunk identity (documentName + pageNumber + chunkIndex + sourceType)
+  const survivingChunkKeys = new Set(
+    (survivingSources || []).map((s) => `${s.documentName}_p${s.pageNumber || 1}_idx${s.chunkIndex ?? 0}_${s.sourceType || "text"}`)
+  );
+
+  // Stop words for novelty comparison
+  const NOVELTY_STOP_WORDS = new Set([
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "this", "that", "it", "its"
+  ]);
+
+  const tokenize = (str) =>
+    (str || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 3 && !NOVELTY_STOP_WORDS.has(w));
+
+  // Attach images strictly via surviving image-derived chunks (Requirement 4a & 4b)
+  for (const chunk of retrievedChunks || []) {
+    if (!chunk.imageRef || !chunk.imageRef.filename) continue;
+    if (chunk.sourceType !== "image_chunk") continue;
+
+    const chunkKey = `${chunk.documentName}_p${chunk.pageNumber || 1}_idx${chunk.chunkIndex ?? 0}_${chunk.sourceType || "image_chunk"}`;
+    const didSurvive = survivingChunkKeys.has(chunkKey);
+
+    if (!didSurvive) {
+      console.log(
+        `[Multimodal] Image dropped: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: did_not_survive_grounding)`
+      );
+      continue;
+    }
+
+    // Novelty check (Requirement 4b):
+    // Compute share of image OCR/caption tokens that do not appear in normal text chunks of the same page.
+    // Below RAG_CONFIG.minImageNoveltyRatio, the image is a duplicate page render and is not attached.
+    // Explicit page requests are exempt.
+    if (!isExplicitPageRequest) {
+      let pageNormalText = (retrievedChunks || [])
+        .filter((c) => c.documentId === chunk.documentId && c.pageNumber === chunk.pageNumber && c.sourceType !== "image_chunk" && !c.imageRef)
+        .map((c) => c.content || "")
+        .join(" ");
+
+      if (!pageNormalText && chunk.documentId) {
+        try {
+          const dbChunks = await DocumentChunk.find({
+            documentId: chunk.documentId,
+            pageNumber: chunk.pageNumber,
+            sourceType: { $ne: "image_chunk" }
+          }).select("content").lean();
+          pageNormalText = dbChunks.map((c) => c.content || "").join(" ");
+        } catch {}
+      }
+
+      const pageTokens = new Set(tokenize(pageNormalText));
+      const imageText = `${chunk.imageRef.caption || ""} ${chunk.content || ""}`;
+      const imageTokens = tokenize(imageText);
+
+      if (imageTokens.length > 0 && pageTokens.size > 0) {
+        const novelTokens = imageTokens.filter((t) => !pageTokens.has(t));
+        const noveltyRatio = novelTokens.length / imageTokens.length;
+        const minNovelty = RAG_CONFIG.minImageNoveltyRatio !== undefined ? RAG_CONFIG.minImageNoveltyRatio : 0.15;
+
+        if (noveltyRatio < minNovelty) {
+          console.log(
+            `[Multimodal] Image dropped: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: duplicate_page_render, noveltyRatio=${noveltyRatio.toFixed(3)} < ${minNovelty})`
+          );
+          continue;
+        }
+      }
+    }
+
+    const imgKey = `${chunk.documentName}_${chunk.imageRef.filename}`;
+    if (!seenImageKeys.has(imgKey) && attached.length < maxImages) {
+      seenImageKeys.add(imgKey);
+
+      // Fetch full image metadata from ImageModel
+      let dbImg = await ImageModel.findOne({
+        documentId: chunk.imageRef.documentId,
+        filename: chunk.imageRef.filename
+      }).lean();
+
+      const survivingChunkDesc = `chunk [p.${chunk.pageNumber} idx.${chunk.chunkIndex ?? 0}] (${chunk.sourceType || "image_chunk"})`;
+
+      const imageCitation = {
+        imageId: dbImg?.imageId || `img_${chunk.imageRef.filename}`,
+        documentId: chunk.imageRef.documentId,
+        documentName: chunk.documentName,
+        pageNumber: chunk.imageRef.pageNumber || chunk.pageNumber || 1,
+        filename: chunk.imageRef.filename,
+        caption: dbImg?.caption || "",
+        description: dbImg?.description || "",
+        imagePath: `/api/documents/images/${chunk.imageRef.documentId}/${chunk.imageRef.filename}`,
+        similarity: chunk.similarity || 1.0,
+        survivingChunk: survivingChunkDesc
+      };
+
+      attached.push(imageCitation);
+      console.log(
+        `[Multimodal] Image attached: file "${chunk.imageRef.filename}", page ${imageCitation.pageNumber} (reason: surviving_text_chunk, score=${chunk.rankingScore || chunk.similarity || "n/a"}, source=${survivingChunkDesc})`
+      );
+    }
+  }
+
+  return attached;
+}
+

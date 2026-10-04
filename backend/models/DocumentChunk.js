@@ -22,6 +22,15 @@ const DocumentChunkSchema = new mongoose.Schema(
     isTestData: { type: Boolean, default: false, index: true },
     sourceType: { type: String, default: "upload" },
     sourcePath: { type: String, default: "" },
+    imageRef: {
+      documentId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Document",
+        default: null
+      },
+      filename: { type: String, default: null },
+      pageNumber: { type: Number, default: null }
+    },
     embedding: {
       type: [Number],
       required: true

@@ -5,25 +5,25 @@
 export function formatSources(textChunks = []) {
   if (!textChunks || textChunks.length === 0) return [];
 
-  const seen = new Set();
-  const sources = [];
+  const seen = new Map();
 
   for (const chunk of textChunks) {
-    const key = `${chunk.documentName}_${chunk.pageNumber || 1}`;
+    const key = `${chunk.documentName}_${chunk.pageNumber || 1}_${chunk.chunkIndex ?? 0}_${chunk.sourceType || "text"}`;
     if (!seen.has(key)) {
-      seen.add(key);
-      sources.push({
+      seen.set(key, {
         documentId: chunk.documentId,
         documentName: chunk.documentName,
         pageNumber: chunk.pageNumber || 1,
         chunkIndex: chunk.chunkIndex,
+        sourceType: chunk.sourceType || "text",
         snippet: (chunk.content || "").slice(0, 200) + "...",
-        similarity: chunk.similarity
+        similarity: chunk.similarity,
+        imageRef: chunk.imageRef || null
       });
     }
   }
 
-  return sources;
+  return Array.from(seen.values());
 }
 
 export function formatImageCitations(images = []) {

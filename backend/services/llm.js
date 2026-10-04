@@ -55,6 +55,76 @@ export function isFallbackAnswer(answer) {
 }
 
 /**
+ * Generic recognition and parsing of English number words.
+ * Prevents spelled-out numbers (e.g. "Ninety-six") from being treated as named entities.
+ */
+const NUMBER_WORDS = new Set([
+  "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+  "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+  "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+  "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "billion"
+]);
+
+export function isNumberWordToken(token = "") {
+  if (!token) return false;
+  const parts = token.toLowerCase().split(/[-_\s]+/);
+  return parts.length > 0 && parts.every((p) => NUMBER_WORDS.has(p));
+}
+
+export function parseWordNumber(token = "") {
+  if (!token) return null;
+  const parts = token.toLowerCase().split(/[-_\s]+/);
+  if (parts.length === 0 || !parts.every((p) => NUMBER_WORDS.has(p))) return null;
+
+  const small = {
+    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+    ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+    seventeen: 17, eighteen: 18, nineteen: 19
+  };
+  const tens = {
+    twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90
+  };
+
+  let total = 0;
+  let current = 0;
+
+  for (const p of parts) {
+    if (small[p] !== undefined) {
+      current += small[p];
+    } else if (tens[p] !== undefined) {
+      current += tens[p];
+    } else if (p === "hundred") {
+      current = (current || 1) * 100;
+    } else if (p === "thousand") {
+      total += (current || 1) * 1000;
+      current = 0;
+    } else if (p === "million") {
+      total += (current || 1) * 1000000;
+      current = 0;
+    } else if (p === "billion") {
+      total += (current || 1) * 1000000000;
+      current = 0;
+    }
+  }
+
+  return total + current;
+}
+
+/**
+ * Strips context prompt metadata headers ([Source X], Page Y, guideline labels)
+ * so that source indices, timestamps, and page numbers do not leak as factual numeric evidence.
+ */
+export function stripContextMetadata(contextPrompt = "") {
+  if (!contextPrompt) return "";
+  return contextPrompt
+    .replace(/^\[(?:Source|Visual Evidence)\s+\d+\]\s+Document:[^\n]*/gim, "")
+    .replace(/^===[^=\n]+===/gm, "")
+    .replace(/^CRITICAL DIRECTIVE:[\s\S]*?(?=\n\n|$)/gm, "")
+    .replace(/^=== STRICT VISUAL QA GUIDELINES ===[\s\S]*?(?=\n\n|$)/gm, "")
+    .replace(/^=== MULTI-TOPIC QUERY GUIDELINES ===[\s\S]*?(?=\n\n|$)/gm, "");
+}
+
+/**
  * Extracts document/collection scope tokens dynamically from the context text.
  */
 export function extractScopeTokensFromContext(contextPrompt = "") {
@@ -194,7 +264,12 @@ export function extractStrictNamedTokens(text = "") {
     text.match(
       /\b[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b/g
     ) || [];
-  hyphenated.forEach((h) => out.add(h));
+  hyphenated.forEach((h) => {
+    // Exclude spelled-out number words (e.g. Ninety-six, Twenty-four)
+    if (!isNumberWordToken(h)) {
+      out.add(h);
+    }
+  });
 
   const alnum =
     text.match(
@@ -359,6 +434,14 @@ export function isEntityInContext(
     ).test(ctx)
   ) {
     return true;
+  }
+
+  // Number words match if their numeric value exists in context
+  if (isNumberWordToken(cleanEntity)) {
+    const numVal = parseWordNumber(cleanEntity);
+    if (numVal !== null) {
+      return numberInText(numVal, contextPrompt) || numberInText(String(numVal), contextPrompt);
+    }
   }
 
   const isIdentifier =
@@ -660,6 +743,9 @@ When an AUTHORITATIVE TABULAR TOOL RESULT is provided in CONTEXT:
 
 For visual description questions, list each distinct visual element or UI component at most once without repeating duplicate elements.
 
+VISUAL EVIDENCE RULE:
+Image-derived context items are visual evidence and the image is displayed to the user automatically; if the user asks to see/show/display an image or page, briefly describe what the visual evidence shows and state its page, instead of refusing. If no visual evidence is in the context, use the normal fallback.
+
 If retrieved sources contain conflicting or different values, explicitly report the conflict, state which page/source contains each value, and do not silently choose one.
 
 Use only the document relevant to the user's question.
@@ -789,6 +875,10 @@ function findUnsupportedEntities(
       continue;
     }
 
+    if (isNumberWordToken(tok)) {
+      continue;
+    }
+
     // Anything explicitly present in the question is allowed.
     if (isEntityInContext(tok, question)) {
       continue;
@@ -813,6 +903,16 @@ function normalizeEvidenceText(text = "") {
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
     .replace(/\u00a0/g, " ")
+    // Closing punctuation, bracket, colon, percent, or letter directly followed by a digit
+    .replace(/([a-zA-Z)\]}>:%])([0-9])/g, "$1 $2")
+    // Digit or percent directly followed by letter, opening punctuation, or bracket
+    .replace(/([0-9%])([a-zA-Z({\[<])/g, "$1 $2")
+    // Colon directly followed by letter or number (e.g. "Grade:A" -> "Grade: A")
+    .replace(/(:)([a-zA-Z0-9])/g, "$1 $2")
+    // Abbreviation period followed by digit (e.g. "M.E.60,000" -> "M.E. 60,000")
+    .replace(/(\b[A-Za-z]\.)([0-9])/g, "$1 $2")
+    // Formatted thousands group followed by next digit in squished table rows (e.g. "50,00065,000" -> "50,000 65,000")
+    .replace(/(,\d{3})(?=\d)/g, "$1 ")
     .replace(/[ \t]+/g, " ")
     .trim();
 }
@@ -828,7 +928,7 @@ function parseNumericValue(str) {
 /**
  * Extracts currency values with their exact positions and normalized numeric values.
  * Handles Indian grouping (1,00,000), Western grouping (100,000), symbols (Rs., ₹, INR, $, USD, EUR),
- * suffixes ("1,00,000 per year", "85,000/-"), and numbers on monetary lines.
+ * suffixes ("1,00,000 per year", "50,000/-"), and numbers on monetary lines.
  */
 function extractCurrencyOccurrences(text = "") {
   if (!text) return [];
@@ -836,9 +936,9 @@ function extractCurrencyOccurrences(text = "") {
   const results = [];
   const seen = new Set();
 
-  // Pattern A: Prefix symbol + number (e.g. "Rs. 1,00,000", "₹85,000", "$ 1,200", "INR 70,000")
-  const prefixRegex = /(?:Rs\.?|INR|₹|\$|USD|EUR)\s*([0-9][0-9,]*(?:\.\d+)?)/gi;
-  let m;
+  // Pattern A: Prefix symbol + number (word boundary before alphabetic codes; symbol-safe for non-word)
+const prefixRegex =
+  /(?:\b(?:Rs\.?|INR|USD|EUR)\s*|[₹$]\s*)([0-9][0-9,]*(?:\.\d+)?)/gi;  let m;
   while ((m = prefixRegex.exec(normalized)) !== null) {
     const rawVal = m[1].replace(/,$/, "");
     const numericValue = parseNumericValue(rawVal);
@@ -857,8 +957,8 @@ function extractCurrencyOccurrences(text = "") {
     }
   }
 
-  // Pattern B: Number + suffix or context (e.g. "1,00,000 per year", "85,000/-", "100000 per annum")
-  const suffixRegex = /\b([0-9][0-9,]*(?:\.\d+)?)\s*(?:(?:\/-)|(?:Rs\.?|INR|₹|\$|USD|EUR)|(?:per\s+(?:year|annum|semester|sem|month|day|hr|hour))|(?:lpa|lakhs?))\b/gi;
+  // Pattern B: Number + suffix or context (with word boundaries)
+  const suffixRegex = /\b([0-9][0-9,]*(?:\.\d+)?)\s*(?:(?:\/-)|(?:\b(?:Rs\.?|INR|USD|EUR)\b|[₹$])|(?:per\s+(?:year|annum|semester|sem|month|day|hr|hour))|(?:\b(?:lpa|lakhs?)\b))/gi;
   while ((m = suffixRegex.exec(normalized)) !== null) {
     const rawVal = m[1].replace(/,$/, "");
     const numericValue = parseNumericValue(rawVal);
@@ -881,7 +981,7 @@ function extractCurrencyOccurrences(text = "") {
   const lines = normalized.split("\n");
   let lineOffset = 0;
   for (const line of lines) {
-    const isMonetaryLine = /(?:rs\.?|inr|₹|\$|fee|fees|tuition|cost|price|salary|stipend|package|lpa|lakh|per\s+(?:year|annum|month))/i.test(line);
+    const isMonetaryLine = /(?:\b(?:rs\.?|inr|usd|eur|fee|fees|tuition|cost|costs|price|salary|stipend|package|lpa|lakhs?)\b|[₹$]|\bper\s+(?:year|annum|month|semester)\b)/i.test(line);
     if (isMonetaryLine) {
       const lineNums = /\b([0-9][0-9,]*(?:\.\d+)?)\b/g;
       let lm;
@@ -977,7 +1077,10 @@ export function verifyAnswerGrounding(
     };
   }
 
-  const contextLower = (contextPrompt || "").toLowerCase();
+  // Strip metadata headers (Source X, Page Y, Document: ...) so they don't leak into evidence
+  const cleanContext = stripContextMetadata(contextPrompt);
+  const normalizedContext = normalizeEvidenceText(cleanContext);
+  const contextLower = normalizedContext.toLowerCase();
   const questionLower = (question || "").toLowerCase();
   const combinedEvidence = `${contextLower} ${questionLower}`;
   const unsupported = [];
@@ -991,15 +1094,50 @@ export function verifyAnswerGrounding(
   // ---------------------------------------------------------
   const answerCurrencies = extractCurrencyOccurrences(answer);
   if (answerCurrencies.length > 0) {
-    const evidenceCurrencies = extractCurrencyOccurrences(contextPrompt);
+    const evidenceCurrencies = extractCurrencyOccurrences(cleanContext);
     const qCurrencies = extractCurrencyOccurrences(question);
     const allEvidence = [...evidenceCurrencies, ...qCurrencies];
-    const normalizedContext = normalizeEvidenceText(contextPrompt);
 
     for (const curr of answerCurrencies) {
-      const matchingOccurrences = allEvidence.filter(
+      let matchingOccurrences = allEvidence.filter(
         (e) => Math.abs(e.numericValue - curr.numericValue) < 1e-5
       );
+
+      // If not identified as currency directly in evidence/question, check if the numeric value
+      // appears in normalized context under an established monetary context (e.g. table headers or question context)
+      if (matchingOccurrences.length === 0) {
+        const hasMonetaryContext =
+          /(?:\b(?:rs\.?|inr|usd|eur|fee|fees|tuition|cost|costs|price|salary|stipend|package|budget|expense|charge|rate|amount|lpa|lakh|crore)\b|[₹$])/i.test(cleanContext) ||
+          /(?:fee|cost|price|salary|tuition|rate|charge|how much|inr|rs|\$)/i.test(question);
+
+        if (hasMonetaryContext) {
+          const numRegex = new RegExp(`(?<![\\d.,])${escRe(curr.rawNumber)}(?![\\d]|[.,]\\d)`, "g");
+          let nm;
+          while ((nm = numRegex.exec(normalizedContext)) !== null) {
+            matchingOccurrences.push({
+              text: nm[0],
+              rawNumber: curr.rawNumber,
+              numericValue: curr.numericValue,
+              index: nm.index,
+              length: nm[0].length,
+            });
+          }
+          if (matchingOccurrences.length === 0) {
+            const rawNumberStr = String(curr.numericValue);
+            const rawRegex = new RegExp(`(?<![\\d.])${escRe(rawNumberStr)}(?![\\d.])`, "g");
+            let rm;
+            while ((rm = rawRegex.exec(normalizedContext)) !== null) {
+              matchingOccurrences.push({
+                text: rm[0],
+                rawNumber: rawNumberStr,
+                numericValue: curr.numericValue,
+                index: rm.index,
+                length: rm[0].length,
+              });
+            }
+          }
+        }
+      }
 
       let association = false;
       if (matchingOccurrences.length > 0) {
@@ -1016,7 +1154,7 @@ export function verifyAnswerGrounding(
       console.log(`  Answer value: ${curr.text}`);
       console.log(`  Normalized answer value: ${curr.numericValue}`);
       console.log(`  Evidence values found: [${allEvidence.map((e) => e.numericValue).join(", ")}]`);
-      console.log(`  Matched evidence value: ${matchingOccurrences.length > 0 ? matchingOccurrences[0].text : "none"}`);
+      console.log(`  Matched evidence occurrences: ${matchingOccurrences.length}`);
       console.log(`  Entity association: ${association ? "PASS" : "FAIL"}`);
 
       if (matchingOccurrences.length === 0) {
@@ -1045,16 +1183,18 @@ export function verifyAnswerGrounding(
   // ---------------------------------------------------------
   // 2. Percentages and multi-digit numbers
   // ---------------------------------------------------------
-  const percentages = answer.match(/\b\d+(?:\.\d+)?%/g) || [];
+  const percentages = answer.match(/\b\d+(?:,\d+)*(?:\.\d+)?\s*%/g) || [];
   for (const pct of percentages) {
-    const v = parseFloat(pct);
+    const cleanPct = pct.replace(/\s+/g, "").toLowerCase();
+    const rawNum = cleanPct.replace(/%/g, "");
+    const v = parseFloat(rawNum);
     const ok =
-      combinedEvidence.includes(pct.toLowerCase()) ||
-      numberInText((v / 100).toFixed(2), combinedEvidence) ||
-      numberInText(String(v / 100), combinedEvidence);
+      combinedEvidence.includes(cleanPct) ||
+      (rawNum && numberInText(rawNum, combinedEvidence)) ||
+      (!isNaN(v) && (numberInText((v / 100).toFixed(2), combinedEvidence) || numberInText(String(v / 100), combinedEvidence)));
 
     if (!ok) {
-      unsupported.push(`Percentage: ${pct}`);
+      unsupported.push(`Percentage: ${pct.trim()}`);
     }
   }
 
@@ -1067,14 +1207,42 @@ export function verifyAnswerGrounding(
     .replace(/(?:Rs\.?|INR|₹|\$|USD|EUR)\s*[0-9][0-9,]*(?:\.\d+)?/gi, " ")
     .replace(/\b[0-9][0-9,]*(?:\.\d+)?\s*(?:(?:\/-)|(?:Rs\.?|INR|₹|\$|USD|EUR)|(?:per\s+(?:year|annum|semester|sem|month|day|hr|hour))|(?:lpa|lakhs?))\b/gi, " ");
 
-  const withoutListNums = proseWithoutCurrency.replace(/^\s*\d+[.)]\s+/gm, " ");
-  // Match numbers with optional Indian or Western grouping commas
-  const numbers = withoutListNums.match(/\b\d+(?:,\d+)*(?:\.\d+)?\b/g) || [];
+  // Remove percentage expressions so their digits are not checked as bare numbers
+  const proseWithoutPercentages = proseWithoutCurrency
+    .replace(/\b\d+(?:,\d+)*(?:\.\d+)?\s*%/g, " ");
+
+  // Remove source citation lines and page indicators (e.g. "Supporting source ... | Page 17", "Page 17", "p. 17")
+  const proseWithoutCitations = proseWithoutPercentages
+    .replace(/Supporting\s+source[\s\S]*$/i, " ")
+    .replace(/\b(?:page|pages|p\.)\s*\d+\b/gi, " ");
+
+  const withoutListNums = proseWithoutCitations.replace(/^\s*\d+[.)]\s+/gm, " ");
+  // Match bare numbers with optional Indian or Western grouping commas
+  const numbers =
+  withoutListNums.match(
+    /\b\d+(?:,\d+)*(?:\.\d+)?\b/g
+  ) || [];
+
+  // Numbers present in the user question are premise numbers and allowed in answer
+  const questionNumbers = new Set((question.match(/\b\d+(?:,\d+)*(?:\.\d+)?\b/g) || []).map((n) => n.replace(/,/g, "")));
+
+  // Also extract spelled-out hyphenated number words (e.g. "Ninety-six" -> 96) and check their numeric value
+  const hyphenatedWords = proseOnly.match(/\b[A-Za-z]+(?:-[A-Za-z]+)+\b/g) || [];
+  for (const hw of hyphenatedWords) {
+    if (isNumberWordToken(hw)) {
+      const numVal = parseWordNumber(hw);
+      if (numVal !== null && numVal >= 10) {
+        numbers.push(String(numVal));
+      }
+    }
+  }
+
   const evidenceNormalized = combinedEvidence.replace(/(?<=\d),(?=\d)/g, "");
 
   for (const num of numbers) {
     const rawVal = num.replace(/,/g, "");
     if (rawVal.length < 2) continue; // Single digits 0-9 are allowed
+    if (questionNumbers.has(rawVal)) continue; // Allow numbers from question premise
 
     // Skip numbers already validated as currencies
     if (answerCurrencies.some((c) => Math.abs(c.numericValue - parseFloat(rawVal)) < 1e-5)) {
@@ -1103,7 +1271,7 @@ export function verifyAnswerGrounding(
   // ---------------------------------------------------------
   const badEntities = findUnsupportedEntities(
     answer,
-    contextPrompt,
+    cleanContext,
     question
   );
 
@@ -1258,14 +1426,6 @@ export async function generateAnswerDetailed(
 
   let userContent = question;
 
-  if (
-    contextPrompt.includes(
-      "=== CONFLICTING EVIDENCE NOTICE ==="
-    )
-  ) {
-    userContent +=
-      "\n\n(Important: The retrieved context contains conflicting accuracy values. You must report the conflict explicitly and state both figures with their source pages.)";
-  }
 
   if (
     contextPrompt.includes(
@@ -1293,12 +1453,13 @@ export async function generateAnswerDetailed(
       `${ENV.OLLAMA_BASE_URL}/api/chat`,
       {
         model: ENV.OLLAMA_LLM_MODEL,
+        keep_alive: "30m",
         messages,
         stream: false,
         options: {
           temperature: 0.1,
-          num_ctx: 8192,
-          num_predict: 800,
+          num_ctx: 3072,
+          num_predict: 350,
         },
       },
       {
@@ -1306,17 +1467,34 @@ export async function generateAnswerDetailed(
       }
     );
 
+    const d = response.data || {};
+    const promptEvalCount = d.prompt_eval_count || 0;
+    const promptEvalMs = d.prompt_eval_duration ? (d.prompt_eval_duration / 1e6).toFixed(0) : "N/A";
+    const evalCount = d.eval_count || 0;
+    const evalMs = d.eval_duration ? (d.eval_duration / 1e6).toFixed(0) : "N/A";
+    const totalMs = d.total_duration ? (d.total_duration / 1e6).toFixed(0) : (Date.now() - startTime);
+    const speed = d.eval_duration && d.eval_count ? (d.eval_count / (d.eval_duration / 1e9)).toFixed(1) : "N/A";
+
+    console.log(`[LLM Diagnostics] Model: ${ENV.OLLAMA_LLM_MODEL} | Device: CPU (size_vram: 0) | num_ctx: 3072 | num_predict: 350 | keep_alive: 30m`);
+    console.log(`[LLM Diagnostics] Prompt Tokens: ${promptEvalCount} (${promptEvalMs}ms eval) | Generated Tokens: ${evalCount} (${evalMs}ms, ${speed} tok/s) | Total: ${totalMs}ms`);
+
     const raw =
       (
         response.data?.message?.content ||
         ""
       ).trim();
 
-      console.log("\n========== LLM DEBUG ==========");
-console.log("QUESTION:", question);
-console.log("RAW LLM ANSWER:", raw);
-console.log("CONTEXT PROMPT:\n", contextPrompt);
-console.log("================================\n");
+    console.log("\n========== LLM DEBUG ==========");
+    console.log("QUESTION:", question);
+    console.log("RAW LLM ANSWER:", raw);
+
+console.log("CONTEXT HAS 100:", contextPrompt.includes("100"));
+console.log(
+  "CONTEXT AROUND 100:",
+  contextPrompt.match(/.{0,100}100.{0,100}/gi)
+);
+    
+    console.log("================================\n");
 
     console.log(
       `[LLM Generation] Answer generated in ${
@@ -1424,14 +1602,6 @@ export async function streamAnswer(
 
   let userStreamContent = question;
 
-  if (
-    contextPrompt.includes(
-      "=== CONFLICTING EVIDENCE NOTICE ==="
-    )
-  ) {
-    userStreamContent +=
-      "\n\n(Important: The retrieved context contains conflicting accuracy values. You must report the conflict explicitly and state both figures with their source pages.)";
-  }
 
   if (
     contextPrompt.includes(
@@ -1462,8 +1632,8 @@ export async function streamAnswer(
       stream: true,
       options: {
         temperature: 0.1,
-        num_ctx: 8192,
-        num_predict: 800,
+        num_ctx: 3072,
+        num_predict: 500,
       },
     },
     {
@@ -1700,10 +1870,14 @@ export function filterSupportingSources(
       const chunk =
         retrievedChunks?.find(
           (c) =>
-            c.documentName ===
-              source.documentName &&
-            c.pageNumber ===
-              source.pageNumber
+            c.documentName === source.documentName &&
+            c.pageNumber === source.pageNumber &&
+            (source.chunkIndex === undefined || c.chunkIndex === source.chunkIndex)
+        ) ||
+        retrievedChunks?.find(
+          (c) =>
+            c.documentName === source.documentName &&
+            c.pageNumber === source.pageNumber
         );
 
       const rawText = (

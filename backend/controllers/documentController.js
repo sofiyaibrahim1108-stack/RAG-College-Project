@@ -7,6 +7,7 @@ import { processDocument } from "../services/documentProcessor.js";
 import { ENV } from "../config/env.js";
 
 import { Department } from "../models/Department.js";
+import { invalidateDepartmentProfilesCache } from "../services/router.js";
 
 /**
  * Upload single or multiple documents
@@ -222,6 +223,7 @@ export async function deleteDocument(req, res) {
     }
 
     await Document.findByIdAndDelete(document._id);
+    try { invalidateDepartmentProfilesCache(); } catch (e) {}
 
     res.json({ success: true, message: "Document and related artifacts removed" });
   } catch (error) {
@@ -277,6 +279,7 @@ export async function bulkDeleteDocuments(req, res) {
 
     // 4. Delete document records
     const deleteResult = await Document.deleteMany({ _id: { $in: ids } });
+    try { invalidateDepartmentProfilesCache(); } catch (e) {}
 
     res.json({
       success: true,

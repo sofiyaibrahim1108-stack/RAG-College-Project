@@ -21,6 +21,7 @@ import {
   Loader2
 } from "lucide-react";
 import { useChat } from "../context/ChatContext";
+import { GoogleDriveIcon } from "../components/common/GoogleDriveIcon";
 import { documentApi } from "../services/documentApi";
 import { departmentApi } from "../services/departmentApi";
 
@@ -191,14 +192,11 @@ export function DocumentsPage() {
       {/* Top Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold text-neutral-900 dark:text-white flex items-center gap-2">
-            <span>Knowledge Documents</span>
-            <span className="text-xs font-normal px-2.5 py-0.5 rounded-full bg-neutral-200 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400">
-              {documents.length} Total
-            </span>
-          </h2>
-          <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">
-            Manage files, inspect extracted SigLIP2 diagrams, or import from Google Drive.
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-neutral-900 dark:text-white">
+            Knowledge Documents
+          </h1>
+          <p className="text-sm sm:text-base text-neutral-500 dark:text-neutral-400 mt-1">
+            {documents.length} documents available
           </p>
         </div>
 
@@ -207,7 +205,7 @@ export function DocumentsPage() {
           {selectedDocIds.size > 0 && (
             <button
               onClick={() => setShowBulkDeleteModal(true)}
-              className="px-3.5 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-semibold shadow-sm transition flex items-center space-x-1.5"
+              className="px-3.5 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-semibold shadow-sm transition flex items-center space-x-1.5 cursor-pointer"
             >
               <Trash2 className="w-3.5 h-3.5" />
               <span>Delete Selected ({selectedDocIds.size})</span>
@@ -215,37 +213,29 @@ export function DocumentsPage() {
           )}
 
           <button
+            onClick={() => setShowDriveModal(true)}
+            className="px-4 py-2.5 bg-white dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 hover:bg-neutral-50 dark:hover:bg-neutral-800 text-neutral-800 dark:text-neutral-100 rounded-xl text-sm font-medium shadow-xs transition flex items-center space-x-2 cursor-pointer"
+          >
+            <GoogleDriveIcon className="w-4 h-4" />
+            <span>Google Drive</span>
+          </button>
+
+          <button
             onClick={() => setShowUploadModal(true)}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-sm transition flex items-center space-x-1.5"
+            className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold shadow-xs transition flex items-center space-x-1.5 cursor-pointer"
           >
             <Upload className="w-4 h-4" />
             <span>Upload Document</span>
           </button>
-
-          <button
-            onClick={() => setShowDriveModal(true)}
-            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-semibold shadow-sm transition flex items-center space-x-1.5"
-          >
-            <Cloud className="w-4 h-4" />
-            <span>Google Drive Import</span>
-          </button>
         </div>
       </div>
 
-      {/* Supported Formats Banner */}
-      <div className="flex flex-wrap items-center gap-1.5 p-3 rounded-2xl bg-neutral-100/70 dark:bg-neutral-900/50 border border-neutral-200/80 dark:border-neutral-800/80 text-xs">
-        <span className="font-semibold text-neutral-700 dark:text-neutral-300 mr-1 flex items-center gap-1">
-          <FileText className="w-3.5 h-3.5 text-blue-500" />
-          Supported Formats:
+      {/* Supported Formats Informational Note */}
+      <div className="text-sm text-neutral-500 dark:text-neutral-400 select-none">
+        <span className="font-medium text-neutral-700 dark:text-neutral-300">Supported file types: </span>
+        <span className="tracking-wide">
+          PDF · DOC · DOCX · TXT · CSV · XLS · XLSX · PPT · PPTX · Markdown · JSON · HTML · XML
         </span>
-        {["PDF", "DOC", "DOCX", "TXT", "CSV", "XLS", "XLSX", "PPT", "PPTX", "Markdown", "JSON", "HTML", "XML"].map((fmt) => (
-          <span
-            key={fmt}
-            className="px-2 py-0.5 rounded-lg bg-white dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 text-[10px] font-mono text-neutral-600 dark:text-neutral-300 font-medium"
-          >
-            {fmt}
-          </span>
-        ))}
       </div>
 
       {/* Filters: Dynamic MongoDB Department Tabs, Search, and Bulk Selection */}
@@ -348,7 +338,7 @@ export function DocumentsPage() {
                     <div className="flex items-center space-x-2">
                       <button
                         onClick={(e) => toggleSelectDoc(doc._id, e)}
-                        className="text-neutral-400 hover:text-blue-600 transition"
+                        className="text-neutral-400 hover:text-blue-600 transition cursor-pointer"
                       >
                         {isSelected ? (
                           <CheckSquare className="w-4 h-4 text-blue-600" />
@@ -356,42 +346,41 @@ export function DocumentsPage() {
                           <Square className="w-4 h-4" />
                         )}
                       </button>
-                      <span className="px-2 py-0.5 rounded-md text-[10px] uppercase font-bold tracking-wider bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400">
+                      <span className="px-2 py-0.5 rounded-md text-[11px] uppercase font-bold tracking-wider bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400">
                         {doc.fileType}
                       </span>
-                      {doc.isTestData && (
-                        <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300">
-                          test
-                        </span>
-                      )}
                     </div>
                     {renderStatusBadge(doc.status)}
                   </div>
 
                   <h3
-                    className="font-semibold text-sm text-neutral-900 dark:text-neutral-100 truncate"
+                    className="font-semibold text-lg text-neutral-900 dark:text-neutral-100 truncate"
                     title={doc.title}
                   >
                     {doc.title}
                   </h3>
-                  <p className="text-xs text-neutral-400 truncate mt-0.5">
+                  <p className="text-sm text-neutral-500 dark:text-neutral-400 truncate mt-0.5">
                     {doc.originalName}
                   </p>
 
-                  <div className="mt-4 pt-3 border-t border-neutral-100 dark:border-neutral-800/80 flex items-center justify-between text-xs text-neutral-500">
-                    <span className="flex items-center gap-1">
-                      <Layers className="w-3.5 h-3.5 text-blue-500" />
-                      <span>{doc.chunkCount || 0} Chunks</span>
-                    </span>
-
-                    <span className="flex items-center gap-1">
-                      <ImageIcon className="w-3.5 h-3.5 text-purple-500" />
-                      <span>{doc.imageCount || 0} Images</span>
-                    </span>
-
-                    <span className="px-2 py-0.5 rounded-full text-[10px] bg-neutral-100 dark:bg-neutral-800 font-medium">
+                  <div className="mt-4 pt-3 border-t border-neutral-100 dark:border-neutral-800/80 flex items-center justify-between text-sm text-neutral-600 dark:text-neutral-400">
+                    <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-neutral-100 dark:bg-neutral-800 text-neutral-800 dark:text-neutral-200">
                       {doc.department}
                     </span>
+
+                    <div className="flex items-center gap-3 text-sm">
+                      <span className="flex items-center gap-1 font-medium text-neutral-700 dark:text-neutral-300">
+                        <Layers className="w-4 h-4 text-blue-500" />
+                        <span>{doc.chunkCount || 0} chunks</span>
+                      </span>
+
+                      {doc.imageCount > 0 && (
+                        <span className="flex items-center gap-1 font-medium text-purple-600 dark:text-purple-400">
+                          <ImageIcon className="w-4 h-4" />
+                          <span>{doc.imageCount} images</span>
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </div>
 
@@ -399,27 +388,27 @@ export function DocumentsPage() {
                 <div className="mt-4 pt-3 border-t border-neutral-100 dark:border-neutral-800/80 flex items-center justify-between">
                   <button
                     onClick={() => handleViewDetails(doc._id)}
-                    className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1"
+                    className="text-sm font-semibold text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 flex items-center gap-1.5 cursor-pointer transition"
                   >
-                    <Eye className="w-3.5 h-3.5" />
+                    <Eye className="w-4 h-4" />
                     <span>Inspect</span>
                   </button>
 
                   <div className="flex items-center space-x-1">
                     <button
                       onClick={() => handleReprocess(doc._id)}
-                      className="p-1.5 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 transition"
+                      className="p-1.5 text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 transition cursor-pointer"
                       title="Reprocess document"
                     >
-                      <RotateCw className="w-3.5 h-3.5" />
+                      <RotateCw className="w-4 h-4" />
                     </button>
 
                     <button
                       onClick={() => handleDelete(doc._id)}
-                      className="p-1.5 text-neutral-400 hover:text-red-600 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/30 transition"
+                      className="p-1.5 text-neutral-400 hover:text-red-600 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/30 transition cursor-pointer"
                       title="Delete document"
                     >
-                      <Trash2 className="w-3.5 h-3.5" />
+                      <Trash2 className="w-4 h-4" />
                     </button>
                   </div>
                 </div>

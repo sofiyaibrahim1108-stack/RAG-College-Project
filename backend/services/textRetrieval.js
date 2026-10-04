@@ -13,8 +13,13 @@ const STOP_WORDS = new Set([
   "you", "your", "he", "she", "they", "them", "their", "who", "whom",
   "whose", "which", "what", "when", "where", "how", "why",
   "would", "could", "should", "will", "can", "may", "might",
-  "not", "no", "so", "if", "as", "up", "out", "about", "does"
+  "so", "if", "as", "up", "out", "about", "does"
 ]);
+
+/**
+ * Polarity/negation words that must NEVER be stripped as stop words.
+ */
+const POLARITY_WORDS = new Set(["no", "not", "without", "never", "none", "nor"]);
 
 /**
  * Extracts meaningful lexical terms from the query.
@@ -29,19 +34,9 @@ export function extractQueryTerms(question) {
     .replace(/[^a-z0-9_\-\s]/g, " ")
     .split(/\s+/)
     .map((w) => w.trim())
-    .filter((w) => w.length >= 2 && !STOP_WORDS.has(w));
+    .filter((w) => w.length >= 2 && (!STOP_WORDS.has(w) || POLARITY_WORDS.has(w)));
 }
 
-/**
- * Computes generic lexical overlap and phrase-matching score between 0.0 and 1.0.
- * Prioritizes question-specific content words over scope/department name terms.
- *
- * @param {string[]} queryTerms
- * @param {string} rawQuestion
- * @param {string} content
- * @param {Set<string>} scopeTokens
- * @returns {number}
- */
 /**
  * Checks if any numbers in the query fall into numeric ranges in content (e.g., 85 in "81–90").
  * Generic for grade tables, mark brackets, and numeric score ranges.
@@ -78,7 +73,7 @@ function checkRangeMatch(query, content) {
  * @param {Set<string>} scopeTokens
  * @returns {number}
  */
-function computeLexicalScore(queryTerms, rawQuestion, content, scopeTokens = new Set()) {
+export function computeLexicalScore(queryTerms, rawQuestion, content, scopeTokens = new Set()) {
   if (!queryTerms || queryTerms.length === 0 || !content) return 0;
   const contentLower = content.toLowerCase();
 
@@ -102,6 +97,7 @@ function computeLexicalScore(queryTerms, rawQuestion, content, scopeTokens = new
   // Domain-agnostic relevance bonuses
   let phraseBonus = 0;
   let metricBonus = 0;
+  let bigramScore = 0;
 
   // 1. Exact Continuous Phrase Matching (2 or more contiguous terms from query)
   if (activeTerms.length >= 2) {
@@ -119,7 +115,21 @@ function computeLexicalScore(queryTerms, rawQuestion, content, scopeTokens = new
     }
   }
 
-  // 2. Numeric range & exact number check from query
+  // 2. Adjacent-word-pair (bigram) overlap with configurable weight (Requirement 3)
+  if (activeTerms.length >= 2) {
+    let matchedBigrams = 0;
+    const totalBigrams = activeTerms.length - 1;
+    for (let i = 0; i < totalBigrams; i++) {
+      const bigram = `${activeTerms[i]} ${activeTerms[i + 1]}`;
+      if (contentLower.includes(bigram)) {
+        matchedBigrams++;
+      }
+    }
+    const bigramOverlap = matchedBigrams / totalBigrams;
+    bigramScore = bigramOverlap * (RAG_CONFIG.bigramLexicalWeight || 0.20);
+  }
+
+  // 3. Numeric range & exact number check from query
   if (checkRangeMatch(rawQuestion, content)) {
     metricBonus = Math.max(metricBonus, 0.35);
   } else {
@@ -129,7 +139,7 @@ function computeLexicalScore(queryTerms, rawQuestion, content, scopeTokens = new
     }
   }
 
-  // 3. Exact Sub-phrase / Full Question match bonus
+  // 4. Exact Sub-phrase / Full Question match bonus
   if (queryTerms.length >= 3) {
     const cleanQ = rawQuestion.toLowerCase().replace(/[^a-z0-9\s]/g, " ").trim();
     if (cleanQ.length >= 10 && contentLower.includes(cleanQ)) {
@@ -137,7 +147,51 @@ function computeLexicalScore(queryTerms, rawQuestion, content, scopeTokens = new
     }
   }
 
-  return Math.min(1.0, Math.max(0, tokenCoverage + metricBonus + phraseBonus));
+  // 5. Heading-level polarity alignment (Domain-Agnostic)
+  // If the query specifies an affirmative subject, but heading negates it, penalize.
+  // If the query specifies a negated subject (e.g. "no disease"), award bonus to headings
+  // that also negate that subject, and penalize headings that are affirmative.
+  let polarityAdjustment = 0;
+  const qHasNegation = queryTerms.some((t) => POLARITY_WORDS.has(t));
+  // Extract heading text (text before OCR body)
+  const headingText = (contentLower.split(/\n\s*ocr:/i)[0] || "").slice(0, 250);
+
+  // Identify any negated terms in query
+  const qNegatedTerms = [];
+  for (const polWord of POLARITY_WORDS) {
+    const qNegRe = new RegExp(`\\b${polWord}[\\s_\\-]+([a-z0-9]+)\\b`, "gi");
+    let qm;
+    while ((qm = qNegRe.exec(rawQuestion.toLowerCase())) !== null) {
+      if (qm[1] && qm[1].length >= 2) qNegatedTerms.push(qm[1]);
+    }
+  }
+
+  for (const polWord of POLARITY_WORDS) {
+    const headingNegRe = new RegExp(`\\b${polWord}[\\s_\\-]+([a-z0-9]+)\\b`, "i");
+    const m = headingNegRe.exec(headingText);
+    if (m) {
+      const negatedWord = m[1];
+      if (negatedWord && negatedWord.length >= 2) {
+        if (qNegatedTerms.includes(negatedWord)) {
+          // Both query and heading agree on negation (e.g. "no disease")
+          polarityAdjustment += 0.25;
+        } else if (!qHasNegation && (activeTerms.includes(negatedWord) || scopeTokens.has(negatedWord))) {
+          // Query asked for affirmative subject, but heading negates it (e.g. "no disease" when query has "dr case" or "disease")
+          polarityAdjustment -= 0.20;
+        }
+      }
+    }
+  }
+
+  // If query specifically asked for a negated condition ("no disease"), penalize affirmative headings (e.g. "DR PRESENT")
+  if (qNegatedTerms.length > 0) {
+    const hasAnyNegationInHeading = Array.from(POLARITY_WORDS).some((p) => new RegExp(`\\b${p}\\b`, "i").test(headingText));
+    if (!hasAnyNegationInHeading && /\b(?:present|detected|positive|high risk)\b/i.test(headingText)) {
+      polarityAdjustment -= 0.25;
+    }
+  }
+
+  return Math.min(1.0, Math.max(0, tokenCoverage + metricBonus + phraseBonus + bigramScore + polarityAdjustment));
 }
 
 /**
@@ -160,6 +214,74 @@ function computeLexicalScore(queryTerms, rawQuestion, content, scopeTokens = new
  * @param {Object} filterMeta
  * @returns {Promise<Array<Object>>}
  */
+let isVectorSearchSupported = null; // null: untested, true: Atlas/AtlasCLI, false: Community 31082
+
+/**
+ * Attempts native MongoDB Atlas $vectorSearch.
+ * Returns null if running on local MongoDB Community Edition (code 31082) where Atlas Search daemon (mongot) is not deployed.
+ */
+async function tryVectorSearch(queryEmbedding, routedDepartments = [], filterMeta = {}, topK = 5) {
+  if (isVectorSearchSupported === false) return null;
+
+  try {
+    const vectorStage = {
+      index: "vector_index",
+      path: "embedding",
+      queryVector: queryEmbedding,
+      numCandidates: Math.max(topK * 10, 50),
+      limit: Math.max(topK * 4, 20)
+    };
+
+    if (routedDepartments && routedDepartments.length > 0) {
+      vectorStage.filter = { department: { $in: routedDepartments } };
+    }
+
+    const pipeline = [
+      { $vectorSearch: vectorStage },
+      {
+        $project: {
+          documentId: 1,
+          documentName: 1,
+          pageNumber: 1,
+          chunkIndex: 1,
+          content: 1,
+          department: 1,
+          sourceType: 1,
+          imageRef: 1,
+          embedding: 1,
+          vectorSearchScore: { $meta: "vectorSearchScore" }
+        }
+      }
+    ];
+
+    if (filterMeta.documentId) {
+      pipeline.push({ $match: { documentId: filterMeta.documentId } });
+    }
+    if (filterMeta.documentName) {
+      pipeline.push({ $match: { documentName: filterMeta.documentName } });
+    }
+
+    const results = await DocumentChunk.aggregate(pipeline);
+    if (isVectorSearchSupported === null) {
+      console.log("[TextRetrieval] Native MongoDB $vectorSearch is active and operational.");
+      isVectorSearchSupported = true;
+    }
+    return results;
+  } catch (err) {
+    if (err.code === 31082 || /requires additional configuration/i.test(err.message)) {
+      if (isVectorSearchSupported === null) {
+        console.warn(
+          "[TextRetrieval] MongoDB $vectorSearch requires Atlas or AtlasCLI with mongot (code 31082). Operating via indexed candidate retrieval."
+        );
+      }
+      isVectorSearchSupported = false;
+      return null;
+    }
+    console.warn(`[TextRetrieval] $vectorSearch attempt: ${err.message}. Using indexed candidate retrieval.`);
+    return null;
+  }
+}
+
 export async function retrieveRelevantTextChunks(
   queryEmbedding,
   routedDepartments = [],
@@ -175,26 +297,30 @@ export async function retrieveRelevantTextChunks(
     return [];
   }
 
-  // 1. Build Metadata Query
-  const mongoQuery = {};
+  // 1. Attempt native MongoDB Vector Search first
+  let candidates = await tryVectorSearch(queryEmbedding, routedDepartments, filterMeta, topK);
 
-  if (routedDepartments && routedDepartments.length > 0) {
-    mongoQuery.department = { $in: routedDepartments };
+  // 2. If $vectorSearch is unavailable (e.g. local Community Edition code 31082), query indexed candidates
+  if (!candidates) {
+    const mongoQuery = {};
+
+    if (routedDepartments && routedDepartments.length > 0) {
+      mongoQuery.department = { $in: routedDepartments };
+    }
+
+    if (filterMeta.documentId) {
+      mongoQuery.documentId = filterMeta.documentId;
+    }
+    if (filterMeta.documentName) {
+      mongoQuery.documentName = filterMeta.documentName;
+    }
+
+    candidates = await DocumentChunk.find(mongoQuery)
+      .select("documentId documentName pageNumber chunkIndex content department sourceType imageRef embedding")
+      .lean();
   }
 
-  if (filterMeta.documentId) {
-    mongoQuery.documentId = filterMeta.documentId;
-  }
-  if (filterMeta.documentName) {
-    mongoQuery.documentName = filterMeta.documentName;
-  }
-
-  // 2. Fetch candidate chunks
-  const candidates = await DocumentChunk.find(mongoQuery)
-    .select("documentId documentName pageNumber chunkIndex content department sourceType embedding")
-    .lean();
-
-  if (candidates.length === 0) {
+  if (!candidates || candidates.length === 0) {
     console.log(`[TextRetrieval] No chunks found matching query criteria [depts: ${routedDepartments.join(", ")}]`);
     return [];
   }
@@ -203,7 +329,6 @@ export async function retrieveRelevantTextChunks(
   const queryTerms = extractQueryTerms(question);
   const pageMatch = (question || "").toLowerCase().match(/\b(?:page|p\.?)\s*(\d+)\b/i);
   const targetPage = pageMatch ? parseInt(pageMatch[1], 10) : null;
-  const asksVisualExplicitly = /\b(?:screenshot|image|diagram|figure|chart|confusion\s*matrix)\b/i.test(question || "");
 
   // Build scope tokens from routed departments/documents
   const scopeTokens = new Set();
@@ -218,7 +343,28 @@ export async function retrieveRelevantTextChunks(
     });
   }
 
-  // 4. Score and filter candidates
+  // 4. Pre-index page-level content across candidates for same-page evidence awareness
+  const pageCombinedTextMap = new Map();
+  for (const chunk of candidates) {
+    if (chunk.documentId && chunk.pageNumber && chunk.sourceType !== "visual_ocr") {
+      const pageKey = `${chunk.documentId}_${chunk.pageNumber}`;
+      if (!pageCombinedTextMap.has(pageKey)) {
+        pageCombinedTextMap.set(pageKey, []);
+      }
+      pageCombinedTextMap.get(pageKey).push(chunk);
+    }
+  }
+
+  // Combine adjacent same-page chunks text
+  const pageMergedContent = new Map();
+  for (const [pageKey, pageChunks] of pageCombinedTextMap.entries()) {
+    if (pageChunks.length > 1) {
+      pageChunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+      pageMergedContent.set(pageKey, pageChunks.map((c) => c.content || "").join("\n"));
+    }
+  }
+
+  // 5. Score and filter candidates
   const scoredCandidates = [];
   const seenPrefixes = new Set();
 
@@ -232,7 +378,19 @@ export async function retrieveRelevantTextChunks(
 
     const sim = cosineSimilarity(queryEmbedding, chunk.embedding);
     const isPageMatch = targetPage !== null && chunk.pageNumber === targetPage;
-    const lexicalScore = computeLexicalScore(queryTerms, question, chunk.content || "", scopeTokens);
+    let lexicalScore = computeLexicalScore(queryTerms, question, chunk.content || "", scopeTokens);
+
+    // Same-page evidence awareness:
+    // If adjacent chunks on the same page contain complementary query terms,
+    // allow the page evidence to strengthen the chunk's ranking score.
+    const pageKey = `${chunk.documentId}_${chunk.pageNumber}`;
+    const pageText = pageMergedContent.get(pageKey);
+    if (pageText && queryTerms.length >= 2) {
+      const pageLexical = computeLexicalScore(queryTerms, question, pageText, scopeTokens);
+      if (pageLexical > lexicalScore) {
+        lexicalScore = Math.min(1.0, lexicalScore + 0.6 * (pageLexical - lexicalScore));
+      }
+    }
 
     // Hybrid score combination (50% semantic + 50% lexical/metric + page match bonus)
     let hybridScore = (0.50 * sim) + (0.50 * lexicalScore);
@@ -243,7 +401,7 @@ export async function retrieveRelevantTextChunks(
     // Keep candidate if semantic similarity passes threshold OR strong lexical match with moderate similarity OR exact page match
     const passesSemantic = sim >= threshold;
     const passesLexicalHybrid = lexicalScore >= 0.35 && sim >= 0.40;
-    const passesVisualOcr = chunk.sourceType === "visual_ocr" && (lexicalScore >= 0.25 || sim >= 0.42);
+    const passesVisualOcr = (chunk.sourceType === "image_chunk" || chunk.sourceType === "visual_ocr") && (lexicalScore >= 0.20 || sim >= 0.40);
 
     if (passesSemantic || passesLexicalHybrid || isPageMatch || passesVisualOcr) {
       scoredCandidates.push({
@@ -254,6 +412,7 @@ export async function retrieveRelevantTextChunks(
         content: chunk.content,
         department: chunk.department,
         sourceType: chunk.sourceType || "text",
+        imageRef: chunk.imageRef || null,
         similarity: parseFloat(sim.toFixed(4)),
         lexicalScore: parseFloat(lexicalScore.toFixed(4)),
         rankingScore: parseFloat(hybridScore.toFixed(4)),
@@ -262,69 +421,86 @@ export async function retrieveRelevantTextChunks(
     }
   }
 
-  // 5. Initial Sort: Rank by hybrid score (prioritizing explicit page match if requested)
-  scoredCandidates.sort((a, b) => {
-    if (a._isPageMatch && !b._isPageMatch) return -1;
-    if (!a._isPageMatch && b._isPageMatch) return 1;
-    return b.rankingScore - a.rankingScore;
-  });
+  // 6. Modality-aware dual-pool ranking: rank text chunks and image_chunks in separate pools, then merge (Requirement 2)
+  const textCandidates = [];
+  const imageChunkCandidates = [];
 
-  // 6. Rerank & Select Top Strongest Chunks with Page Diversity & Department Balance
-  const seenPages = new Set();
-  let ocrChunkCount = 0;
-  const strongChunks = [];
+  for (const c of scoredCandidates) {
+    if (c.sourceType === "image_chunk" || c.imageRef) {
+      imageChunkCandidates.push(c);
+    } else {
+      textCandidates.push(c);
+    }
+  }
+
+  const sortPool = (pool) => {
+    pool.sort((a, b) => {
+      if (a._isPageMatch && !b._isPageMatch) return -1;
+      if (!a._isPageMatch && b._isPageMatch) return 1;
+      return b.rankingScore - a.rankingScore;
+    });
+  };
+
+  sortPool(textCandidates);
+  sortPool(imageChunkCandidates);
+
+  const topKTextLimit = RAG_CONFIG.topKTextChunks || topK || 5;
+  const topKImageLimit = RAG_CONFIG.topKImageChunks || 2;
 
   const isValidChunk = (c) => {
     if (!c._isPageMatch && c.rankingScore < 0.40 && c.lexicalScore < 0.15 && c.similarity < 0.40) {
       return false;
     }
-    if (!asksVisualExplicitly && c.sourceType === "visual_ocr" && ocrChunkCount >= 1) {
-      return false;
-    }
-    const pageKey = `${c.documentName}_p${c.pageNumber}`;
-    if (!c._isPageMatch && seenPages.has(pageKey)) {
-      return false;
-    }
     return true;
   };
 
-  const addChunk = (c) => {
-    if (c.sourceType === "visual_ocr") ocrChunkCount++;
-    seenPages.add(`${c.documentName}_p${c.pageNumber}`);
-    strongChunks.push(c);
-  };
-
-  // If multiple departments were routed, guarantee top representation from each department
-  if (routedDepartments && routedDepartments.length > 1) {
-    for (const dept of routedDepartments) {
-      let deptAdded = 0;
-      for (const c of scoredCandidates) {
-        if (c.department === dept && isValidChunk(c)) {
-          addChunk(c);
-          deptAdded++;
-          if (deptAdded >= 2) break;
-        }
-      }
+  const seenTextPages = new Set();
+  const selectedText = [];
+  for (const c of textCandidates) {
+    if (selectedText.length >= topKTextLimit) break;
+    const pageKey = `${c.documentName}_p${c.pageNumber}`;
+    if (!c._isPageMatch && seenTextPages.has(pageKey)) continue;
+    if (isValidChunk(c)) {
+      seenTextPages.add(pageKey);
+      selectedText.push(c);
     }
   }
 
-  // Fill remaining slots up to topK by best ranking score
-  for (const c of scoredCandidates) {
-    if (strongChunks.length >= topK) break;
-    if (!strongChunks.includes(c) && isValidChunk(c)) {
-      addChunk(c);
+  const seenImageKeys = new Set();
+  const selectedImages = [];
+  for (const c of imageChunkCandidates) {
+    if (selectedImages.length >= topKImageLimit) break;
+    const imgKey = c.imageRef?.filename || `${c.documentName}_p${c.pageNumber}`;
+    if (seenImageKeys.has(imgKey)) continue;
+    if (isValidChunk(c)) {
+      seenImageKeys.add(imgKey);
+      selectedImages.push(c);
+      console.log(
+        `[Multimodal] Retrieved image-derived chunk: page ${c.pageNumber}, rankScore=${c.rankingScore}, sim=${c.similarity}, doc="${c.documentName}", file="${c.imageRef?.filename || 'n/a'}"`
+      );
     }
   }
 
-  // Merge sibling chunks on the same page from candidate memory to preserve full context
+  // Merge and sort by ranking score
+  const strongChunks = [...selectedText, ...selectedImages];
+  strongChunks.sort((a, b) => {
+    if (a._isPageMatch && !b._isPageMatch) return -1;
+    if (!a._isPageMatch && b._isPageMatch) return 1;
+    return b.rankingScore - a.rankingScore;
+  });
+
+  // Safely augment very short chunks with immediate adjacent sibling to maintain sentence continuity without blowing up prompt tokens
   for (const c of strongChunks) {
-    if (c.sourceType !== "visual_ocr" && c.pageNumber && c.documentId) {
-      const pageSiblings = candidates
-        .filter((cand) => String(cand.documentId) === String(c.documentId) && cand.pageNumber === c.pageNumber && cand.sourceType !== "visual_ocr")
-        .sort((a, b) => a.chunkIndex - b.chunkIndex);
-
-      if (pageSiblings.length > 1) {
-        c.content = pageSiblings.map((s) => s.content).join("\n");
+    if (c.sourceType !== "visual_ocr" && c.pageNumber && c.documentId && (c.content || "").length < 350) {
+      const adjacentSibling = candidates.find(
+        (cand) =>
+          String(cand.documentId) === String(c.documentId) &&
+          cand.pageNumber === c.pageNumber &&
+          cand.chunkIndex === c.chunkIndex + 1 &&
+          cand.sourceType !== "visual_ocr"
+      );
+      if (adjacentSibling && adjacentSibling.content) {
+        c.content = `${c.content}\n${adjacentSibling.content}`.slice(0, 800);
       }
     }
   }

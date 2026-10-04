@@ -2,10 +2,9 @@ import React, { useState, useRef, useEffect } from "react";
 import {
   ArrowUp,
   Square,
-  Paperclip,
-  Cloud,
-  Sparkles
+  Paperclip
 } from "lucide-react";
+import { GoogleDriveIcon } from "../common/GoogleDriveIcon";
 import { useChat } from "../../context/ChatContext";
 
 export function ChatInput() {
@@ -40,7 +39,7 @@ export function ChatInput() {
   }
 
   function handleSubmit() {
-    if (!input.trim() || isStreaming) return;
+    if (!input.trim()) return;
     sendMessage(input.trim());
     setInput("");
     if (textareaRef.current) {
@@ -74,7 +73,7 @@ export function ChatInput() {
       {/* Drag overlay notice */}
       {isDragging && (
         <div className="mb-2 p-3 bg-blue-500/10 border-2 border-dashed border-blue-500 rounded-2xl text-center text-xs text-blue-600 dark:text-blue-400 font-medium animate-pulse">
-          Drop PDF, DOC, DOCX, TXT, CSV, XLS, XLSX, PPT, PPTX, MD, JSON, HTML, or XML file here
+          Drop document file here to upload
         </div>
       )}
 
@@ -85,9 +84,9 @@ export function ChatInput() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Ask anything about your documents, architecture, or code..."
+          placeholder="Ask a question about your documents..."
           rows={1}
-          className="w-full resize-none bg-transparent px-4 pt-3.5 pb-12 text-sm text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-none min-h-[52px] max-h-48"
+          className="w-full resize-none bg-transparent px-4 pt-3.5 pb-12 text-[15px] text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-none min-h-[52px] max-h-48"
         />
 
         {/* Bottom toolbar */}
@@ -97,31 +96,40 @@ export function ChatInput() {
             <button
               type="button"
               onClick={() => setShowUploadModal(true)}
-              className="p-1.5 text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition flex items-center space-x-1 text-xs"
-              title="Attach document (PDF, DOC, DOCX, TXT, CSV, XLS, XLSX, PPT, PPTX, MD, JSON...)"
+              className="p-1.5 text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition flex items-center space-x-1.5 text-xs font-medium cursor-pointer"
+              title="Upload document"
             >
-              <Paperclip className="w-4 h-4" />
+              <Paperclip className="w-4 h-4 text-neutral-500" />
               <span className="hidden sm:inline">Attach File</span>
             </button>
 
             <button
               type="button"
               onClick={() => setShowDriveModal(true)}
-              className="p-1.5 text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition flex items-center space-x-1 text-xs"
+              className="p-1.5 text-neutral-600 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-200 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition flex items-center space-x-1.5 text-xs font-medium cursor-pointer"
               title="Import from Google Drive"
             >
-              <Cloud className="w-4 h-4 text-emerald-500" />
+              <GoogleDriveIcon className="w-4 h-4" />
               <span className="hidden sm:inline">Google Drive</span>
             </button>
           </div>
 
-          {/* Right action: Send or Stop */}
+          {/* Right action: Send, Queue, or Stop */}
           <div>
-            {isStreaming ? (
+            {input.trim() ? (
+              <button
+                type="button"
+                onClick={handleSubmit}
+                className="p-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white shadow-sm transition flex items-center justify-center cursor-pointer"
+                title="Send question"
+              >
+                <ArrowUp className="w-4 h-4 stroke-[2.5]" />
+              </button>
+            ) : isStreaming ? (
               <button
                 type="button"
                 onClick={stopGeneration}
-                className="p-2 rounded-xl bg-red-600 hover:bg-red-700 text-white shadow transition flex items-center justify-center"
+                className="p-2 rounded-xl bg-red-600 hover:bg-red-700 text-white shadow transition flex items-center justify-center cursor-pointer"
                 title="Stop generation"
               >
                 <Square className="w-4 h-4 fill-white" />
@@ -129,13 +137,8 @@ export function ChatInput() {
             ) : (
               <button
                 type="button"
-                onClick={handleSubmit}
-                disabled={!input.trim()}
-                className={`p-2 rounded-xl transition flex items-center justify-center shadow-sm ${
-                  input.trim()
-                    ? "bg-blue-600 hover:bg-blue-700 text-white"
-                    : "bg-neutral-200 dark:bg-neutral-800 text-neutral-400 cursor-not-allowed"
-                }`}
+                disabled
+                className="p-2 rounded-xl bg-neutral-200 dark:bg-neutral-800 text-neutral-400 cursor-not-allowed transition flex items-center justify-center shadow-sm"
                 title="Send question"
               >
                 <ArrowUp className="w-4 h-4 stroke-[2.5]" />
@@ -145,8 +148,8 @@ export function ChatInput() {
         </div>
       </div>
 
-      <div className="mt-2 text-center text-[11px] text-neutral-400 dark:text-neutral-500">
-        AI Knowledge Assistant grounded in your local documents via LangGraph & SigLIP2.
+      <div className="mt-2 text-center text-xs text-neutral-400 dark:text-neutral-500">
+        RAG Chatbot • Answers are grounded directly in your uploaded documents
       </div>
     </div>
   );

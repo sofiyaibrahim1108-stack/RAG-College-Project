@@ -1,34 +1,18 @@
 import React, { useRef, useEffect, useState } from "react";
-import { Sparkles, ArrowDown, HelpCircle, FileSearch, Lightbulb, Compass } from "lucide-react";
+import { ArrowDown, Loader2 } from "lucide-react";
 import { useChat } from "../context/ChatContext";
 import { ChatMessage } from "../components/chat/ChatMessage";
 import { ChatInput } from "../components/chat/ChatInput";
 
-const SUGGESTIONS = [
-  {
-    title: "Document Summary",
-    desc: "Can you provide a summary of the uploaded documents and their key topics?",
-    icon: FileSearch
-  },
-  {
-    title: "Cross-Domain Questions",
-    desc: "What are the core concepts and findings documented in the knowledge base?",
-    icon: Lightbulb
-  },
-  {
-    title: "Diagrams & Illustrations",
-    desc: "Explain any architectural diagrams, flowcharts, or figures found in the files.",
-    icon: Compass
-  },
-  {
-    title: "Knowledge Exploration",
-    desc: "What departments and subjects are currently covered in this workspace?",
-    icon: HelpCircle
-  }
-];
+function getTimeGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good morning!";
+  if (hour < 18) return "Good afternoon!";
+  return "Good evening!";
+}
 
 export function ChatPage() {
-  const { messages, sendMessage, isStreaming } = useChat();
+  const { messages, isStreaming, isLoadingMessages } = useChat();
   const messagesEndRef = useRef(null);
   const containerRef = useRef(null);
   const [showScrollBottom, setShowScrollBottom] = useState(false);
@@ -61,49 +45,29 @@ export function ChatPage() {
       <div
         ref={containerRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto"
+        className="flex-1 overflow-y-auto flex flex-col"
       >
-        {messages.length === 0 ? (
-          /* Empty State / Welcome Hero */
-          <div className="max-w-2xl mx-auto px-4 py-16 text-center space-y-8 animate-in fade-in duration-300">
-            <div className="space-y-3">
-              <div className="w-14 h-14 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white mx-auto shadow-xl ring-4 ring-blue-500/10">
-                <Sparkles className="w-7 h-7" />
-              </div>
-              <h2 className="text-2xl font-bold text-neutral-900 dark:text-white">
-                How can I assist you with your knowledge today?
-              </h2>
-              <p className="text-sm text-neutral-500 dark:text-neutral-400 max-w-md mx-auto">
-                Ask questions grounded in your uploaded documents and diagrams. The system routes by department and queries text chunks and SigLIP2 images.
-              </p>
-            </div>
-
-            {/* Quick Prompt Cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-left">
-              {SUGGESTIONS.map((item, idx) => {
-                const Icon = item.icon;
-                return (
-                  <button
-                    key={idx}
-                    onClick={() => sendMessage(item.desc)}
-                    disabled={isStreaming}
-                    className="p-4 rounded-2xl border border-neutral-200 dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/60 hover:border-blue-500/50 hover:bg-neutral-50 dark:hover:bg-neutral-800/60 transition shadow-xs group"
-                  >
-                    <div className="flex items-center space-x-2 text-xs font-semibold text-neutral-900 dark:text-neutral-100 mb-1">
-                      <Icon className="w-4 h-4 text-blue-500 group-hover:scale-110 transition" />
-                      <span>{item.title}</span>
-                    </div>
-                    <p className="text-xs text-neutral-500 dark:text-neutral-400 line-clamp-2">
-                      {item.desc}
-                    </p>
-                  </button>
-                );
-              })}
-            </div>
+        {isLoadingMessages && messages.length === 0 ? (
+          <div className="flex-1 flex flex-col items-center justify-center space-y-3 animate-in fade-in duration-200">
+            <Loader2 className="w-6 h-6 animate-spin text-neutral-400" />
+            <span className="text-xs text-neutral-400">Loading conversation...</span>
+          </div>
+        ) : messages.length === 0 ? (
+          /* Empty State / Welcome (Clean, minimal, generous whitespace) */
+          <div className="flex-1 flex flex-col items-center justify-center px-4 py-16 text-center max-w-2xl mx-auto select-none animate-in fade-in duration-200">
+            <p className="text-base sm:text-lg font-medium text-blue-600 dark:text-blue-400 mb-2">
+              {getTimeGreeting()}
+            </p>
+            <h2 className="text-2xl sm:text-3xl md:text-4xl font-semibold text-neutral-900 dark:text-white tracking-tight leading-snug mb-3">
+              How can I help you with your documents today?
+            </h2>
+            <p className="text-sm sm:text-base text-neutral-500 dark:text-neutral-400 max-w-lg leading-relaxed">
+              Ask questions about your uploaded documents, search for information, or explore diagrams and images.
+            </p>
           </div>
         ) : (
           /* Messages Stream */
-          <div className="pb-6 divide-y divide-transparent">
+          <div className="py-6 px-2 sm:px-4 max-w-4xl mx-auto w-full space-y-6">
             {messages.map((msg, index) => (
               <ChatMessage key={msg._id || index} message={msg} index={index} />
             ))}
@@ -127,3 +91,4 @@ export function ChatPage() {
     </div>
   );
 }
+

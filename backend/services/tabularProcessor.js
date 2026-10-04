@@ -29,6 +29,8 @@ export const ALLOWED_OPERATIONS = new Set([
   "percentage",
   "distribution",
   "lookup",
+  "filter",
+  "rank",
   "none"
 ]);
 
@@ -88,6 +90,341 @@ export function loadRows(doc) {
   const workbook = XLSX.read(fs.readFileSync(doc.path), { type: "buffer" });
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   return XLSX.utils.sheet_to_json(sheet, { defval: "" });
+}
+
+function escRe(s) {
+  return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Standard Levenshtein edit distance for generic typo and plural tolerance.
+ */
+function editDistance(a, b) {
+  if (!a) return b ? b.length : 0;
+  if (!b) return a.length;
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) dp[i][j] = dp[i - 1][j - 1];
+      else dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+/**
+ * Generic linguistic suffix normalizer (strips English inflections without domain rules).
+ */
+export function stemWord(w) {
+  if (!w || w.length <= 3) return w;
+  if (w.endsWith("ies") && w.length >= 5) return w.slice(0, -3) + "y";
+  if (w.endsWith("es") && w.length >= 5) return w.slice(0, -2);
+  if (w.endsWith("s") && !w.endsWith("ss") && w.length >= 4) return w.slice(0, -1);
+  if (w.endsWith("ing") && w.length >= 6) return w.slice(0, -3);
+  if (w.endsWith("ed") && w.length >= 5) return w.slice(0, -2);
+  return w;
+}
+
+/**
+ * Matches a query token to a schema column name using generic normalization:
+ * lowercase, alphanumeric stripping, suffix stemming, and edit distance.
+ */
+export function matchTokenToColumn(token, colName) {
+  if (!token || !colName) return false;
+  const t = token.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const c = colName.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!t || !c) return false;
+  if (t === c) return true;
+
+  // Generic stem match
+  const tStem = stemWord(t);
+  const cStem = stemWord(c);
+  if (tStem.length >= 3 && cStem.length >= 3) {
+    if (tStem === cStem) return true;
+    const tBase = tStem.endsWith("e") ? tStem.slice(0, -1) : tStem;
+    const cBase = cStem.endsWith("e") ? cStem.slice(0, -1) : cStem;
+    if (tBase === cBase) return true;
+  }
+
+  // Edit distance (only for words of length >= 5 with distance 1)
+  if (Math.abs(t.length - c.length) <= 1 && t.length >= 5 && c.length >= 5) {
+    if (editDistance(t, c) <= 1) return true;
+  }
+  return false;
+}
+
+function normalizeOp(opStr) {
+  const s = String(opStr).toLowerCase().trim();
+  if (/^(?:above|greater(?:\s+than)?|more(?:\s+than)?|higher(?:\s+than)?|over|exceeding|exceeds|>)$/.test(s)) return "gt";
+  if (/^(?:at\s+least|>=|min\s+of)$/.test(s)) return "gte";
+  if (/^(?:below|less(?:\s+than)?|lower(?:\s+than)?|under|fewer(?:\s+than)?|<)$/.test(s)) return "lt";
+  if (/^(?:at\s+most|<=|max\s+of)$/.test(s)) return "lte";
+  if (/^(?:equal(?:\s+to)?|equals|==|=)$/.test(s)) return "eq";
+  return null;
+}
+
+/**
+ * Fast deterministic parser for structured queries.
+ * Identifies column names, comparison operators, thresholds, and target operations directly from table schema.
+ */
+export function parseDeterministicQueryPlan(question, colInfo) {
+  if (!question || !colInfo || colInfo.length === 0) return null;
+  const q = question.trim();
+  const qWords = q.split(/[\s,?.!;:()\[\]"]+/).filter(Boolean);
+
+  const colByName = new Map();
+  const colByLower = new Map();
+  for (const c of colInfo) {
+    colByName.set(c.name, c);
+    colByLower.set(c.name.toLowerCase().trim(), c);
+  }
+
+  // 1. Identify all column mentions in question using exact regex + generic token matching
+  const foundCols = [];
+  const seenColNames = new Set();
+
+  for (const col of colInfo) {
+    // 1A. Direct regex match
+    const patternStr = escRe(col.name).replace(/[_\-\s]+/g, "[\\s_\\-]+");
+    const re = new RegExp(`\\b${patternStr}\\b`, "gi");
+    let m = re.exec(q);
+    if (m) {
+      foundCols.push({ col, index: m.index, length: m[0].length, matchedText: m[0] });
+      seenColNames.add(col.name);
+      continue;
+    }
+
+    // 1B. Generic normalization / stem / edit-distance token match
+    for (let i = 0; i < qWords.length; i++) {
+      const w = qWords[i];
+      if (matchTokenToColumn(w, col.name)) {
+        foundCols.push({ col, index: q.toLowerCase().indexOf(w.toLowerCase()), length: w.length, matchedText: w });
+        seenColNames.add(col.name);
+        break;
+      }
+      if (i < qWords.length - 1) {
+        const bigram = `${w} ${qWords[i + 1]}`;
+        if (matchTokenToColumn(bigram, col.name)) {
+          foundCols.push({ col, index: q.toLowerCase().indexOf(bigram.toLowerCase()), length: bigram.length, matchedText: bigram });
+          seenColNames.add(col.name);
+          break;
+        }
+      }
+    }
+  }
+
+  // Sort identified columns by their appearance position in the question
+  foundCols.sort((a, b) => a.index - b.index);
+
+  // 2. Identify operation
+  let operation = null;
+  if (/\b(?:how\s+many|count\s+of|number\s+of|total\s+number\s+of)\b/i.test(q)) {
+    operation = "count";
+  } else if (/\b(?:highest|maximum|max|top|greatest|most|best)\b/i.test(q)) {
+    operation = "max";
+  } else if (/\b(?:lowest|minimum|min|least|bottom|worst)\b/i.test(q)) {
+    operation = "min";
+  } else if (/\b(?:average|mean|avg)\b/i.test(q)) {
+    operation = "average";
+  } else if (/\b(?:sum\s+of|total\s+sum)\b/i.test(q)) {
+    operation = "sum";
+  } else if (/\b(?:percentage|percent|%)\b/i.test(q)) {
+    operation = "percentage";
+  } else if (/\b(?:which|who|list|names?\s+of|find|show|give\s+me)\b/i.test(q)) {
+    operation = "filter";
+  }
+
+  const opTokens = "above|greater(?:\\s+than)?|more(?:\\s+than)?|higher(?:\\s+than)?|over|exceeding|exceeds|below|less(?:\\s+than)?|lower(?:\\s+than)?|under|fewer(?:\\s+than)?|at\\s+least|at\\s+most|[><]=?";
+
+  // 3. Extract filters
+  const filters = [];
+
+  // Pattern A1: Prefix Shared condition over multiple columns
+  const prefixSharedRegex = new RegExp(
+    `(?:scored\\s+|have\\s+|got\\s+|with\\s+)?(${opTokens})\\s*(\\d+(?:\\.\\d+)?)\\s+(?:in\\s+|for\\s+)?(?:both\\s+)?([^,.?!]+)`,
+    "i"
+  );
+  const prefixMatch = prefixSharedRegex.exec(q);
+  if (prefixMatch) {
+    const rawOp = prefixMatch[1];
+    const threshold = parseFloat(prefixMatch[2]);
+    const op = normalizeOp(rawOp);
+    const scopeSegment = prefixMatch[3];
+
+    const colsInSegment = [];
+    for (const c of colInfo) {
+      if (matchTokenToColumn(scopeSegment, c.name) || new RegExp(`\\b${escRe(c.name)}\\b`, "i").test(scopeSegment)) {
+        colsInSegment.push(c);
+      }
+    }
+
+    if (colsInSegment.length >= 1 && op && !Number.isNaN(threshold)) {
+      for (const c of colsInSegment) {
+        if (c.isNumeric) {
+          filters.push({ column: c.name, op, value: threshold });
+        }
+      }
+    }
+  }
+
+  // Pattern B: Independent column conditions (e.g. "Math above 80", "more than 90 in Maths")
+  if (filters.length === 0) {
+    for (const col of colInfo) {
+      if (!col.isNumeric) continue;
+
+      // Col followed by op + num
+      for (let i = 0; i < qWords.length; i++) {
+        if (matchTokenToColumn(qWords[i], col.name)) {
+          const afterText = q.slice(q.toLowerCase().indexOf(qWords[i].toLowerCase()) + qWords[i].length);
+          const postM = new RegExp(`^\\s*(?:score|mark|marks)?\\s*(?:is|are|of|scored|got)?\\s*(${opTokens})\\s*(\\d+(?:\\.\\d+)?)`, "i").exec(afterText);
+          if (postM) {
+            const op = normalizeOp(postM[1]);
+            const num = parseFloat(postM[2]);
+            if (op && !Number.isNaN(num)) {
+              filters.push({ column: col.name, op, value: num });
+              break;
+            }
+          }
+        }
+      }
+
+      // Op + num followed by col (e.g. "more than 90 in Maths")
+      const preRe = new RegExp(`(${opTokens})\\s*(\\d+(?:\\.\\d+)?)\\s*(?:in|for|on)?\\s*([a-zA-Z0-9_\\-]+)`, "i");
+      const preM = preRe.exec(q);
+      if (preM) {
+        const op = normalizeOp(preM[1]);
+        const num = parseFloat(preM[2]);
+        const targetWord = preM[3];
+        if (op && !Number.isNaN(num) && matchTokenToColumn(targetWord, col.name)) {
+          filters.push({ column: col.name, op, value: num });
+        }
+      }
+    }
+  }
+
+  // Pattern C: Categorical column matching (e.g. distinct entities like person names, "Pass", "East")
+  let matchedEntityFilter = null;
+  for (const col of colInfo) {
+    if (col.isNumeric || !col.distinct) continue;
+    for (const d of col.distinct) {
+      if (!d) continue;
+      const strVal = String(d).trim();
+      if (!strVal) continue;
+
+      let isMatch = false;
+      const dPattern = escRe(strVal).replace(/[_\-\s]+/g, "[\\s_\\-]+");
+
+      if (strVal.length <= 2) {
+        // Categorical values of 1-2 characters (like Grade A/B/C) must match ONLY if:
+        // (1) The column name from the schema appears next to the value in the question, OR
+        // (2) The value appears as an exact uppercase standalone token. Plain article "a" must never create a filter.
+        const colPattern = escRe(col.name).replace(/[_\-\s]+/g, "[\\s_\\-]+");
+        const nearColRe = new RegExp(`(?:\\b${colPattern}\\s*(?:is|equals|:|==|=|-)?\\s*${dPattern}\\b|\\b${dPattern}\\s+${colPattern}\\b)`, "i");
+        const exactUpperRe = new RegExp(`\\b${dPattern}\\b`); // Exact uppercase (case-sensitive)
+        if (nearColRe.test(q) || exactUpperRe.test(q)) {
+          isMatch = true;
+        }
+      } else {
+        const dRe = new RegExp(`\\b${dPattern}\\b`, "i");
+        if (dRe.test(q)) {
+          isMatch = true;
+        }
+      }
+
+      if (isMatch) {
+        const f = { column: col.name, op: "eq", value: d };
+        filters.push(f);
+        if (/name|student|person|user|product|item|employee|order/i.test(col.name) || strVal.length >= 3) {
+          matchedEntityFilter = f;
+        }
+      }
+    }
+  }
+
+  // If query contains personal/possessive pronouns but no entity was identified,
+  // it is an unresolved follow-up and cannot be deterministically answered without resolved context
+  const hasUnresolvedPronoun = /\b(he|she|they|his|her|their|him|them)\b/i.test(q) && !matchedEntityFilter;
+  if (hasUnresolvedPronoun) {
+    return null;
+  }
+
+  // 4. Resolve operation and target column
+  let targetColumn = null;
+  const numericFound = foundCols.filter((fc) => fc.col.isNumeric);
+
+  // If an entity was matched (e.g. specific entity filter) AND another column was mentioned in the question:
+  // This is a single-cell LOOKUP!
+  const requestedCol = foundCols.find((fc) => fc.col.name !== matchedEntityFilter?.column);
+  if (matchedEntityFilter && requestedCol) {
+    operation = "lookup";
+    targetColumn = requestedCol.col.name;
+  } else if (["average", "sum", "min", "max"].includes(operation)) {
+    if (numericFound.length > 0) {
+      targetColumn = numericFound[0].col.name;
+    }
+  } else if (operation === "count") {
+    targetColumn = numericFound.length > 0 ? numericFound[0].col.name : (colInfo[0]?.name || null);
+  } else if (operation === "filter") {
+    const nameCol = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) ||
+                    colInfo.find((c) => !c.isNumeric) ||
+                    colInfo[0];
+    targetColumn = nameCol ? nameCol.name : null;
+  }
+
+  // Ordinal rank extraction (e.g. "second student", "2nd highest", "top student", "3rd")
+  const ORDINAL_MAP = {
+    first: 1, "1st": 1,
+    second: 2, "2nd": 2,
+    third: 3, "3rd": 3,
+    fourth: 4, "4th": 4,
+    fifth: 5, "5th": 5,
+    sixth: 6, "6th": 6,
+    seventh: 7, "7th": 7,
+    eighth: 8, "8th": 8,
+    ninth: 9, "9th": 9,
+    tenth: 10, "10th": 10
+  };
+  const ordinalMatch = /\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|sixth|6th|seventh|7th|eighth|8th|ninth|9th|tenth|10th)\b/i.exec(q);
+  const rankIndex = ordinalMatch ? ORDINAL_MAP[ordinalMatch[1].toLowerCase()] : null;
+  const rankOrder = /\b(lowest|bottom|min|minimum|worst|least)\b/i.test(q) ? "asc" : "desc";
+
+  if (rankIndex && (rankIndex > 1 || /\b(?:rank|ranked|student|record|person|row|highest|lowest)\b/i.test(q))) {
+    operation = "rank";
+    const targetNumericCol = numericFound.length > 0
+      ? numericFound[0].col.name
+      : (colInfo.find((c) => c.isNumeric && /total|score|mark|amount|revenue/i.test(c.name))?.name ||
+         colInfo.find((c) => c.isNumeric)?.name || null);
+    targetColumn = targetNumericCol;
+  }
+
+  if (!operation) {
+    if (matchedEntityFilter && requestedCol) {
+      operation = "lookup";
+      targetColumn = requestedCol.col.name;
+    } else if (filters.length > 0) {
+      operation = "filter";
+      const nameCol = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) || colInfo[0];
+      targetColumn = nameCol ? nameCol.name : null;
+    } else if (numericFound.length === 1) {
+      operation = "average";
+      targetColumn = numericFound[0].col.name;
+    }
+  }
+
+  if (!operation) return null;
+
+  return {
+    operation,
+    targetColumn,
+    rankIndex,
+    rankOrder,
+    filters,
+    isAmbiguous: false,
+    reason: `Deterministic structured parsing: ${operation} on ${targetColumn || "table"} with ${filters.length} filter(s)`
+  };
 }
 
 // ---------- semantic query understanding via local LLM ----------
@@ -270,6 +607,23 @@ export function validateSemanticPlan(plan, colInfo, rows) {
     return { valid: false, reason: `lookup requires a target column to retrieve` };
   }
 
+  if (normalizedOp === "filter" && !validatedTarget) {
+    validatedTarget = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) ||
+                      colInfo.find((c) => !c.isNumeric) ||
+                      colInfo[0];
+  }
+
+  if (normalizedOp === "rank") {
+    if (!validatedTarget) {
+      validatedTarget = colInfo.find((c) => c.isNumeric && /total|score|mark|amount|revenue/i.test(c.name)) ||
+                        colInfo.find((c) => c.isNumeric) ||
+                        colInfo[0];
+    }
+    if (!validatedTarget || !validatedTarget.isNumeric) {
+      return { valid: false, reason: "rank operation requires a numeric column in table schema" };
+    }
+  }
+
   // 3. Validate filters strictly against real columns and dataset values
   const validatedFilters = [];
   if (Array.isArray(plan.filters)) {
@@ -350,7 +704,7 @@ export function describeFilters(filters) {
 
 // ---------- main entry point ----------
 
-export async function processTabularQuery(question = "", targetDepartments = [], targetDocuments = []) {
+export async function processTabularQuery(question = "", targetDepartments = [], targetDocuments = [], fallbackQuestion = "") {
   const baseQuery = { fileType: { $in: ["csv", "xlsx", "xls"] }, status: "completed" };
   let docs = [];
   if (targetDepartments && targetDepartments.length > 0) {
@@ -383,8 +737,26 @@ export async function processTabularQuery(question = "", targetDepartments = [],
   const documentName = doc.originalName;
   const columns = colInfo.map((c) => c.name);
 
-  // 2. Semantic Query Understanding against real schema
-  const semanticPlan = await parseSemanticQueryPlan(question, documentName, colInfo);
+  // 2. Query Understanding: Attempt fast deterministic parsing first
+  let semanticPlan = parseDeterministicQueryPlan(question, colInfo);
+  let resolvedQuestion = question;
+
+  if (!semanticPlan && fallbackQuestion && fallbackQuestion !== question) {
+    semanticPlan = parseDeterministicQueryPlan(fallbackQuestion, colInfo);
+    if (semanticPlan) {
+      resolvedQuestion = fallbackQuestion;
+      console.log(`[Tabular Processor] Deterministic plan resolved using context: ${semanticPlan.operation} on ${semanticPlan.targetColumn || "table"}`);
+    }
+  } else if (semanticPlan) {
+    console.log(`[Tabular Processor] Deterministic plan resolved: ${semanticPlan.operation} on ${semanticPlan.targetColumn || "table"}`);
+  }
+
+  if (!semanticPlan) {
+    // Fall back to semantic LLM plan for complex questions
+    const qForLlm = fallbackQuestion || question;
+    semanticPlan = await parseSemanticQueryPlan(qForLlm, documentName, colInfo);
+    resolvedQuestion = qForLlm;
+  }
 
   // 3. Strict Programmatic Validation
   const validation = validateSemanticPlan(semanticPlan, colInfo, rows);
@@ -430,10 +802,32 @@ export async function processTabularQuery(question = "", targetDepartments = [],
   }
 
   // 4. Apply validated filters
+  const { operation, target } = validation;
   const filteredRows = applyFilters(rows, validation.filters);
   const filterText = describeFilters(validation.filters);
 
   if (filteredRows.length === 0) {
+    if (operation === "count") {
+      logTabularSemanticDebug("0", null, 0);
+      return {
+        ...base,
+        success: true,
+        computedValue: "0",
+        rowsUsed: 0,
+        summary: `Number of rows matching (${filterText}) = 0 out of ${rows.length} rows.`
+      };
+    }
+    if (operation === "filter") {
+      logTabularSemanticDebug("None", null, 0);
+      return {
+        ...base,
+        success: true,
+        computedValue: "None",
+        rowsUsed: 0,
+        records: [],
+        summary: `No records match the filters (${filterText}) out of ${rows.length} rows.`
+      };
+    }
     const reason = `no rows match the filters (${filterText})`;
     logTabularSemanticDebug(null, reason, 0);
     return {
@@ -446,7 +840,6 @@ export async function processTabularQuery(question = "", targetDepartments = [],
   }
 
   // 5. Deterministic JavaScript Execution
-  const { operation, target } = validation;
   const needsNumeric = ["average", "sum", "min", "max"].includes(operation);
 
   if (needsNumeric) {
@@ -557,7 +950,7 @@ export async function processTabularQuery(question = "", targetDepartments = [],
   if (operation === "lookup" && target && filteredRows.length <= 10) {
     const label = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric)?.name || columns[0];
     const vals = filteredRows.map((r) => `${r[label]}: ${target.name} = ${r[target.name]}`);
-    const lookupVal = filteredRows.length === 1 ? String(filteredRows[0][target.name]) : null;
+    const lookupVal = filteredRows.length === 1 ? String(filteredRows[0][target.name]) : (vals.length > 0 ? vals.join(", ") : null);
     logTabularSemanticDebug(lookupVal, null, filteredRows.length);
     return {
       ...base,
@@ -566,8 +959,62 @@ export async function processTabularQuery(question = "", targetDepartments = [],
       column: target.name,
       computedValue: lookupVal,
       rowsUsed: filteredRows.length,
-      summary: `Lookup (filters: ${filterText}): ${vals.join("; ")}.`
+      records: filteredRows,
+      summary: `The ${target.name} of ${filteredRows[0]?.[label] || "the matching record"} is ${lookupVal} (filters: ${filterText}). Full record: ${JSON.stringify(filteredRows[0])}.`
     };
+  }
+
+  if (operation === "filter") {
+    const label = (target && !target.isNumeric)
+      ? target.name
+      : (colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric)?.name || columns[0]);
+    const names = filteredRows.map((r) => String(r[label] ?? "")).filter(Boolean);
+    const computedValue = names.length > 0 ? names.join(", ") : "None";
+    const details = filteredRows.map((r) => {
+      const parts = validation.filters.map((f) => `${f.column}: ${r[f.column]}`).join(", ");
+      return parts ? `${r[label]} (${parts})` : String(r[label]);
+    }).join("; ");
+
+    logTabularSemanticDebug(computedValue, null, filteredRows.length);
+    return {
+      ...base,
+      success: true,
+      operation: "filter",
+      column: label,
+      computedValue,
+      rowsUsed: filteredRows.length,
+      records: filteredRows,
+      summary: `Matching records (${filterText}): ${details}. Total matching: ${filteredRows.length} out of ${rows.length} rows.`
+    };
+  }
+
+  if (operation === "rank" && target) {
+    const order = semanticPlan.rankOrder || "desc";
+    const rankIndex = semanticPlan.rankIndex || 1;
+    const nums = filteredRows
+      .map((r) => ({ row: r, n: parseNum(r[target.name]) }))
+      .filter((x) => x.n !== null);
+
+    nums.sort((a, b) => (order === "asc" ? a.n - b.n : b.n - a.n));
+
+    if (nums.length >= rankIndex) {
+      const selected = nums[rankIndex - 1];
+      const label = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric)?.name || columns[0];
+      const rankOrdinal = rankIndex === 2 ? "2nd" : rankIndex === 3 ? "3rd" : `${rankIndex}th`;
+      const computedValue = `${selected.row[label]} with ${selected.n} ${target.name}`;
+
+      logTabularSemanticDebug(computedValue, null, nums.length);
+      return {
+        ...base,
+        success: true,
+        operation: "rank",
+        column: target.name,
+        computedValue,
+        rowsUsed: nums.length,
+        records: [selected.row],
+        summary: `The ${rankOrdinal} highest by ${target.name} is ${selected.row[label]} with ${selected.n} ${target.name} (full record: ${JSON.stringify(selected.row)}).`
+      };
+    }
   }
 
   // Fallback for preview / unhandled operations

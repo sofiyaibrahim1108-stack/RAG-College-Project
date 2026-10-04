@@ -140,21 +140,18 @@ export function DepartmentsPage() {
       {/* Top Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h2 className="text-xl font-bold text-neutral-900 dark:text-white flex items-center gap-2">
-            <Building2 className="w-5 h-5 text-blue-500" />
-            <span>Department Management</span>
-            <span className="text-xs font-normal px-2.5 py-0.5 rounded-full bg-neutral-200 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400">
-              {departments.length}
-            </span>
-          </h2>
-          <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">
-            Organize knowledge domains. Documents and queries are dynamically routed across these departments.
+          <h1 className="text-2xl font-bold text-neutral-900 dark:text-white flex items-center gap-2">
+            <Building2 className="w-6 h-6 text-blue-600 dark:text-blue-400" />
+            <span>Departments</span>
+          </h1>
+          <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-1">
+            {departments.length} departments available for organizing knowledge documents.
           </p>
         </div>
 
         <button
           onClick={openCreateModal}
-          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold shadow-sm transition flex items-center space-x-1.5 self-start sm:self-auto"
+          className="px-4.5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold shadow-xs transition flex items-center space-x-2 self-start sm:self-auto cursor-pointer"
         >
           <Plus className="w-4 h-4" />
           <span>Create Department</span>
@@ -169,29 +166,29 @@ export function DepartmentsPage() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search departments..."
-          className="w-full pl-9 pr-3 py-2 text-xs rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+          className="w-full pl-9 pr-3 py-2 text-sm rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
         />
       </div>
 
       {/* Table or Empty State */}
       {loading ? (
-        <div className="py-16 text-center text-xs text-neutral-400 flex items-center justify-center space-x-2">
+        <div className="py-16 text-center text-sm text-neutral-400 flex items-center justify-center space-x-2">
           <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
-          <span>Loading departments from database...</span>
+          <span>Loading departments...</span>
         </div>
       ) : departments.length === 0 ? (
         /* Empty State */
         <div className="py-16 text-center border-2 border-dashed border-neutral-200 dark:border-neutral-800 rounded-2xl p-8 space-y-3">
           <FolderOpen className="w-10 h-10 text-neutral-400 mx-auto" />
-          <p className="text-sm font-semibold text-neutral-800 dark:text-neutral-200">
+          <p className="text-base font-semibold text-neutral-800 dark:text-neutral-200">
             No departments available
           </p>
-          <p className="text-xs text-neutral-400 max-w-sm mx-auto">
+          <p className="text-sm text-neutral-400 max-w-sm mx-auto">
             Create your first department to start organizing documents and routing knowledge searches.
           </p>
           <button
             onClick={openCreateModal}
-            className="mt-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-semibold"
+            className="mt-2 px-4.5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-semibold cursor-pointer"
           >
             + Create Department
           </button>
@@ -200,53 +197,48 @@ export function DepartmentsPage() {
         /* Department Table */
         <div className="border border-neutral-200 dark:border-neutral-800 rounded-2xl bg-white dark:bg-neutral-900 overflow-hidden shadow-xs">
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-neutral-50 dark:bg-neutral-950/60 border-b border-neutral-200 dark:border-neutral-800 text-neutral-500 dark:text-neutral-400 font-semibold uppercase tracking-wider text-[10px]">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-neutral-50 dark:bg-neutral-950/60 border-b border-neutral-200 dark:border-neutral-800 text-neutral-500 dark:text-neutral-400 font-semibold uppercase tracking-wider text-xs">
                 <tr>
-                  <th className="py-3 px-4">Department Name</th>
-                  <th className="py-3 px-4">Description</th>
-                  <th className="py-3 px-4 text-center">Documents</th>
-                  <th className="py-3 px-4 text-right">Actions</th>
+                  <th className="py-3.5 px-4">Department Name</th>
+                  <th className="py-3.5 px-4">Description</th>
+                  <th className="py-3.5 px-4 text-center">Documents</th>
+                  <th className="py-3.5 px-4 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-neutral-100 dark:divide-neutral-800/60 text-neutral-700 dark:text-neutral-300">
                 {filteredDepts.map((dept) => (
-                  <tr key={dept._id} className="hover:bg-neutral-50 dark:hover:bg-neutral-800/40 transition">
-                    <td className="py-3.5 px-4 font-semibold text-neutral-900 dark:text-neutral-100">
-                      <div className="flex items-center gap-2">
+                  <tr key={dept._id} className="hover:bg-neutral-50/70 dark:hover:bg-neutral-800/40 transition">
+                    <td className="py-4 px-4 font-semibold text-neutral-900 dark:text-neutral-100">
+                      <div className="flex items-center gap-2.5">
                         <Building2 className="w-4 h-4 text-blue-500 flex-shrink-0" />
                         <span>{dept.name}</span>
-                        {dept.isTestData && (
-                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 font-mono">
-                            test
-                          </span>
-                        )}
                       </div>
                     </td>
-                    <td className="py-3.5 px-4 text-neutral-500 dark:text-neutral-400 max-w-xs truncate">
+                    <td className="py-4 px-4 text-neutral-500 dark:text-neutral-400 max-w-xs truncate text-xs">
                       {dept.description || "—"}
                     </td>
-                    <td className="py-3.5 px-4 text-center font-mono">
-                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300">
-                        <FileText className="w-3 h-3 mr-1 text-blue-500" />
+                    <td className="py-4 px-4 text-center font-mono">
+                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-700 dark:text-neutral-300">
+                        <FileText className="w-3.5 h-3.5 mr-1 text-blue-500" />
                         {dept.documentCount || 0}
                       </span>
                     </td>
-                    <td className="py-3.5 px-4 text-right">
+                    <td className="py-4 px-4 text-right">
                       <div className="flex items-center justify-end space-x-1.5">
                         <button
                           onClick={() => openEditModal(dept)}
-                          className="p-1.5 text-neutral-500 hover:text-blue-600 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition"
+                          className="p-1.5 text-neutral-500 hover:text-blue-600 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg transition cursor-pointer"
                           title="Edit department"
                         >
-                          <Edit2 className="w-3.5 h-3.5" />
+                          <Edit2 className="w-4 h-4" />
                         </button>
                         <button
                           onClick={() => startDeleteCheck(dept)}
-                          className="p-1.5 text-neutral-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 rounded-lg transition"
+                          className="p-1.5 text-neutral-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 rounded-lg transition cursor-pointer"
                           title="Delete department"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
+                          <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
                     </td>
@@ -268,15 +260,15 @@ export function DepartmentsPage() {
             className="relative max-w-md w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl overflow-hidden shadow-2xl p-6"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-base font-semibold text-neutral-900 dark:text-neutral-100 flex items-center gap-2">
-                <Building2 className="w-5 h-5 text-blue-500" />
+            <div className="flex items-center justify-between mb-5 pb-3 border-b border-neutral-100 dark:border-neutral-800">
+              <h3 className="text-lg font-bold text-neutral-900 dark:text-neutral-100 flex items-center gap-2.5">
+                <Building2 className="w-5 h-5 text-blue-600 dark:text-blue-400" />
                 <span>{editingDept ? "Edit Department" : "Create Department"}</span>
               </h3>
               <button
                 onClick={() => !isSubmitting && setIsModalOpen(false)}
                 disabled={isSubmitting}
-                className="p-1.5 text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200 rounded-lg"
+                className="p-1.5 text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200 rounded-lg cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -284,37 +276,37 @@ export function DepartmentsPage() {
 
             <form onSubmit={handleSaveDepartment} className="space-y-4">
               <div>
-                <label className="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">
+                <label className="block text-sm font-medium text-neutral-800 dark:text-neutral-200 mb-1.5">
                   Department Name *
                 </label>
                 <input
                   type="text"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  placeholder="e.g. Artificial Intelligence, Human Resources, Finance"
+                  placeholder="e.g. Ophthalmology, Academic Affairs, Computer Science"
                   autoFocus
                   required
                   disabled={isSubmitting}
-                  className="w-full text-xs p-2.5 rounded-xl border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  className="w-full text-sm p-2.5 rounded-xl border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-medium text-neutral-700 dark:text-neutral-300 mb-1">
+                <label className="block text-sm font-medium text-neutral-800 dark:text-neutral-200 mb-1.5">
                   Description
                 </label>
                 <textarea
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
-                  placeholder="Scope or domain topics covered in this department..."
+                  placeholder="Brief description of documents and topics under this department..."
                   rows={3}
                   disabled={isSubmitting}
-                  className="w-full text-xs p-2.5 rounded-xl border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  className="w-full text-sm p-2.5 rounded-xl border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
               </div>
 
               {modalError && (
-                <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-xl text-xs text-red-600 dark:text-red-400">
+                <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-xl text-sm text-red-600 dark:text-red-400">
                   {modalError}
                 </div>
               )}
@@ -324,16 +316,16 @@ export function DepartmentsPage() {
                   type="button"
                   onClick={() => setIsModalOpen(false)}
                   disabled={isSubmitting}
-                  className="px-4 py-2 text-xs font-medium text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-xl transition"
+                  className="px-4 py-2 text-sm font-medium text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-xl transition cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   disabled={!name.trim() || isSubmitting}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-xs font-semibold shadow-sm transition flex items-center space-x-1.5"
+                  className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl text-sm font-semibold shadow-xs transition flex items-center space-x-2 cursor-pointer"
                 >
-                  {isSubmitting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  {isSubmitting && <Loader2 className="w-4 h-4 animate-spin" />}
                   <span>{editingDept ? "Save Changes" : "Create Department"}</span>
                 </button>
               </div>

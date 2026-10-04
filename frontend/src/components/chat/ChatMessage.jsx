@@ -2,7 +2,6 @@ import React, { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
-  User,
   Copy,
   Check,
   RotateCw,
@@ -11,7 +10,6 @@ import {
   Edit2,
   Clock,
   Layers,
-  Sparkles,
   BookOpen,
   Image as ImageIcon,
   AlertCircle
@@ -60,19 +58,26 @@ export function ChatMessage({ message, index }) {
      ========================================================== */
   if (isUser) {
     return (
-      <div className="group w-full py-2.5 px-4 md:px-6">
-        <div className="max-w-4xl mx-auto flex flex-col items-end">
-          {/* "You" Label & Edit Action */}
-          <div className="flex items-center space-x-2 mb-1 pr-1 text-xs text-neutral-400 dark:text-neutral-500 select-none">
+      <div className="group w-full py-2.5 px-3 sm:px-4 md:px-6">
+        <div className="max-w-4xl mx-auto flex items-center justify-end space-x-2">
+          {/* Queued status badge */}
+          {message.isQueued && (
+            <span className="inline-flex items-center space-x-1 px-2.5 py-1 rounded-full text-xs font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-400 border border-neutral-200 dark:border-neutral-700 select-none animate-pulse">
+              <Clock className="w-3 h-3 text-blue-500" />
+              <span>Queued</span>
+            </span>
+          )}
+
+          {/* Edit Trigger */}
+          {!isEditing && !message.isQueued && (
             <button
               onClick={() => setIsEditing(true)}
-              className="opacity-0 group-hover:opacity-100 hover:text-neutral-700 dark:hover:text-neutral-200 transition p-0.5 rounded cursor-pointer"
+              className="opacity-0 group-hover:opacity-100 hover:text-neutral-700 dark:hover:text-neutral-200 text-neutral-400 transition p-1.5 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 cursor-pointer"
               title="Edit question"
             >
-              <Edit2 className="w-3 h-3" />
+              <Edit2 className="w-3.5 h-3.5" />
             </button>
-            <span className="font-semibold">You</span>
-          </div>
+          )}
 
           {/* User Bubble or Edit Textarea */}
           {isEditing ? (
@@ -86,7 +91,7 @@ export function ChatMessage({ message, index }) {
               <div className="flex items-center justify-end space-x-2">
                 <button
                   onClick={() => setIsEditing(false)}
-                  className="px-3 py-1.5 text-xs font-medium text-neutral-600 dark:text-neutral-400 hover:bg-neutral-200 dark:hover:bg-neutral-800 rounded-lg transition"
+                  className="px-3 py-1.5 text-xs font-medium text-neutral-600 dark:text-neutral-400 hover:bg-neutral-200 dark:hover:bg-neutral-800 rounded-lg transition cursor-pointer"
                 >
                   Cancel
                 </button>
@@ -100,7 +105,7 @@ export function ChatMessage({ message, index }) {
               </div>
             </div>
           ) : (
-            <div className="bg-blue-600 dark:bg-blue-600 text-white rounded-2xl rounded-tr-xs px-4 py-3 shadow-xs max-w-2xl text-sm leading-relaxed whitespace-pre-wrap break-words">
+            <div className="bg-blue-600 text-white rounded-2xl rounded-tr-sm px-4.5 py-3 shadow-xs max-w-2xl text-[15px] leading-relaxed whitespace-pre-wrap break-words">
               {message.content}
             </div>
           )}
@@ -110,36 +115,30 @@ export function ChatMessage({ message, index }) {
   }
 
   /* ==========================================================
-     AI ASSISTANT MESSAGE (Left-Aligned Container)
+     AI ASSISTANT MESSAGE (Left-Aligned Clean Container)
      ========================================================== */
   return (
-    <div className="group w-full py-3 px-4 md:px-6">
+    <div className="group w-full py-2.5 px-3 sm:px-4 md:px-6">
       <div className="max-w-4xl mx-auto flex flex-col items-start space-y-2">
-        {/* Assistant Header: Avatar + "Knowledge Assistant" + Department badges */}
-        <div className="flex items-center space-x-2 select-none pl-1">
-          <div className="w-6 h-6 rounded-full bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white shadow-xs ring-2 ring-blue-500/20">
-            <Sparkles className="w-3.5 h-3.5" />
+        {/* Subtle routed department badge if present */}
+        {message.routedDepartments &&
+          message.routedDepartments.length > 0 &&
+          message.content !== "I couldn't find this information in the uploaded documents." && (
+          <div className="flex items-center space-x-1 pl-1 select-none">
+            {message.routedDepartments.map((dept) => (
+              <span
+                key={dept}
+                className="inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-medium bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 border border-neutral-200/70 dark:border-neutral-800"
+              >
+                <Layers className="w-3 h-3 mr-1 text-blue-500" />
+                {dept}
+              </span>
+            ))}
           </div>
-          <span className="text-xs font-semibold text-neutral-900 dark:text-neutral-100">
-            Knowledge Assistant
-          </span>
-          {message.routedDepartments && message.routedDepartments.length > 0 && (
-            <div className="flex items-center space-x-1 ml-1.5">
-              {message.routedDepartments.map((dept) => (
-                <span
-                  key={dept}
-                  className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-50 text-blue-700 dark:bg-blue-950/70 dark:text-blue-300 border border-blue-200 dark:border-blue-900"
-                >
-                  <Layers className="w-2.5 h-2.5 mr-1" />
-                  {dept}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
+        )}
 
         {/* Separate Answer Container */}
-        <div className="w-full bg-white dark:bg-neutral-900 border border-neutral-200/90 dark:border-neutral-800 rounded-2xl rounded-tl-xs p-4 sm:p-5 shadow-xs transition-all">
+        <div className="w-full bg-white dark:bg-neutral-900 border border-neutral-200/90 dark:border-neutral-800 rounded-2xl p-5 shadow-xs transition-all">
           {/* Loading / Searching State inside the message container */}
           {isAssistantLoading && (
             <div className="flex items-center space-x-2.5 py-1 text-neutral-500 dark:text-neutral-400 select-none">
@@ -164,7 +163,7 @@ export function ChatMessage({ message, index }) {
 
           {/* Markdown Content Area */}
           {message.content && !message.isError && (
-            <div className="text-neutral-800 dark:text-neutral-200 text-sm markdown-body leading-relaxed">
+            <div className="text-neutral-800 dark:text-neutral-200 text-[15px] markdown-body leading-relaxed">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}
                 components={{
@@ -251,7 +250,7 @@ export function ChatMessage({ message, index }) {
             <div className="mt-5 pt-3.5 border-t border-neutral-100 dark:border-neutral-800 animate-in fade-in duration-200">
               <div className="flex items-center space-x-1.5 text-xs font-semibold text-neutral-600 dark:text-neutral-400 mb-2.5">
                 <BookOpen className="w-3.5 h-3.5 text-blue-500" />
-                <span>Cited Sources</span>
+                <span>Sources</span>
               </div>
               <div className="flex flex-wrap gap-2">
                 {message.sources.map((src, i) => (
@@ -266,7 +265,7 @@ export function ChatMessage({ message, index }) {
             <div className="mt-4 pt-3.5 border-t border-neutral-100 dark:border-neutral-800 animate-in fade-in duration-200">
               <div className="flex items-center space-x-1.5 text-xs font-semibold text-neutral-600 dark:text-neutral-400 mb-2">
                 <ImageIcon className="w-3.5 h-3.5 text-purple-500" />
-                <span>Relevant Document Diagrams</span>
+                <span>Images & Diagrams</span>
               </div>
               <div className="flex flex-wrap gap-3">
                 {message.images.map((img, i) => (
@@ -324,13 +323,11 @@ export function ChatMessage({ message, index }) {
                 </button>
               </div>
 
-              {/* Timings info pill */}
+              {/* Response duration pill */}
               {message.timings?.total && (
                 <span
-                  className="flex items-center space-x-1 text-[10px] text-neutral-400 font-mono"
-                  title={`Router: ${message.timings.router || 0}ms | TextRet: ${
-                    message.timings.textRetrieval || 0
-                  }ms | SigLIP: ${message.timings.siglipEmbedding || 0}ms | LLM: ${message.timings.llm || 0}ms`}
+                  className="flex items-center space-x-1 text-xs text-neutral-400 font-medium"
+                  title="Response time"
                 >
                   <Clock className="w-3 h-3" />
                   <span>{(message.timings.total / 1000).toFixed(1)}s</span>

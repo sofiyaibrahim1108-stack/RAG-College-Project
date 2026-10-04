@@ -55,10 +55,10 @@ export const siglipClient = {
    */
   async embedText(text) {
     try {
-      const res = await requestWithFallback("post", "/embed/text", { text: text || "" });
+      const res = await requestWithFallback("post", "/embed/text", { text: text || "" }, { timeout: 2500 });
       return res.data.embedding;
     } catch (err) {
-      console.error(`[SigLIP Client] embedText error: ${err.message}`);
+      console.warn(`[SigLIP Client] embedText unreachable or failed: ${err.message}`);
       throw new Error(`SigLIP text embedding failed: ${err.message}`);
     }
   },

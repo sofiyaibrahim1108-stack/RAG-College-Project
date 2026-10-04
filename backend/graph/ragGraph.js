@@ -7,10 +7,12 @@ import { processTabularQuery } from "../services/tabularProcessor.js";
 import { generateTextEmbedding } from "../services/embeddingService.js";
 import { retrieveWithScopeFallback } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
-import { retrieveRelevantImages } from "../services/imageRetrieval.js";
+import { retrieveRelevantImages, resolveMultimodalAttachments } from "../services/imageRetrieval.js";
 import { buildRAGContext } from "../services/contextBuilder.js";
 import { generateAnswerDetailed, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate, filterSupportingSources } from "../services/llm.js";
 import { formatSources, formatImageCitations } from "../utils/citations.js";
+import { RAG_CONFIG } from "../config/rag.js";
+import { normalizeUserQuery } from "../services/queryNormalizer.js";
 
 /**
  * 1. Node: loadConversationHistory
@@ -28,7 +30,8 @@ async function loadConversationHistoryNode(state) {
 
       history = recentMsgs.reverse().map((m) => ({
         role: m.role,
-        content: m.content
+        content: m.content,
+        routedDepartments: m.routedDepartments || []
       }));
     } catch (err) {
       console.warn(`[Node: loadHistory] Warning: ${err.message}`);
@@ -37,7 +40,35 @@ async function loadConversationHistoryNode(state) {
 
   return {
     conversationHistory: history,
+    originalQuestion: state.originalQuestion || state.question,
     timings: { history: Date.now() - t0 }
+  };
+}
+
+/**
+ * 1.5. Node: normalizeQuery
+ * Rewrites user message into a standalone question (turns commands like "show me X" into "what does X show",
+ * and resolves follow-up pronouns using previous turns).
+ * Keeps originalQuestion for display and logging.
+ */
+async function normalizeQueryNode(state) {
+  const original = state.originalQuestion || state.question;
+  const history = state.conversationHistory || [];
+  const hasPreviousUserTurns = Array.isArray(history) && history.some((m) => m.role === "user");
+
+  // Requirement 2a: Run the rewrite only when the conversation already has previous user turns (for pronouns/follow-ups).
+  // For first-turn questions, skip it.
+  if (!hasPreviousUserTurns) {
+    return {
+      question: original,
+      originalQuestion: original
+    };
+  }
+
+  const normalized = await normalizeUserQuery(original, history);
+  return {
+    question: normalized,
+    originalQuestion: original
   };
 }
 
@@ -82,7 +113,12 @@ async function tabularNode(state) {
 
   const t0 = Date.now();
   try {
-    const result = await processTabularQuery(state.question, state.routedDepartments);
+    // Requirement 1a: Pass the ORIGINAL user question (not the rewritten one) to the tabular route.
+    // Requirement 3: If deterministic parser cannot resolve the original question (e.g. follow-up with pronouns),
+    // fallbackQuestion allows resolving from the rewritten standalone query without LLM planning.
+    const originalQ = state.originalQuestion || state.question;
+    const fallbackQ = state.question !== originalQ ? state.question : "";
+    const result = await processTabularQuery(originalQ, state.routedDepartments, [], fallbackQ);
     const duration = Date.now() - t0;
     console.log(`[Timing] Tabular Tool: ${duration} ms`);
 
@@ -98,6 +134,7 @@ async function tabularNode(state) {
     return {
       queryType: "document_qa",
       routedDepartments: [],
+      routerConfidence: 0.5,
       tabularResult: null,
       timings: { tabular: duration }
     };
@@ -106,10 +143,28 @@ async function tabularNode(state) {
     return {
       queryType: "document_qa",
       routedDepartments: [],
+      routerConfidence: 0.5,
       tabularResult: null,
       timings: { tabular: Date.now() - t0 }
     };
   }
+}
+
+/**
+ * Resolves pronoun and reference follow-up questions dynamically from conversation context.
+ */
+function resolveFollowUpQuery(question, history = []) {
+  if (!history || history.length === 0) return question;
+  const hasPronoun = /\b(it|its|they|them|this|that|these|those)\b/i.test(question);
+  const isShortFollowUp = /\b(what about|how does it|what are its|explain further|tell me more|what is the result|what is the accuracy|what are the advantages|how does that|tell me about it)\b/i.test(question);
+  if (!hasPronoun && !isShortFollowUp) return question;
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === "user" && history[i].content && history[i].content !== question) {
+      return `${history[i].content.trim()} ${question}`;
+    }
+  }
+  return question;
 }
 
 /**
@@ -122,7 +177,8 @@ async function textEmbeddingNode(state) {
 
   const t0 = Date.now();
   try {
-    const embedding = await generateTextEmbedding(state.question);
+    const effectiveQuery = resolveFollowUpQuery(state.question, state.conversationHistory);
+    const embedding = await generateTextEmbedding(effectiveQuery);
     const duration = Date.now() - t0;
     console.log(`[Timing] Text Embedding: ${duration} ms`);
 
@@ -156,11 +212,12 @@ async function textRetrievalNode(state) {
 
   const t0 = Date.now();
   try {
+    const effectiveQuery = resolveFollowUpQuery(state.question, state.conversationHistory);
     const { chunks, widened } = await retrieveWithScopeFallback(
       state.queryEmbedding,
       state.routedDepartments,
       5,
-      state.question
+      effectiveQuery
     );
     const duration = Date.now() - t0;
     console.log(`[Retrieval] ${duration}ms${widened ? " (widened beyond routed scope)" : ""}`);
@@ -170,36 +227,38 @@ async function textRetrievalNode(state) {
       sources: formatSources(chunks),
       timings: { textRetrieval: duration, retrieval: duration }
     };
-    if (widened) {
-      update.routedDepartments = [...new Set(chunks.map((c) => c.department).filter(Boolean))];
+
+    // Derive department from top-k vector/cosine retrieval hits (majority / score-weighted)
+    if (widened || !state.routedDepartments || state.routedDepartments.length === 0) {
+      const deptWeights = new Map();
+      for (const c of chunks) {
+        if (c.department) {
+          const score = c.rankingScore || c.similarity || 1;
+          deptWeights.set(c.department, (deptWeights.get(c.department) || 0) + score);
+        }
+      }
+      const sortedDepts = [...deptWeights.entries()].sort((a, b) => b[1] - a[1]);
+      if (sortedDepts.length > 0) {
+        update.routedDepartments = [sortedDepts[0][0]];
+      }
     }
+
     return update;
   } catch (err) {
     console.error(`[Node: textRetrieval] Error: ${err.message}`);
     return {
       retrievedChunks: [],
       sources: [],
-      timings: { textRetrieval: Date.now() - t0 }
+      timings: { textRetrieval: Date.now() - t0, retrieval: Date.now() - t0 }
     };
   }
-}
-
-/**
- * Determines whether a query has visual/diagram intent to run SigLIP
- */
-export function isVisualQuery(question) {
-  if (!question) return false;
-  const visualRegex =
-    /\b(diagram|diagrams|figure|figures|image|images|screenshot|screenshots|picture|pictures|flowchart|flowcharts|chart|charts|photo|visual|confusion matrix|page\s*\d+\s*(?:show|contain|display))\b/i;
-  return visualRegex.test(question);
 }
 
 /**
  * 6. Node: imageEmbedding
  */
 async function imageEmbeddingNode(state) {
-  const shouldEmbed = state.queryType === "visual_qa" || isVisualQuery(state.question);
-  if (!shouldEmbed || state.queryType === "out_of_scope") {
+  if (state.queryType !== "visual_qa") {
     return {
       siglipQueryEmbedding: [],
       timings: { siglipEmbedding: 0 }
@@ -210,14 +269,11 @@ async function imageEmbeddingNode(state) {
   try {
     const siglipEmb = await siglipClient.embedText(state.question);
     const duration = Date.now() - t0;
-    console.log(`[Timing] SigLIP Embedding: ${duration}ms`);
-
     return {
       siglipQueryEmbedding: siglipEmb,
       timings: { siglipEmbedding: duration }
     };
   } catch (err) {
-    console.warn(`[Node: imageEmbedding] Notice: ${err.message}`);
     return {
       siglipQueryEmbedding: [],
       timings: { siglipEmbedding: Date.now() - t0 }
@@ -229,8 +285,7 @@ async function imageEmbeddingNode(state) {
  * 7. Node: imageRetrieval
  */
 async function imageRetrievalNode(state) {
-  const shouldRetrieve = state.queryType === "visual_qa" || isVisualQuery(state.question);
-  if (!shouldRetrieve || state.queryType === "out_of_scope") {
+  if (state.queryType !== "visual_qa" || !state.siglipQueryEmbedding || state.siglipQueryEmbedding.length === 0) {
     return {
       retrievedImages: [],
       imageCitations: [],
@@ -248,7 +303,6 @@ async function imageRetrievalNode(state) {
       state.question
     );
     const duration = Date.now() - t0;
-    console.log(`[ImageRetrieval] ${duration}ms`);
 
     return {
       retrievedImages: images,
@@ -256,7 +310,6 @@ async function imageRetrievalNode(state) {
       timings: { imageRetrieval: duration }
     };
   } catch (err) {
-    console.warn(`[Node: imageRetrieval] Notice: ${err.message}`);
     return {
       retrievedImages: [],
       imageCitations: [],
@@ -297,6 +350,7 @@ async function generateAnswerNode(state) {
       fallbackReason: "out_of_scope",
       sources: [],
       imageCitations: [],
+      routedDepartments: [],
       timings: { evidenceGate: gateDuration, generation: 0, llm: 0 }
     };
   }
@@ -316,63 +370,86 @@ async function generateAnswerNode(state) {
       fallbackReason: gate.reason,
       sources: [],
       imageCitations: [],
+      routedDepartments: [],
       timings: { evidenceGate: gateDuration, generation: 0, llm: 0 }
     };
   }
 
   try {
     const tGen = Date.now();
-    const { answer, reason } = await generateAnswerDetailed(
+    let { answer, reason } = await generateAnswerDetailed(
       state.question,
       state.contextPrompt,
       state.conversationHistory,
       state.queryType,
       evidenceMeta
     );
-    const genDuration = Date.now() - tGen;
+    let genDuration = Date.now() - tGen;
     console.log(`[Generation] ${genDuration}ms${reason ? ` (withheld: ${reason})` : ""}`);
 
-    const isMissing = isFallbackAnswer(answer);
+    let isMissing = isFallbackAnswer(answer);
+
+    // Requirement 2b: For first-turn questions, if the generated answer is the fallback while
+    // the evidence gate passed and relevant evidence exists, retry the generation ONCE with a rewritten standalone question.
+    const hasPreviousUserTurns = Array.isArray(state.conversationHistory) && state.conversationHistory.some((m) => m.role === "user");
+    if (isMissing && !hasPreviousUserTurns && gate.supported && (state.retrievedChunks || []).length > 0) {
+      console.log(`[Generation Retry] Fallback on first-turn question "${state.question}". Retrying once with rewritten standalone question...`);
+      const rewrittenQ = await normalizeUserQuery(state.originalQuestion || state.question, state.conversationHistory, true);
+      if (rewrittenQ && rewrittenQ !== state.question) {
+        const retryResult = await generateAnswerDetailed(
+          rewrittenQ,
+          state.contextPrompt,
+          state.conversationHistory,
+          state.queryType,
+          evidenceMeta
+        );
+        if (!isFallbackAnswer(retryResult.answer)) {
+          console.log(`[Generation Retry] Succeeded with rewritten question: "${rewrittenQ}"`);
+          answer = retryResult.answer;
+          reason = retryResult.reason;
+          isMissing = false;
+        }
+      }
+    }
+
     const finalAnswer = isMissing ? FALLBACK_MESSAGE : answer;
     const fallbackReason = isMissing ? (reason || "insufficient_evidence") : null;
 
     let finalSources = isMissing ? [] : filterSupportingSources(state.sources, finalAnswer, state.retrievedChunks, state.question);
-    let finalImageCitations = isMissing ? [] : state.imageCitations;
-    let routedDepts = state.routedDepartments;
+    let finalImageCitations = [];
+    let effectiveDepartments = [];
 
-    // Tool-computed answers cite the dataset the tool actually used
-    const tool = state.tabularResult;
-    if (!isMissing && tool && tool.success && tool.operation !== "preview") {
-      const fromDataset = (state.sources || []).filter((s) => s.documentName === tool.documentName);
-      finalSources = fromDataset.length > 0
-        ? fromDataset.slice(0, 1)
-        : [{ documentName: tool.documentName, pageNumber: 1, chunkIndex: 0, snippet: tool.summary?.slice(0, 200) }];
-      finalImageCitations = [];
-    }
+    if (!isMissing) {
+      // Tool-computed answers cite the dataset the tool actually used
+      const tool = state.tabularResult;
+      if (tool && tool.success && tool.operation !== "preview") {
+        const fromDataset = (state.sources || []).filter((s) => s.documentName === tool.documentName);
+        finalSources = fromDataset.length > 0
+          ? fromDataset.slice(0, 1)
+          : [{ documentName: tool.documentName, pageNumber: 1, chunkIndex: 0, snippet: tool.summary?.slice(0, 200) }];
+        finalImageCitations = [];
 
-    if (!isMissing && state.queryType === "visual_qa" && state.retrievedImages?.length > 0) {
-      // In visual QA, citations must only refer to the requested visual source/page
-      const visualDocNames = new Set(state.retrievedImages.map((img) => img.documentName));
-      const visualPages = new Set(state.retrievedImages.map((img) => img.pageNumber));
+        const matchingChunk = (state.retrievedChunks || []).find((c) => c.documentName === tool.documentName);
+        const dept = matchingChunk?.department || (state.routedDepartments && state.routedDepartments[0]);
+        effectiveDepartments = dept ? [dept] : (state.routedDepartments || []);
+      } else {
+        // Document QA with shared Multimodal image attachment
+        finalImageCitations = await resolveMultimodalAttachments({
+          survivingSources: finalSources,
+          retrievedChunks: state.retrievedChunks,
+          maxImages: RAG_CONFIG.topKImages,
+          isFallback: isMissing,
+          question: state.originalQuestion || state.question
+        });
 
-      const matchingTextSources = (state.sources || []).filter(
-        (s) => visualDocNames.has(s.documentName) && visualPages.has(s.pageNumber)
-      );
+        const sourceDepts = [...new Set((finalSources || []).map((s) => s.department).filter(Boolean))];
+        const chunkDepts = [...new Set((state.retrievedChunks || []).map((c) => c.department).filter(Boolean))];
 
-      finalSources = matchingTextSources.length > 0
-        ? matchingTextSources
-        : state.retrievedImages.map((img) => ({
-            documentId: img.documentId,
-            documentName: img.documentName,
-            pageNumber: img.pageNumber || 1,
-            chunkIndex: 0,
-            snippet: img.caption ? `[Image] ${img.caption}` : `[Screenshot] Page ${img.pageNumber}`,
-            similarity: img.similarity
-          }));
-
-      const visualDepts = [...new Set(state.retrievedImages.map((img) => img.department).filter(Boolean))];
-      if (visualDepts.length > 0) {
-        routedDepts = visualDepts;
+        if (state.routedDepartments && state.routedDepartments.length > 0) {
+          effectiveDepartments = state.routedDepartments;
+        } else {
+          effectiveDepartments = sourceDepts.length > 0 ? sourceDepts : chunkDepts;
+        }
       }
     }
 
@@ -381,7 +458,7 @@ async function generateAnswerNode(state) {
       fallbackReason,
       sources: finalSources,
       imageCitations: finalImageCitations,
-      routedDepartments: routedDepts,
+      routedDepartments: effectiveDepartments,
       timings: { evidenceGate: gateDuration, generation: genDuration, llm: genDuration }
     };
   } catch (err) {
@@ -391,6 +468,7 @@ async function generateAnswerNode(state) {
       fallbackReason: "insufficient_evidence",
       sources: [],
       imageCitations: [],
+      routedDepartments: [],
       timings: { evidenceGate: gateDuration, generation: Date.now() - t0, llm: Date.now() - t0 }
     };
   }
@@ -405,7 +483,7 @@ async function saveConversationNode(state) {
 
   try {
     if (!convId) {
-      const titleSnippet = state.question.slice(0, 40);
+      const titleSnippet = (state.originalQuestion || state.question).slice(0, 40);
       const newConv = await Conversation.create({
         title: titleSnippet || "New Conversation"
       });
@@ -415,7 +493,7 @@ async function saveConversationNode(state) {
     await Message.create({
       conversationId: convId,
       role: "user",
-      content: state.question
+      content: state.originalQuestion || state.question
     });
 
     await Message.create({
@@ -450,6 +528,7 @@ async function saveConversationNode(state) {
 export function createRAGGraph() {
   const workflow = new StateGraph(RAGStateAnnotation)
     .addNode("loadConversationHistory", loadConversationHistoryNode)
+    .addNode("normalizeQuery", normalizeQueryNode)
     .addNode("router", routerNode)
     .addNode("tabular", tabularNode)
     .addNode("textEmbedding", textEmbeddingNode)
@@ -460,9 +539,15 @@ export function createRAGGraph() {
     .addNode("generateAnswer", generateAnswerNode)
     .addNode("saveConversation", saveConversationNode)
     .addEdge(START, "loadConversationHistory")
-    .addEdge("loadConversationHistory", "router")
+    .addEdge("loadConversationHistory", "normalizeQuery")
+    .addEdge("normalizeQuery", "router")
     .addEdge("router", "tabular")
-    .addEdge("tabular", "textEmbedding")
+    .addConditionalEdges("tabular", (state) => {
+      if (state.tabularResult && state.tabularResult.success && state.tabularResult.computedValue !== null) {
+        return "contextBuilder";
+      }
+      return "textEmbedding";
+    })
     .addEdge("textEmbedding", "textRetrieval")
     .addEdge("textRetrieval", "imageEmbedding")
     .addEdge("imageEmbedding", "imageRetrieval")

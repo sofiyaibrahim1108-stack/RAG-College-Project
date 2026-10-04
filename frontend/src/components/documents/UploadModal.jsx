@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { X, UploadCloud, FileText, CheckCircle2, AlertCircle, Loader2, Plus, Building2 } from "lucide-react";
+import { X, UploadCloud, FileText, CheckCircle2, AlertCircle, Loader2, Plus } from "lucide-react";
 import { useChat } from "../../context/ChatContext";
 import { documentApi } from "../../services/documentApi";
 import { departmentApi } from "../../services/departmentApi";
@@ -29,9 +29,7 @@ export function UploadModal() {
       const res = await departmentApi.getDepartments();
       const depts = res.departments || [];
       setDepartments(depts);
-      if (depts.length > 0 && !selectedDeptId) {
-        setSelectedDeptId(depts[0]._id);
-      }
+      // Do NOT silently select a department by default
     } catch (e) {
       console.error("Failed to load departments", e);
     } finally {
@@ -50,19 +48,19 @@ export function UploadModal() {
   }
 
   async function handleUpload() {
-    if (!selectedFile) {
-      setErrorMessage("Please select a file to upload");
+    if (!selectedDeptId) {
+      setErrorMessage("Please select a department before uploading.");
       return;
     }
 
-    if (!selectedDeptId) {
-      setErrorMessage("Please select a department before uploading");
+    if (!selectedFile) {
+      setErrorMessage("Please select a file to upload.");
       return;
     }
 
     const deptObj = departments.find((d) => d._id === selectedDeptId);
     if (!deptObj) {
-      setErrorMessage("Selected department is invalid");
+      setErrorMessage("Please select a department before uploading.");
       return;
     }
 
@@ -93,29 +91,33 @@ export function UploadModal() {
         setShowUploadModal(false);
       }, 1500);
     } catch (err) {
+      console.error("[Upload Error]:", err);
       setIsUploading(false);
-      setErrorMessage(err.response?.data?.error || err.message || "Failed to upload document");
+      setErrorMessage("Something went wrong while uploading the document. Please try again.");
     }
   }
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-in fade-in"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 animate-in fade-in"
       onClick={() => !isUploading && setShowUploadModal(false)}
     >
       <div
         className="relative max-w-md w-full bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl overflow-hidden shadow-2xl p-6"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-base font-semibold text-neutral-900 dark:text-neutral-100 flex items-center gap-2">
-            <UploadCloud className="w-5 h-5 text-blue-500" />
-            <span>Upload Document</span>
-          </h3>
+        {/* Header */}
+        <div className="flex items-center justify-between mb-5 pb-3 border-b border-neutral-100 dark:border-neutral-800">
+          <div className="flex items-center gap-2.5">
+            <UploadCloud className="w-5 h-5 text-blue-600 dark:text-blue-400 shrink-0" />
+            <h3 className="text-lg font-bold text-neutral-900 dark:text-neutral-100">
+              Upload Document
+            </h3>
+          </div>
           <button
             onClick={() => !isUploading && setShowUploadModal(false)}
             disabled={isUploading}
-            className="p-1.5 text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200 rounded-lg"
+            className="p-1.5 text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200 rounded-lg cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -124,8 +126,8 @@ export function UploadModal() {
         {/* Dynamic Department Selector */}
         <div className="mb-4">
           <div className="flex items-center justify-between mb-1.5">
-            <label className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
-              Department *
+            <label className="text-sm font-medium text-neutral-800 dark:text-neutral-200">
+              Select Department *
             </label>
             <button
               type="button"
@@ -133,48 +135,38 @@ export function UploadModal() {
                 setShowUploadModal(false);
                 setActiveView("departments");
               }}
-              className="text-[10px] text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-0.5"
+              className="text-xs text-blue-600 dark:text-blue-400 hover:underline flex items-center gap-1 font-medium cursor-pointer"
             >
-              <Plus className="w-3 h-3" />
+              <Plus className="w-3.5 h-3.5" />
               <span>Create Department</span>
             </button>
           </div>
 
           {loadingDepts ? (
-            <div className="p-2.5 rounded-xl border border-neutral-200 dark:border-neutral-800 text-xs text-neutral-400 flex items-center gap-2">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            <div className="p-2.5 rounded-xl border border-neutral-200 dark:border-neutral-800 text-sm text-neutral-400 flex items-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
               <span>Loading departments...</span>
             </div>
           ) : departments.length === 0 ? (
-            <div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 rounded-xl text-xs space-y-1.5">
-              <p className="text-amber-800 dark:text-amber-300 font-medium">
+            <div className="p-3.5 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 rounded-xl text-sm space-y-1.5">
+              <p className="text-amber-800 dark:text-amber-300 font-semibold">
                 No departments available.
               </p>
-              <p className="text-amber-700/80 dark:text-amber-400 text-[11px]">
-                You must create at least one department before uploading documents.
+              <p className="text-amber-700/80 dark:text-amber-400 text-xs">
+                Please create at least one department before uploading documents.
               </p>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowUploadModal(false);
-                  setActiveView("departments");
-                }}
-                className="mt-1 px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-[11px] font-semibold transition flex items-center gap-1"
-              >
-                <Plus className="w-3 h-3" />
-                <span>+ Create Department</span>
-              </button>
             </div>
           ) : (
             <select
               value={selectedDeptId}
-              onChange={(e) => setSelectedDeptId(e.target.value)}
+              onChange={(e) => {
+                setSelectedDeptId(e.target.value);
+                if (errorMessage) setErrorMessage(null);
+              }}
               disabled={isUploading}
-              className="w-full text-xs p-2.5 rounded-xl border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full text-sm p-2.5 rounded-xl border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-500 font-medium"
             >
-              <option value="" disabled>
-                Select Department ▼
-              </option>
+              <option value="">Select Department</option>
               {departments.map((dept) => (
                 <option key={dept._id} value={dept._id}>
                   {dept.name}
@@ -182,10 +174,6 @@ export function UploadModal() {
               ))}
             </select>
           )}
-
-          <p className="text-[11px] text-neutral-400 mt-1">
-            Department is required for domain-aware retrieval.
-          </p>
         </div>
 
         {/* Dropzone */}
@@ -201,37 +189,37 @@ export function UploadModal() {
             className="hidden"
           />
 
-          <FileText className="w-8 h-8 text-neutral-400 mx-auto mb-2" />
+          <FileText className="w-9 h-9 text-neutral-400 mx-auto mb-2" />
           {selectedFile ? (
             <div>
-              <p className="text-xs font-semibold text-neutral-900 dark:text-neutral-100">
+              <p className="text-sm font-semibold text-neutral-900 dark:text-neutral-100">
                 {selectedFile.name}
               </p>
-              <p className="text-[11px] text-neutral-400 mt-0.5">
+              <p className="text-xs text-neutral-400 mt-0.5">
                 {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
               </p>
             </div>
           ) : (
             <div>
-              <p className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
+              <p className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
                 Click to browse or drag file here
               </p>
-              <p className="text-[11px] text-neutral-400 mt-1">
-                Supports PDF, DOC, DOCX, TXT, CSV, XLS, XLSX, PPT, PPTX, MD, JSON, HTML, XML (up to 50MB)
+              <p className="text-xs text-neutral-400 mt-1">
+                Supports PDF, DOC, DOCX, TXT, CSV, XLS, PPT, Markdown (up to 50MB)
               </p>
             </div>
           )}
         </div>
 
-        {/* Progress or error */}
+        {/* Progress bar */}
         {isUploading && (
           <div className="mt-4 space-y-1.5">
             <div className="flex items-center justify-between text-xs text-neutral-600 dark:text-neutral-400">
-              <span className="flex items-center gap-1.5">
+              <span className="flex items-center gap-1.5 font-medium">
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />
                 {statusMessage}
               </span>
-              <span>{uploadProgress}%</span>
+              <span className="font-semibold">{uploadProgress}%</span>
             </div>
             <div className="w-full bg-neutral-200 dark:bg-neutral-800 rounded-full h-1.5 overflow-hidden">
               <div
@@ -242,41 +230,53 @@ export function UploadModal() {
           </div>
         )}
 
+        {/* Error message */}
         {errorMessage && (
-          <div className="mt-3 p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-xl flex items-center space-x-2 text-xs text-red-600 dark:text-red-400">
+          <div className="mt-3 p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-xl flex items-center space-x-2 text-sm text-red-600 dark:text-red-400">
             <AlertCircle className="w-4 h-4 flex-shrink-0" />
             <span>{errorMessage}</span>
           </div>
         )}
 
+        {/* Status message */}
         {statusMessage && !isUploading && (
-          <div className="mt-3 p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-900 rounded-xl flex items-center space-x-2 text-xs text-emerald-600 dark:text-emerald-400">
+          <div className="mt-3 p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-900 rounded-xl flex items-center space-x-2 text-sm text-emerald-600 dark:text-emerald-400">
             <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
             <span>{statusMessage}</span>
           </div>
         )}
 
         {/* Footer Actions */}
-        <div className="mt-5 flex items-center justify-end space-x-2">
-          <button
-            onClick={() => setShowUploadModal(false)}
-            disabled={isUploading}
-            className="px-4 py-2 text-xs font-medium text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-xl transition"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleUpload}
-            disabled={!selectedFile || !selectedDeptId || departments.length === 0 || isUploading}
-            className={`px-4 py-2 text-xs font-semibold rounded-xl shadow-sm transition flex items-center space-x-1.5 ${
-              selectedFile && selectedDeptId && !isUploading
-                ? "bg-blue-600 hover:bg-blue-700 text-white"
-                : "bg-neutral-200 dark:bg-neutral-800 text-neutral-400 cursor-not-allowed"
-            }`}
-          >
-            {isUploading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-            <span>Upload & Process</span>
-          </button>
+        <div className="mt-5 flex items-center justify-between">
+          <div className="text-xs text-neutral-400">
+            {!selectedDeptId
+              ? "Select department to continue"
+              : !selectedFile
+              ? "Choose file to upload"
+              : ""}
+          </div>
+
+          <div className="flex items-center space-x-2">
+            <button
+              onClick={() => setShowUploadModal(false)}
+              disabled={isUploading}
+              className="px-4 py-2 text-sm font-medium text-neutral-600 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-xl transition cursor-pointer"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleUpload}
+              disabled={!selectedFile || !selectedDeptId || departments.length === 0 || isUploading}
+              className={`px-5 py-2.5 text-sm font-semibold rounded-xl shadow-xs transition flex items-center space-x-1.5 ${
+                selectedFile && selectedDeptId && !isUploading
+                  ? "bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
+                  : "bg-neutral-200 dark:bg-neutral-800 text-neutral-400 cursor-not-allowed opacity-80"
+              }`}
+            >
+              {isUploading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              <span>Upload Document</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>

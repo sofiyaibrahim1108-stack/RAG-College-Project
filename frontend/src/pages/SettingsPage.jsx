@@ -6,10 +6,10 @@ import {
   Sparkles,
   CheckCircle2,
   AlertCircle,
-  Cloud,
   Sliders,
   RefreshCw
 } from "lucide-react";
+import { GoogleDriveIcon } from "../components/common/GoogleDriveIcon";
 import { useChat } from "../context/ChatContext";
 import { driveApi } from "../services/driveApi";
 
@@ -26,17 +26,17 @@ export function SettingsPage() {
   return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 space-y-6 max-w-5xl mx-auto">
       <div>
-        <h2 className="text-xl font-bold text-neutral-900 dark:text-white">
-          System & RAG Configuration
-        </h2>
-        <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">
-          Diagnostics and settings for MongoDB, Ollama LLM, Python SigLIP2, and Google Drive.
+        <h1 className="text-2xl font-bold text-neutral-900 dark:text-white">
+          System Settings
+        </h1>
+        <p className="text-sm text-neutral-500 dark:text-neutral-400 mt-1">
+          Diagnostics and status for local database, AI models, and cloud integrations.
         </p>
       </div>
 
       {/* Diagnostics Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* MongoDB Status */}
+        {/* Document Database */}
         <div className="p-5 rounded-2xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-xs space-y-3">
           <div className="flex items-center justify-between">
             <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 rounded-xl">
@@ -49,18 +49,18 @@ export function SettingsPage() {
           </div>
           <div>
             <h3 className="font-semibold text-sm text-neutral-900 dark:text-neutral-100">
-              Local MongoDB
+              Document Database
             </h3>
             <p className="text-xs text-neutral-400 mt-0.5 font-mono">
-              localhost:27017
+              Vector & Storage Engine
             </p>
           </div>
           <p className="text-[11px] text-neutral-500 dark:text-neutral-400 border-t border-neutral-100 dark:border-neutral-800 pt-2">
-            Compatible with MongoDB Compass. Stores all vectors, chunks, and sessions.
+            Secure local repository storing document vectors, text chunks, and chat history.
           </p>
         </div>
 
-        {/* Ollama LLM Status */}
+        {/* Language & Embedding Engine */}
         <div className="p-5 rounded-2xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-xs space-y-3">
           <div className="flex items-center justify-between">
             <div className="p-2.5 bg-blue-50 dark:bg-blue-950/40 text-blue-600 rounded-xl">
@@ -73,18 +73,18 @@ export function SettingsPage() {
           </div>
           <div>
             <h3 className="font-semibold text-sm text-neutral-900 dark:text-neutral-100">
-              Ollama Local Models
+              Language Engine
             </h3>
             <p className="text-xs text-neutral-400 mt-0.5 font-mono truncate">
-              qwen2.5-coder:3b
+              Local Inference Engine
             </p>
           </div>
           <p className="text-[11px] text-neutral-500 dark:text-neutral-400 border-t border-neutral-100 dark:border-neutral-800 pt-2">
-            LLM: Qwen 2.5 Coder 3B • Embed: mxbai-embed-large (1024-dim).
+            Document synthesis, reasoning, and context retrieval.
           </p>
         </div>
 
-        {/* SigLIP2 Microservice Status */}
+        {/* Visual & Diagram Processing */}
         <div className="p-5 rounded-2xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-xs space-y-3">
           <div className="flex items-center justify-between">
             <div className="p-2.5 bg-purple-50 dark:bg-purple-950/40 text-purple-600 rounded-xl">
@@ -103,22 +103,22 @@ export function SettingsPage() {
           </div>
           <div>
             <h3 className="font-semibold text-sm text-neutral-900 dark:text-neutral-100">
-              Python SigLIP2
+              Visual Processing
             </h3>
             <p className="text-xs text-neutral-400 mt-0.5 font-mono">
-              768-dim Multimodal
+              Multimodal Search
             </p>
           </div>
           <p className="text-[11px] text-neutral-500 dark:text-neutral-400 border-t border-neutral-100 dark:border-neutral-800 pt-2">
-            Cross-modal embeddings comparing questions to document diagrams.
+            Cross-modal embeddings comparing questions to document diagrams and figures.
           </p>
         </div>
 
         {/* Google Drive Status */}
         <div className="p-5 rounded-2xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-xs space-y-3">
           <div className="flex items-center justify-between">
-            <div className="p-2.5 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 rounded-xl">
-              <Cloud className="w-5 h-5" />
+            <div className="p-2.5 bg-neutral-100 dark:bg-neutral-800 rounded-xl">
+              <GoogleDriveIcon className="w-5 h-5" />
             </div>
             <span
               className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
@@ -187,7 +187,7 @@ export function SettingsPage() {
           </div>
 
           <div className="p-3 bg-neutral-50 dark:bg-neutral-950/60 rounded-xl border border-neutral-200 dark:border-neutral-800">
-            <span className="text-[11px] text-neutral-400 block">Top-K SigLIP Images</span>
+            <span className="text-[11px] text-neutral-400 block">Top Visual Matches</span>
             <span className="text-sm font-semibold text-neutral-800 dark:text-neutral-200">2 diagrams</span>
           </div>
         </div>
@@ -195,8 +195,8 @@ export function SettingsPage() {
 
       {/* Google Drive Configuration Guide */}
       <div className="p-6 rounded-2xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 shadow-xs space-y-3">
-        <div className="flex items-center space-x-2 text-emerald-600 dark:text-emerald-400 font-semibold text-sm">
-          <Cloud className="w-5 h-5" />
+        <div className="flex items-center space-x-2 text-neutral-800 dark:text-neutral-200 font-semibold text-sm">
+          <GoogleDriveIcon className="w-5 h-5" />
           <span>Google Drive Integration</span>
         </div>
         <p className="text-xs text-neutral-600 dark:text-neutral-300 leading-relaxed">

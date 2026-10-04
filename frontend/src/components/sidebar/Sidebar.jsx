@@ -12,13 +12,17 @@ import {
   Settings,
   MoreVertical,
   Check,
-  X,
-  Database,
-  Cpu,
-  Eye,
-  Bot
+  X
 } from "lucide-react";
+import { BrandIcon } from "../common/BrandIcon";
 import { useChat } from "../../context/ChatContext";
+
+function formatConversationTitle(rawTitle = "") {
+  if (!rawTitle) return "New Conversation";
+  let clean = rawTitle.replace(/^["']+|["']+$/g, "").trim();
+  clean = clean.replace(/\.{2,}$/, "").trim();
+  return clean || "New Conversation";
+}
 
 export function Sidebar({ isOpen, onClose }) {
   const {
@@ -32,8 +36,7 @@ export function Sidebar({ isOpen, onClose }) {
     activeView,
     setActiveView,
     searchQuery,
-    setSearchQuery,
-    systemHealth
+    setSearchQuery
   } = useChat();
 
   const [editingId, setEditingId] = useState(null);
@@ -64,6 +67,7 @@ export function Sidebar({ isOpen, onClose }) {
   function renderConversationItem(conv) {
     const isActive = currentConversationId === conv._id && activeView === "chat";
     const isEditing = editingId === conv._id;
+    const cleanTitle = formatConversationTitle(conv.title);
 
     return (
       <div
@@ -77,6 +81,7 @@ export function Sidebar({ isOpen, onClose }) {
             ? "bg-neutral-200/80 dark:bg-neutral-800 text-neutral-900 dark:text-neutral-100 font-medium"
             : "text-neutral-600 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800/50 hover:text-neutral-900 dark:hover:text-neutral-200"
         }`}
+        title={cleanTitle}
       >
         <div className="flex items-center space-x-2.5 min-w-0 flex-1">
           <MessageSquare className="w-4 h-4 flex-shrink-0 text-neutral-400 group-hover:text-neutral-600 dark:group-hover:text-neutral-300" />
@@ -98,7 +103,7 @@ export function Sidebar({ isOpen, onClose }) {
               </button>
             </div>
           ) : (
-            <span className="truncate text-xs">{conv.title || "Untitled Chat"}</span>
+            <span className="truncate text-sm">{cleanTitle}</span>
           )}
         </div>
 
@@ -115,7 +120,7 @@ export function Sidebar({ isOpen, onClose }) {
             {activeMenuId === conv._id && (
               <div className="absolute right-0 mt-1 w-32 bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-xl shadow-xl z-20 py-1 text-xs">
                 <button
-                  onClick={(e) => {
+                  onClick={() => {
                     togglePinConversation(conv._id, conv.pinned);
                     setActiveMenuId(null);
                   }}
@@ -168,16 +173,24 @@ export function Sidebar({ isOpen, onClose }) {
         {/* Top Header & New Chat */}
         <div className="p-3.5 border-b border-neutral-200/60 dark:border-neutral-800/60 space-y-3">
           <div className="flex items-center justify-between px-1">
-            <div className="flex items-center space-x-2.5">
-              <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white shadow-md">
-                <Bot className="w-5 h-5" />
-              </div>
+            <div
+              className="flex items-center space-x-2.5 cursor-pointer"
+              onClick={() => {
+                setActiveView("chat");
+                if (onClose) onClose();
+              }}
+              title="Return to chat"
+            >
+              <BrandIcon
+                className="w-4.5 h-4.5"
+                containerClassName="w-8 h-8 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-xs shrink-0"
+              />
               <div>
-                <h2 className="text-sm font-bold text-neutral-900 dark:text-white leading-tight">
-                  Knowledge AI
+                <h2 className="text-base font-bold text-neutral-900 dark:text-white leading-tight">
+                  RAG Chatbot
                 </h2>
-                <span className="text-[10px] text-neutral-500 dark:text-neutral-400 font-mono">
-                  RAG + LangGraph
+                <span className="text-xs text-neutral-500 dark:text-neutral-400 font-medium">
+                  Document Intelligence
                 </span>
               </div>
             </div>
@@ -196,7 +209,7 @@ export function Sidebar({ isOpen, onClose }) {
               createNewChat();
               if (onClose) onClose();
             }}
-            className="w-full flex items-center justify-center space-x-2 px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold shadow-sm transition"
+            className="w-full flex items-center justify-center space-x-2 px-3.5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold shadow-sm transition"
           >
             <Plus className="w-4 h-4" />
             <span>New Chat</span>
@@ -204,15 +217,77 @@ export function Sidebar({ isOpen, onClose }) {
 
           {/* Search Box */}
           <div className="relative">
-            <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-neutral-400" />
+            <Search className="w-4 h-4 absolute left-3 top-2.5 text-neutral-400" />
             <input
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search conversations..."
-              className="w-full pl-8 pr-3 py-1.5 text-xs rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              className="w-full pl-9 pr-3 py-2 text-sm rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 text-neutral-800 dark:text-neutral-200 placeholder:text-neutral-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
             />
           </div>
+
+          {/* Primary Navigation Links (Above conversations, ChatGPT-style) */}
+          <nav className="space-y-1 pt-1">
+            <button
+              onClick={() => {
+                setActiveView("chat");
+                if (onClose) onClose();
+              }}
+              className={`flex items-center space-x-3 w-full px-3 py-2 rounded-xl text-sm font-medium transition cursor-pointer ${
+                activeView === "chat"
+                  ? "bg-blue-600 text-white shadow-xs"
+                  : "text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200/70 dark:hover:bg-neutral-800"
+              }`}
+            >
+              <MessageSquare className="w-4 h-4 shrink-0" />
+              <span>Chat</span>
+            </button>
+            <button
+              onClick={() => {
+                setActiveView("departments");
+                if (onClose) onClose();
+              }}
+              className={`flex items-center space-x-3 w-full px-3 py-2 rounded-xl text-sm font-medium transition cursor-pointer ${
+                activeView === "departments"
+                  ? "bg-blue-600 text-white shadow-xs"
+                  : "text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200/70 dark:hover:bg-neutral-800"
+              }`}
+            >
+              <Building2 className="w-4 h-4 shrink-0" />
+              <span>Departments</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setActiveView("documents");
+                if (onClose) onClose();
+              }}
+              className={`flex items-center space-x-3 w-full px-3 py-2 rounded-xl text-sm font-medium transition cursor-pointer ${
+                activeView === "documents"
+                  ? "bg-blue-600 text-white shadow-xs"
+                  : "text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200/70 dark:hover:bg-neutral-800"
+              }`}
+            >
+              <FolderArchive className="w-4 h-4 shrink-0" />
+              <span>Knowledge Documents</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setActiveView("settings");
+                if (onClose) onClose();
+              }}
+              className={`flex items-center space-x-3 w-full px-3 py-2 rounded-xl text-sm font-medium transition cursor-pointer ${
+                activeView === "settings"
+                  ? "bg-blue-600 text-white shadow-xs"
+                  : "text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200/70 dark:hover:bg-neutral-800"
+              }`}
+            >
+              <Settings className="w-4 h-4 shrink-0" />
+              <span>Settings</span>
+            </button>
+          </nav>
         </div>
 
         {/* Scrollable Conversation List */}
@@ -247,76 +322,12 @@ export function Sidebar({ isOpen, onClose }) {
           </div>
         </div>
 
-        {/* Bottom Section: Navigation Tabs & Health Indicators */}
-        <div className="p-3 border-t border-neutral-200/60 dark:border-neutral-800/60 space-y-2 bg-neutral-100/50 dark:bg-neutral-950/40">
-          <nav className="space-y-1">
-            <button
-              onClick={() => {
-                setActiveView("departments");
-                if (onClose) onClose();
-              }}
-              className={`flex items-center space-x-2.5 w-full px-3 py-2 rounded-xl text-xs font-medium transition ${
-                activeView === "departments"
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200 dark:hover:bg-neutral-800"
-              }`}
-            >
-              <Building2 className="w-4 h-4" />
-              <span>Departments</span>
-            </button>
-
-            <button
-              onClick={() => {
-                setActiveView("documents");
-                if (onClose) onClose();
-              }}
-              className={`flex items-center space-x-2.5 w-full px-3 py-2 rounded-xl text-xs font-medium transition ${
-                activeView === "documents"
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200 dark:hover:bg-neutral-800"
-              }`}
-            >
-              <FolderArchive className="w-4 h-4" />
-              <span>Knowledge Documents</span>
-            </button>
-
-            <button
-              onClick={() => {
-                setActiveView("settings");
-                if (onClose) onClose();
-              }}
-              className={`flex items-center space-x-2.5 w-full px-3 py-2 rounded-xl text-xs font-medium transition ${
-                activeView === "settings"
-                  ? "bg-blue-600 text-white shadow-sm"
-                  : "text-neutral-700 dark:text-neutral-300 hover:bg-neutral-200 dark:hover:bg-neutral-800"
-              }`}
-            >
-              <Settings className="w-4 h-4" />
-              <span>System & RAG Settings</span>
-            </button>
-          </nav>
-
-          {/* Status Badges */}
-          <div className="pt-2 border-t border-neutral-200/50 dark:border-neutral-800/50 flex items-center justify-between px-1 text-[11px] text-neutral-500">
-            <span className="flex items-center gap-1.5" title="MongoDB Compass Connected">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-              <span>Mongo</span>
-            </span>
-
-            <span className="flex items-center gap-1.5" title="Local Ollama Qwen Active">
-              <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              <span>Ollama</span>
-            </span>
-
-            <span className="flex items-center gap-1.5" title="Python SigLIP2 Active">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  systemHealth?.siglip?.status === "ok" ? "bg-emerald-500" : "bg-amber-500"
-                }`}
-              />
-              <span>SigLIP2</span>
-            </span>
-          </div>
+        {/* Minimal Bottom Status Footer */}
+        <div className="p-3.5 border-t border-neutral-200/60 dark:border-neutral-800/60 flex items-center text-xs text-neutral-500 dark:text-neutral-400">
+          <span className="flex items-center gap-2 font-medium">
+            <span className="w-2 h-2 rounded-full bg-emerald-500" />
+            <span>System Ready</span>
+          </span>
         </div>
       </aside>
     </>

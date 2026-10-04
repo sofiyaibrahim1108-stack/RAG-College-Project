@@ -12,6 +12,7 @@ import { chunkDocumentPages } from "./chunkingService.js";
 import { generateBatchTextEmbeddings } from "./embeddingService.js";
 import { siglipClient } from "./siglipClient.js";
 import { extractOcrText } from "./ocrService.js";
+import { invalidateDepartmentProfilesCache } from "./router.js";
 import { ENV } from "../config/env.js";
 
 /**
@@ -68,7 +69,8 @@ async function processPdf(filePath, outputDir, docName) {
         let lastY, text = "";
         for (const item of textContent.items) {
           if (lastY === item.transform[5] || !lastY) {
-            text += item.str;
+            const needSpace = text.length > 0 && !text.endsWith(" ") && !text.endsWith("\n") && !item.str.startsWith(" ");
+            text += (needSpace ? " " : "") + item.str;
           } else {
             text += "\n" + item.str;
           }
@@ -575,6 +577,60 @@ async function processXml(filePath) {
 }
 
 /**
+ * Builds ONE text chunk from: page heading/native text + caption + OCR text.
+ * Stores an imageRef pointing back to the visual asset.
+ */
+function buildImageChunkContent(img, pages = [], ocrText = "") {
+  const pageNum = img.pageNumber || 1;
+  const pageObj = pages.find((p) => p.pageNumber === pageNum);
+  const rawPageText = pageObj ? pageObj.text || "" : "";
+
+  // Extract non-numeric lines
+  const lines = rawPageText
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !/^\d+$/.test(l));
+
+  let headingText = lines.length > 0 ? lines[0] : "";
+
+  // If this page had only numbers / no text (common for dedicated image pages),
+  // inherit the most recent non-empty heading from previous pages
+  if (!headingText && pageNum > 1) {
+    for (let p = pageNum - 1; p >= Math.max(1, pageNum - 3); p--) {
+      const prevPage = pages.find((pg) => pg.pageNumber === p);
+      if (prevPage && prevPage.text) {
+        const prevLines = prevPage.text
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0 && !/^\d+$/.test(l));
+        if (prevLines.length > 0) {
+          headingText = prevLines[0];
+          break;
+        }
+      }
+    }
+  }
+
+  const nativeText = lines.slice(0, 3).join("\n").slice(0, 400);
+
+  const parts = [];
+  if (headingText) {
+    parts.push(headingText);
+  }
+  if (nativeText && nativeText !== headingText) {
+    parts.push(nativeText);
+  }
+  if (img.caption && img.caption.trim() && !parts.some((p) => p.includes(img.caption.trim()))) {
+    parts.push(`Caption: ${img.caption.trim()}`);
+  }
+  if (ocrText && ocrText.trim()) {
+    parts.push(`OCR: ${ocrText.trim()}`);
+  }
+
+  return parts.join("\n\n").trim();
+}
+
+/**
  * Main orchestration entry point for processing a Document
  * @param {string} documentId
  */
@@ -632,8 +688,9 @@ export async function processDocument(documentId) {
     );
 
     // 1. Process and save images with SigLIP2 embeddings and OCR text extraction
+    await ImageModel.deleteMany({ documentId: document._id });
     const savedImages = [];
-    const ocrChunks = [];
+    const imageDerivedChunks = [];
 
     for (const img of extractedData.images) {
       try {
@@ -666,18 +723,25 @@ export async function processDocument(documentId) {
         });
         savedImages.push(imageRecord);
 
-        // If screenshot contains recognizable text/numbers (e.g. confusion matrix, graphs),
-        // make it searchable evidence by adding an OCR chunk
-        if (ocrText && ocrText.trim().length >= 10) {
-          ocrChunks.push({
+        // Design 1: For every extracted image, build ONE text chunk from:
+        // page heading/native text on that page + image caption + OCR text.
+        // Store imageRef on the chunk.
+        const chunkContent = buildImageChunkContent(img, extractedData.pages, ocrText);
+        if (chunkContent.length >= 10) {
+          imageDerivedChunks.push({
             documentId: document._id,
             documentName: document.originalName,
             pageNumber: img.pageNumber || 1,
-            chunkIndex: 0, // will be reassigned below
-            content: `[Visual Screenshot Evidence (Page ${img.pageNumber})]:\n${ocrText.trim()}`,
+            chunkIndex: 0, // reassigned below
+            content: chunkContent,
             department: document.department || "General",
-            sourceType: "visual_ocr",
-            sourcePath: img.filePath
+            sourceType: "image_chunk",
+            sourcePath: img.filePath,
+            imageRef: {
+              documentId: document._id,
+              filename: img.filename,
+              pageNumber: img.pageNumber || 1
+            }
           });
         }
       } catch (imgErr) {
@@ -688,12 +752,12 @@ export async function processDocument(documentId) {
     // 2. Chunk text pages
     const chunkObjects = chunkDocumentPages(extractedData.pages, document);
 
-    // Append OCR chunks with consistent chunk indices
-    for (const oc of ocrChunks) {
-      oc.chunkIndex = chunkObjects.length;
-      chunkObjects.push(oc);
+    // Append image-derived chunks with consistent chunk indices
+    for (const ic of imageDerivedChunks) {
+      ic.chunkIndex = chunkObjects.length;
+      chunkObjects.push(ic);
     }
-    console.log(`[DocumentProcessor] Generated ${chunkObjects.length} text chunks (including ${ocrChunks.length} visual OCR chunks)`);
+    console.log(`[DocumentProcessor] Generated ${chunkObjects.length} text chunks (including ${imageDerivedChunks.length} image-derived chunks)`);
 
     if (chunkObjects.length > 0) {
       // 3. Generate Ollama text embeddings in batches
@@ -718,6 +782,11 @@ export async function processDocument(documentId) {
       processedAt: new Date()
     };
     await document.save();
+
+    // Invalidate cached department profiles for dynamic router
+    try {
+      invalidateDepartmentProfilesCache();
+    } catch (e) {}
 
     console.log(`[DocumentProcessor] Successfully finished processing document: ${document.originalName}`);
     return document;

@@ -15,12 +15,11 @@ export function SourceCitationCard({ source }) {
         <FileText className="w-3.5 h-3.5" />
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-xs font-medium text-neutral-800 dark:text-neutral-200 truncate">
+        <p className="text-xs font-semibold text-neutral-800 dark:text-neutral-200 truncate">
           {source.documentName}
         </p>
-        <p className="text-[10px] text-neutral-500 dark:text-neutral-400">
+        <p className="text-[11px] text-neutral-500 dark:text-neutral-400">
           Page {source.pageNumber || 1}
-          {source.similarity ? ` • ${(source.similarity * 100).toFixed(0)}% match` : ""}
         </p>
       </div>
       <ChevronRight className="w-3 h-3 text-neutral-400 group-hover:text-neutral-600 dark:group-hover:text-neutral-200 transition" />

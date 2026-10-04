@@ -1,4 +1,4 @@
-import { ragGraph, isVisualQuery } from "../graph/ragGraph.js";
+import { ragGraph } from "../graph/ragGraph.js";
 import { Message } from "../models/Message.js";
 import { Conversation } from "../models/Conversation.js";
 import { routeDepartment } from "../services/router.js";
@@ -6,7 +6,7 @@ import { processTabularQuery } from "../services/tabularProcessor.js";
 import { generateTextEmbedding } from "../services/embeddingService.js";
 import { retrieveWithScopeFallback } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
-import { retrieveRelevantImages } from "../services/imageRetrieval.js";
+import { retrieveRelevantImages, resolveMultimodalAttachments } from "../services/imageRetrieval.js";
 import { buildRAGContext } from "../services/contextBuilder.js";
 import {
   streamAnswer,
@@ -19,6 +19,8 @@ import {
   formatSources,
   formatImageCitations
 } from "../utils/citations.js";
+import { RAG_CONFIG } from "../config/rag.js";
+import { normalizeUserQuery } from "../services/queryNormalizer.js";
 
 
 /**
@@ -158,11 +160,17 @@ export async function askQuestionStream(req, res) {
       .reverse()
       .map((m) => ({
         role: m.role,
-        content: m.content
+        content: m.content,
+        routedDepartments: m.routedDepartments || []
       }));
 
     timings.history = Date.now() - t0;
 
+    const originalQuestion = question.trim();
+    const hasPreviousUserTurns = Array.isArray(history) && history.some((m) => m.role === "user");
+    const effectiveQuestion = hasPreviousUserTurns
+      ? await normalizeUserQuery(originalQuestion, history)
+      : originalQuestion;
 
     // ==========================================================
     // 2. DEPARTMENT / QUERY ROUTER
@@ -175,7 +183,7 @@ export async function askQuestionStream(req, res) {
     });
 
     const routeResult = await routeDepartment(
-      question,
+      effectiveQuestion,
       history
     );
 
@@ -208,6 +216,7 @@ export async function askQuestionStream(req, res) {
         fallbackReason: "out_of_scope",
         sources: [],
         images: [],
+        routedDepartments: [],
         timings
       });
 
@@ -245,9 +254,22 @@ export async function askQuestionStream(req, res) {
 
       try {
         tabularResult = await processTabularQuery(
-          question,
+          originalQuestion,
           routeResult.departments
         );
+
+        if (
+          (!tabularResult ||
+            !tabularResult.success ||
+            tabularResult.computedValue === null) &&
+          effectiveQuestion &&
+          effectiveQuestion !== originalQuestion
+        ) {
+          tabularResult = await processTabularQuery(
+            effectiveQuestion,
+            routeResult.departments
+          );
+        }
 
         timings.tabular = Date.now() - tTab;
 
@@ -269,13 +291,16 @@ export async function askQuestionStream(req, res) {
           tabularResult.computedValue === null
         ) {
           console.log(
-            "[ChatController] Tabular query unresolved -> document_qa fallback"
+            "[ChatController] Tabular query unresolved"
           );
 
           tabularResult = null;
 
           effectiveQueryType = "document_qa";
           effectiveDepartments = [];
+          textChunks = textChunks.filter(
+            (c) => !/\.(csv|xlsx?)$/i.test(c.documentName || "")
+          );
         }
       } catch (e) {
         console.warn(
@@ -310,13 +335,15 @@ export async function askQuestionStream(req, res) {
 
     const isStrictVisual =
   effectiveQueryType === "visual_qa" &&
-  /\b(screenshot|describe\s+only\s+the\s+visual|visual\s+elements|do\s+not\s+use\s+surrounding\s+text)\b/i.test(question);
+  /\b(screenshot|describe\s+only\s+the\s+visual|visual\s+elements|do\s+not\s+use\s+surrounding\s+text)\b/i.test(effectiveQuestion);
 
     let textChunks = [];
     let sources = [];
 
 
-    if (!isStrictVisual) {
+    const hasAuthoritativeTabular = tabularResult && tabularResult.success && tabularResult.computedValue !== null;
+
+    if (!isStrictVisual && !hasAuthoritativeTabular) {
       // --------------------------------------------------------
       // TEXT EMBEDDING
       // --------------------------------------------------------
@@ -324,7 +351,7 @@ export async function askQuestionStream(req, res) {
       const tEmb = Date.now();
 
       const textEmb =
-        await generateTextEmbedding(question);
+        await generateTextEmbedding(effectiveQuestion);
 
       timings.textEmbedding =
         Date.now() - tEmb;
@@ -341,7 +368,7 @@ export async function askQuestionStream(req, res) {
           textEmb,
           effectiveDepartments,
           5,
-          question
+          effectiveQuestion
         );
 
       textChunks = retrieval.chunks || [];
@@ -516,9 +543,12 @@ export async function askQuestionStream(req, res) {
             }
           } else {
             console.log(
-              "[Tabular Rescue] No valid tabular result. Continuing normal document QA."
+              "[Tabular Rescue] No valid tabular result. Filtering raw CSV chunks to prevent hallucination."
             );
 
+            textChunks = textChunks.filter(
+              (c) => !/\.(csv|xlsx?)$/i.test(c.documentName || "")
+            );
             tabularResult = null;
           }
         } catch (e) {
@@ -536,61 +566,30 @@ export async function askQuestionStream(req, res) {
 
 
     // ==========================================================
-    // 6. IMAGE EMBEDDING + IMAGE RETRIEVAL
+    // 6. IMAGE EMBEDDING + IMAGE RETRIEVAL (SigLIP Candidate Signal)
     // ==========================================================
 
     let images = [];
     let imageCitations = [];
+    let siglipCandidates = [];
 
-
-    if (
-      routeResult.queryType === "visual_qa" ||
-      isVisualQuery(question)
-    ) {
+    if (!hasAuthoritativeTabular) {
       const tSiglip = Date.now();
-
-      sendEvent("status", {
-        message:
-          "Searching visual diagrams..."
-      });
-
-
       try {
-        const siglipEmb =
-          await siglipClient.embedText(
-            question
-          );
-
-        timings.siglipEmbedding =
-          Date.now() - tSiglip;
-
+        const siglipEmb = await siglipClient.embedText(question);
+        timings.siglipEmbedding = Date.now() - tSiglip;
 
         const tImgRet = Date.now();
-
-        images =
-          await retrieveRelevantImages(
-            siglipEmb,
-            routeResult.departments,
-            3,
-            undefined,
-            question
-          );
-
-
-        timings.imageRetrieval =
-          Date.now() - tImgRet;
-
-
-        imageCitations =
-          formatImageCitations(images);
-      } catch (e) {
-        console.warn(
-          `[Stream SigLIP notice] ${e.message}`
+        siglipCandidates = await retrieveRelevantImages(
+          siglipEmb,
+          routeResult.departments,
+          3,
+          undefined,
+          question
         );
-
-        timings.siglipEmbedding =
-          Date.now() - tSiglip;
-
+        timings.imageRetrieval = Date.now() - tImgRet;
+      } catch (e) {
+        timings.siglipEmbedding = Date.now() - tSiglip;
         timings.imageRetrieval = 0;
       }
     } else {
@@ -764,6 +763,8 @@ export async function askQuestionStream(req, res) {
       fallbackReason =
         gate.reason;
 
+      effectiveDepartments = [];
+
       sendEvent("token", {
         token: fullAnswer
       });
@@ -793,7 +794,7 @@ export async function askQuestionStream(req, res) {
 
       fullAnswer =
         await streamAnswer(
-          question,
+          effectiveQuestion,
           context.contextPrompt,
           history,
           (token) => {
@@ -840,6 +841,8 @@ export async function askQuestionStream(req, res) {
         finalSources = [];
 
         finalImageCitations = [];
+
+        effectiveDepartments = [];
       }
 
 
@@ -852,6 +855,10 @@ export async function askQuestionStream(req, res) {
           "[ChatController] Final answer is tabular."
         );
 
+        const matchingCsv = (textChunks || []).find((c) => c.documentName === tool.documentName);
+        effectiveDepartments = matchingCsv?.department
+          ? [matchingCsv.department]
+          : (routeResult.departments && routeResult.departments.length > 0 ? routeResult.departments : ["Student information"]);
 
         /*
          * Only cite the actual dataset used by the
@@ -889,68 +896,7 @@ export async function askQuestionStream(req, res) {
 
 
       // ========================================================
-      // VISUAL QA SOURCES
-      // ========================================================
-
-      else if (
-        effectiveQueryType ===
-          "visual_qa" &&
-        images.length > 0
-      ) {
-        const visualDocNames =
-          new Set(
-            images.map(
-              (img) =>
-                img.documentName
-            )
-          );
-
-
-        const visualPages =
-          new Set(
-            images.map(
-              (img) =>
-                img.pageNumber
-            )
-          );
-
-
-        const matchingTextSources =
-          (sources || []).filter(
-            (s) =>
-              visualDocNames.has(
-                s.documentName
-              ) &&
-              visualPages.has(
-                s.pageNumber
-              )
-          );
-
-
-        finalSources =
-          matchingTextSources.length > 0
-            ? matchingTextSources
-            : images.map(
-                (img) => ({
-                  documentId:
-                    img.documentId,
-                  documentName:
-                    img.documentName,
-                  pageNumber:
-                    img.pageNumber || 1,
-                  chunkIndex: 0,
-                  snippet: img.caption
-                    ? `[Image] ${img.caption}`
-                    : `[Screenshot] Page ${img.pageNumber}`,
-                  similarity:
-                    img.similarity
-                })
-              );
-      }
-
-
-      // ========================================================
-      // NORMAL DOCUMENT SOURCES
+      // NORMAL DOCUMENT SOURCES WITH SHARED MULTIMODAL ATTACHMENT
       // ========================================================
 
       else {
@@ -961,6 +907,23 @@ export async function askQuestionStream(req, res) {
             textChunks,
             question
           );
+
+        finalImageCitations = await resolveMultimodalAttachments({
+          survivingSources: finalSources,
+          retrievedChunks: textChunks,
+          maxImages: RAG_CONFIG.topKImages,
+          isFallback: false,
+          question: originalQuestion
+        });
+
+        const sourceDepts = [...new Set((finalSources || []).map((s) => s.department).filter(Boolean))];
+        const chunkDepts = [...new Set((textChunks || []).map((c) => c.department).filter(Boolean))];
+
+        if (routeResult.departments && routeResult.departments.length > 0) {
+          effectiveDepartments = routeResult.departments;
+        } else {
+          effectiveDepartments = sourceDepts.length > 0 ? sourceDepts : chunkDepts;
+        }
       }
     }
 
@@ -983,7 +946,7 @@ export async function askQuestionStream(req, res) {
     await Message.create({
       conversationId: convId,
       role: "user",
-      content: question
+      content: originalQuestion
     });
 
 
@@ -1029,6 +992,7 @@ export async function askQuestionStream(req, res) {
       sources: finalSources,
       images:
         finalImageCitations,
+      routedDepartments: effectiveDepartments,
       timings
     });
 

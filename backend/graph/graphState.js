@@ -8,6 +8,10 @@ export const RAGStateAnnotation = Annotation.Root({
     reducer: (curr, update) => update ?? curr,
     default: () => ""
   }),
+  originalQuestion: Annotation({
+    reducer: (curr, update) => update ?? curr,
+    default: () => ""
+  }),
   conversationId: Annotation({
     reducer: (curr, update) => update ?? curr,
     default: () => null
