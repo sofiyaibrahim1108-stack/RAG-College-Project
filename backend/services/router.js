@@ -1,6 +1,7 @@
 import { Department } from "../models/Department.js";
 import { Document } from "../models/Document.js";
 import { DocumentChunk } from "../models/DocumentChunk.js";
+import { ImageModel } from "../models/Image.js";
 
 const GENERIC_ROUTER_STOPWORDS = new Set([
   "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
@@ -22,40 +23,6 @@ const UPPER_STOPWORDS = new Set([
 
 // Known out-of-scope trivia keywords that have no support in uploaded documents
 const KNOWN_OUT_OF_SCOPE_REGEX = /\b(cricket|world cup|ipl|football|fifa|olympics|bollywood|hollywood|celebrity|president|prime minister|election|weather forecast|horoscope|zodiac)\b/i;
-
-/**
- * DOMAIN HINT PATTERNS
- * Maps domain-specific terminology/symbols (regex) -> lowercase department name fragment.
- * Used ONLY to identify the relevant department/document, NOT to answer the question.
- * Strictly adheres to domain routing hints without hardcoding document answers.
- */
-const DOMAIN_HINT_PATTERNS = [
-  // 1. JavaScript programming language signals
-  {
-    // Special operator symbols in raw question
-    pattern: /(?:===|!==|==|!=|=>|\+\+|--)/,
-    deptKeyword: "javascript"
-  },
-  {
-    pattern: /\b(var|let|const|typeof|closure|hoisting|promise|async|await|dom|event\s*loop|prototype|function|array|object|javascript|js|instanceof|null|undefined|nan|callback|arrow\s*function|block\s*scope|function\s*scope|module|import|export|strict\s*mode|use\s*strict|comparison\s*operator)\b/i,
-    deptKeyword: "javascript"
-  },
-  // 2. Eye / medical / DR signals (with exact regex matching for EfficientNet, EfficientNetB0, Adam, etc.)
-  {
-    pattern: /\b(diabetic\s+retinopathy|retinopathy|dr|efficientnet(?:b\d+)?|cnn|optimizer|adam|binary\s+cross\s*entropy|transfer\s+learning|fine\s*tuning|two\s*stage\s+training|validation\s+accuracy|confusion\s+matrix|224\s*x\s*224|224x224|disease\s+severity|retinal|fundus|glaucoma|cataract|ophthalmology)\b/i,
-    deptKeyword: "eye"
-  },
-  // 3. College / placement / handbook signals
-  {
-    pattern: /\b(xyz\s+college|xyz|college|semester|odd\s+semester|even\s+semester|admission|course|b\.?\s*arch|fee|fees|placement|placements|highest\s+package|average\s+package|grading\s+system|grade\s+point|hostel|scholarship|curriculum)\b/i,
-    deptKeyword: "college"
-  },
-  // 4. Student / CSV signals
-  {
-    pattern: /\b(student|marks|highest\s+total|lowest\s+total|how\s+many\s+students|grade\s+[abc]|student_marks|marks\s+dataset)\b/i,
-    deptKeyword: "student"
-  }
-];
 
 // Cache profiles in memory to avoid querying MongoDB on every single question
 let cachedProfiles = null;
@@ -202,70 +169,50 @@ export async function routeDepartment(question, conversationHistory = []) {
     };
   }
 
-  // 3. College vs Tabular disambiguation
-  const isCollegeExplicit = /\b(xyz\s+college|xyz|college|handbook|placement|placements|highest\s+package|average\s+package|b\.?\s*arch|admission|semester)\b/i.test(rawQ);
-
-  const isTabularIntent = !isCollegeExplicit && (
-    /\b(highest\s+total|lowest\s+total|how\s+many\s+students|grade\s+[abc]|student\s+marks|student_marks|marks\s+dataset)\b/i.test(rawQ) ||
-    (/\b(student|students)\b/i.test(rawQ) && /\b(marks|grade|average|total|score|pass|fail|count)\b/i.test(rawQ)) ||
-    (/\b(highest|lowest|average|total\s+marks)\b/i.test(rawQ) && !isCollegeExplicit)
-  );
-
+  // 3. Media / Visual Intent
   const isVisual =
     /\b(screenshot|screenshots|diagram|diagrams|figure|figures|chart|charts|photo|illustration|flowchart|page\s*\d+\s*(?:show|contain|display))\b/i.test(rawQ) ||
     (/\b(image|images)\b/i.test(rawQ) && !/\b(?:total|count|number|how many)\s+images\b/i.test(rawQ));
 
-  const queryType = isVisual ? "visual_qa" : (isTabularIntent ? "tabular" : "document_qa");
+  // 4. Generic Tabular Intent Detection
+  const tabularProfile = profiles.find((p) =>
+    p.fileTypes.some((ft) => ["csv", "xlsx", "xls"].includes(ft)) ||
+    p.docs.some((doc) => /\.(csv|xlsx|xls)$/i.test(doc))
+  );
 
-  // 4. Tabular fast path: route to department holding spreadsheet/CSV
-  if (isTabularIntent) {
-    const tabularProfile = profiles.find((p) =>
-      p.fileTypes.some((ft) => ["csv", "xlsx", "xls"].includes(ft)) ||
-      p.docs.some((doc) => /\.(csv|xlsx|xls)$/i.test(doc)) ||
-      /student|mark|grade/i.test(p.name)
-    );
-    if (tabularProfile) {
-      const elapsed = Date.now() - startTime;
-      console.log(`[Router] Tabular route to [${tabularProfile.name}] in ${elapsed}ms`);
-      return {
-        queryType: "tabular",
-        candidates: [{ department: tabularProfile.name, confidence: 0.95 }],
-        departments: [tabularProfile.name],
-        confidence: 0.95
-      };
-    }
-  }
-
-  // 5. Domain Hint Pattern Matching (catches terminology/symbols in RAW question)
-  const matchedDepts = [];
-  for (const hint of DOMAIN_HINT_PATTERNS) {
-    if (hint.pattern.test(rawQ)) {
-      const matched = profiles.find((p) =>
-        p.name.toLowerCase().includes(hint.deptKeyword)
-      );
-      if (matched && !matchedDepts.includes(matched.name)) {
-        matchedDepts.push(matched.name);
+  let isTabularIntent = false;
+  if (tabularProfile) {
+    const isExplicitTableWord = /\b(dataset|spreadsheet|csv|table\s+rows?|tabular|excel)\b/i.test(rawQ);
+    const isAggregateOp = /\b(average|mean|highest|maximum|max|lowest|minimum|min|sum|count|distribution|percentage)\b/i.test(rawQ);
+    if (isExplicitTableWord) {
+      isTabularIntent = true;
+    } else if (isAggregateOp) {
+      // Check if question terms overlap with tabular profile's top terms or doc name
+      const qTokens = rawQ.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length >= 3 && !GENERIC_ROUTER_STOPWORDS.has(w));
+      const hasTabularTermOverlap = (tabularProfile.topTerms || []).some((t) => qTokens.includes(t)) ||
+        (tabularProfile.name && qTokens.some((t) => tabularProfile.name.toLowerCase().includes(t)));
+      if (hasTabularTermOverlap) {
+        isTabularIntent = true;
       }
     }
   }
 
-  if (matchedDepts.length > 0) {
-    // If college explicit, filter out student related
-    const finalDepts = isCollegeExplicit
-      ? matchedDepts.filter((d) => !/student/i.test(d))
-      : matchedDepts;
+  const queryType = isVisual ? "visual_qa" : (isTabularIntent ? "tabular" : "document_qa");
 
-    const deptsToReturn = finalDepts.length > 0 ? finalDepts : matchedDepts;
-    const queryType = isVisual ? "visual_qa" : "document_qa";
+  // Tabular route: if question explicitly has tabular aggregate intent, route to tabular department
+  if (isTabularIntent && tabularProfile) {
     const elapsed = Date.now() - startTime;
-    console.log(`[Router] Domain hint match -> [${deptsToReturn.join(", ")}] type=${queryType} in ${elapsed}ms`);
+    console.log(`[Router] Tabular route to [${tabularProfile.name}] in ${elapsed}ms`);
     return {
-      queryType,
-      candidates: deptsToReturn.map((d, idx) => ({ department: d, confidence: idx === 0 ? 0.95 : 0.85 })),
-      departments: deptsToReturn,
+      queryType: "tabular",
+      candidates: [{ department: tabularProfile.name, confidence: 0.95 }],
+      departments: [tabularProfile.name],
       confidence: 0.95
     };
   }
+
+  // 5. Code Syntax Check (e.g., ===, !==, =>, ++, --)
+  const hasCodeOperators = /(?:===|!==|=>|\+\+|--)/.test(rawQ);
 
   // 6. Match Exact Acronyms (e.g., \bDR\b, \bXYZ\b, \bJS\b)
   for (const p of profiles) {
@@ -287,45 +234,35 @@ export async function routeDepartment(question, conversationHistory = []) {
     }
   }
 
-  // 7. Match Department Names or Document Filenames
-  const matchingDepts = [];
+  // 6. Direct Full Name Match (full department name or full document title mentioned in question)
   for (const p of profiles) {
     const dLower = p.name.toLowerCase();
-    if (q.includes(dLower)) {
-      matchingDepts.push(p.name);
-    } else {
-      const dWords = dLower.split(/\s+/).filter((w) => w.length >= 4);
-      if (dWords.length > 0 && dWords.some((w) => q.includes(w))) {
-        if (!matchingDepts.includes(p.name)) matchingDepts.push(p.name);
-      }
-      for (const doc of p.docs) {
-        const docBase = doc.toLowerCase().replace(/\.[a-z0-9]+$/i, "").replace(/[_-]/g, " ");
-        if (docBase.length >= 4 && q.includes(docBase)) {
-          if (!matchingDepts.includes(p.name)) matchingDepts.push(p.name);
-        }
-        const docTokens = docBase.split(/\s+/).filter((w) => w.length >= 4 && !GENERIC_ROUTER_STOPWORDS.has(w));
-        if (docTokens.length > 0 && docTokens.some((w) => q.includes(w))) {
-          if (!matchingDepts.includes(p.name)) matchingDepts.push(p.name);
-        }
+    if (dLower.length >= 3 && q.includes(dLower)) {
+      const elapsed = Date.now() - startTime;
+      console.log(`[Router] Exact department name match -> [${p.name}] type=${queryType} in ${elapsed}ms`);
+      return {
+        queryType,
+        candidates: [{ department: p.name, confidence: 0.95 }],
+        departments: [p.name],
+        confidence: 0.95
+      };
+    }
+    for (const doc of p.docs) {
+      const docBase = doc.toLowerCase().replace(/\.[a-z0-9]+$/i, "").replace(/[_-]/g, " ");
+      if (docBase.length >= 5 && q.includes(docBase)) {
+        const elapsed = Date.now() - startTime;
+        console.log(`[Router] Exact document title match -> [${p.name}] type=${queryType} in ${elapsed}ms`);
+        return {
+          queryType,
+          candidates: [{ department: p.name, confidence: 0.95 }],
+          departments: [p.name],
+          confidence: 0.95
+        };
       }
     }
   }
 
-  if (matchingDepts.length > 0) {
-    const elapsed = Date.now() - startTime;
-    console.log(`[Router] Direct name match -> [${matchingDepts[0]}] type=${queryType} in ${elapsed}ms`);
-    return {
-      queryType,
-      candidates: matchingDepts.slice(0, 2).map((d, idx) => ({
-        department: d,
-        confidence: idx === 0 ? 0.95 : 0.4
-      })),
-      departments: [matchingDepts[0]],
-      confidence: 0.95
-    };
-  }
-
-  // 7. Token and Keyword Overlap Scoring across profiles
+  // 7. Dynamic Token and Keyword Overlap Scoring across profiles
   const qWords = q
     .replace(/[^a-z0-9_\-\s]/g, " ")
     .split(/\s+/)
@@ -334,11 +271,23 @@ export async function routeDepartment(question, conversationHistory = []) {
   const candidateScores = [];
   for (const p of profiles) {
     let score = 0;
-    for (const term of (p.topTerms || [])) {
-      if (qWords.includes(term) || q.includes(term)) {
+
+    // Code operators bonus if programming syntax present
+    if (hasCodeOperators) {
+      const isCodeDept = p.docs.some((d) => /\.(js|ts|py|java|cpp|c|html|css)/i.test(d)) ||
+        /javascript|code|programming|script/i.test(p.name);
+      if (isCodeDept) score += 3.0;
+    }
+
+    // Match individual words from department name
+    const dTokens = p.name.toLowerCase().split(/\s+/).filter((w) => w.length >= 3 && !GENERIC_ROUTER_STOPWORDS.has(w));
+    for (const dt of dTokens) {
+      if (qWords.includes(dt)) {
         score += 1.5;
       }
     }
+
+    // Match document filename tokens
     for (const doc of p.docs) {
       const docTerms = doc.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length >= 4 && !GENERIC_ROUTER_STOPWORDS.has(w));
       for (const dt of docTerms) {
@@ -347,6 +296,14 @@ export async function routeDepartment(question, conversationHistory = []) {
         }
       }
     }
+
+    // Match dynamic chunk top terms
+    for (const term of (p.topTerms || [])) {
+      if (qWords.includes(term) || q.includes(term)) {
+        score += 1.5;
+      }
+    }
+
     if (score > 0) {
       candidateScores.push({ department: p.name, score });
     }
@@ -354,7 +311,7 @@ export async function routeDepartment(question, conversationHistory = []) {
 
   candidateScores.sort((a, b) => b.score - a.score);
 
-  if (candidateScores.length > 0 && candidateScores[0].score >= 1.0) {
+  if (candidateScores.length > 0 && candidateScores[0].score >= 1.5) {
     const top = candidateScores[0];
     const second = candidateScores[1];
     const isHighConfidence = !second || top.score >= second.score * 1.5;
@@ -363,7 +320,7 @@ export async function routeDepartment(question, conversationHistory = []) {
 
     const elapsed = Date.now() - startTime;
     console.log(
-      `[Router] Overlap score match -> [${depts.join(", ")}] score=${top.score} type=${queryType} in ${elapsed}ms`
+      `[Router] Dynamic overlap match -> [${depts.join(", ")}] score=${top.score} type=${queryType} in ${elapsed}ms`
     );
 
     return {
@@ -378,7 +335,28 @@ export async function routeDepartment(question, conversationHistory = []) {
   }
 
   // 8. If question specifies a page number or visual intent, search broadly across departments
-  const hasPageSpecifier = /\b(?:page|p\.?)\s*\d+\b/i.test(q);
+  const pageMatch = rawQ.match(/\b(?:page|p\.?)\s*(\d+)\b/i);
+  const hasPageSpecifier = !!pageMatch;
+
+  if (isVisual && hasPageSpecifier) {
+    const targetPage = parseInt(pageMatch[1], 10);
+    try {
+      const targetImg = await ImageModel.findOne({ pageNumber: targetPage }).select("department").lean();
+      if (targetImg && targetImg.department) {
+        const elapsed = Date.now() - startTime;
+        console.log(`[Router] Visual query resolved to department [${targetImg.department}] for Page ${targetPage} in ${elapsed}ms`);
+        return {
+          queryType: "visual_qa",
+          candidates: [{ department: targetImg.department, confidence: 0.95 }],
+          departments: [targetImg.department],
+          confidence: 0.95
+        };
+      }
+    } catch (e) {
+      // Fall through to broad search if image query encounters error
+    }
+  }
+
   if (isVisual || hasPageSpecifier) {
     const elapsed = Date.now() - startTime;
     console.log(`[Router] Visual/Page query without explicit department -> broad search type=${queryType} in ${elapsed}ms`);
@@ -390,13 +368,14 @@ export async function routeDepartment(question, conversationHistory = []) {
     };
   }
 
-  // 9. If zero terms matched any document or department, it is out of scope!
+  // 9. Fallback to broad search across all departments
+  // Specific evidence sufficiency and term grounding are validated by the Evidence Support Gate
   const elapsed = Date.now() - startTime;
-  console.log(`[Router] No department match found -> OUT_OF_SCOPE in ${elapsed}ms: "${question}"`);
+  console.log(`[Router] No specific department keyword matched -> broad search type=${queryType} in ${elapsed}ms`);
   return {
-    queryType: "out_of_scope",
-    candidates: [],
-    departments: [],
-    confidence: 1.0
+    queryType: isVisual ? "visual_qa" : "document_qa",
+    candidates: profiles.map((p) => ({ department: p.name, confidence: 0.7 })),
+    departments: profiles.map((p) => p.name),
+    confidence: 0.7
   };
 }

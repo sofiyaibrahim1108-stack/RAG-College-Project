@@ -4,12 +4,22 @@ import { Conversation } from "../models/Conversation.js";
 import { routeDepartment } from "../services/router.js";
 import { processTabularQuery } from "../services/tabularProcessor.js";
 import { generateTextEmbedding } from "../services/embeddingService.js";
-import { retrieveRelevantTextChunks } from "../services/textRetrieval.js";
+import { retrieveWithScopeFallback } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
 import { retrieveRelevantImages } from "../services/imageRetrieval.js";
 import { buildRAGContext } from "../services/contextBuilder.js";
-import { streamAnswer, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate } from "../services/llm.js";
-import { formatSources, formatImageCitations } from "../utils/citations.js";
+import {
+  streamAnswer,
+  FALLBACK_MESSAGE,
+  isFallbackAnswer,
+  checkEvidenceSupportGate,
+  filterSupportingSources
+} from "../services/llm.js";
+import {
+  formatSources,
+  formatImageCitations
+} from "../utils/citations.js";
+
 
 /**
  * Executes standard RAG query via compiled LangGraph
@@ -17,11 +27,18 @@ import { formatSources, formatImageCitations } from "../utils/citations.js";
 export async function askQuestion(req, res) {
   try {
     const { question, conversationId } = req.body;
+
     if (!question || !question.trim()) {
-      return res.status(400).json({ error: "Question cannot be empty" });
+      return res.status(400).json({
+        error: "Question cannot be empty"
+      });
     }
 
-    console.log(`[ChatController] Incoming question: "${question}" (conv: ${conversationId || "new"})`);
+    console.log(
+      `[ChatController] Incoming question: "${question}" (conv: ${
+        conversationId || "new"
+      })`
+    );
 
     const result = await ragGraph.invoke({
       question: question.trim(),
@@ -38,10 +55,14 @@ export async function askQuestion(req, res) {
       confidence: result.routerConfidence,
       sources: result.sources,
       images: result.imageCitations,
+      fallbackReason: result.fallbackReason || null,
       timings: result.timings
     });
   } catch (error) {
-    console.error(`[ChatController Error] ${error.stack || error.message}`);
+    console.error(
+      `[ChatController Error] ${error.stack || error.message}`
+    );
+
     res.status(500).json({
       success: false,
       error: "An unexpected error occurred while processing your request.",
@@ -50,52 +71,116 @@ export async function askQuestion(req, res) {
   }
 }
 
+
 /**
- * Server-Sent Events (SSE) streaming endpoint for real-time generation
+ * Server-Sent Events (SSE) streaming endpoint
+ *
+ * Important:
+ * If the router incorrectly classifies a CSV/table question as
+ * document_qa, we perform a TABULAR RESCUE after text retrieval.
+ *
+ * Example:
+ *
+ * "What is the typical mathematics performance of the students?"
+ *
+ * Router:
+ *   document_qa
+ *
+ * Retrieval:
+ *   finds student_marks_dataset.csv
+ *
+ * Tabular rescue:
+ *   average(Math) = 68.23
+ *
+ * Then the authoritative tabular result is passed into contextBuilder.
  */
 export async function askQuestionStream(req, res) {
   const { question, conversationId } = req.body;
+
   if (!question || !question.trim()) {
-    return res.status(400).json({ error: "Question cannot be empty" });
+    return res.status(400).json({
+      error: "Question cannot be empty"
+    });
   }
 
-  // Set SSE headers
+  // ------------------------------------------------------------
+  // SSE HEADERS
+  // ------------------------------------------------------------
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
   const sendEvent = (event, data) => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    res.write(
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+    );
   };
 
   const timings = {};
   const tTotal = Date.now();
 
   try {
+    // ==========================================================
+    // 0. CREATE / LOAD CONVERSATION
+    // ==========================================================
+
     let convId = conversationId;
+
     if (!convId) {
       const newConv = await Conversation.create({
         title: question.trim().slice(0, 40)
       });
+
       convId = newConv._id.toString();
     }
-    sendEvent("conversationId", { conversationId: convId });
 
-    // 1. Load recent history
+    sendEvent("conversationId", {
+      conversationId: convId
+    });
+
+
+    // ==========================================================
+    // 1. LOAD RECENT HISTORY
+    // ==========================================================
+
     const t0 = Date.now();
-    const recentMsgs = await Message.find({ conversationId: convId })
+
+    const recentMsgs = await Message.find({
+      conversationId: convId
+    })
       .sort({ createdAt: -1 })
       .limit(6)
       .lean();
-    const history = recentMsgs.reverse().map((m) => ({ role: m.role, content: m.content }));
+
+    const history = recentMsgs
+      .reverse()
+      .map((m) => ({
+        role: m.role,
+        content: m.content
+      }));
+
     timings.history = Date.now() - t0;
 
-    // 2. Department Router
+
+    // ==========================================================
+    // 2. DEPARTMENT / QUERY ROUTER
+    // ==========================================================
+
     const tRouter = Date.now();
-    sendEvent("status", { message: "Searching your documents..." });
-    const routeResult = await routeDepartment(question, history);
+
+    sendEvent("status", {
+      message: "Searching your documents..."
+    });
+
+    const routeResult = await routeDepartment(
+      question,
+      history
+    );
+
     timings.router = Date.now() - tRouter;
+
     sendEvent("routed", {
       queryType: routeResult.queryType,
       departments: routeResult.departments,
@@ -104,177 +189,929 @@ export async function askQuestionStream(req, res) {
       duration: timings.router
     });
 
-    // Short-circuit for out_of_scope queries
+
+    // ==========================================================
+    // OUT OF SCOPE SHORT-CIRCUIT
+    // ==========================================================
+
     if (routeResult.queryType === "out_of_scope") {
       timings.total = Date.now() - tTotal;
-      sendEvent("token", { token: FALLBACK_MESSAGE });
+      timings.fallbackReason = "out_of_scope";
+
+      sendEvent("token", {
+        token: FALLBACK_MESSAGE
+      });
+
       sendEvent("complete", {
         messageId: null,
         answer: FALLBACK_MESSAGE,
+        fallbackReason: "out_of_scope",
         sources: [],
         images: [],
         timings
       });
+
       res.end();
       return;
     }
 
-    // 3. Tabular processing if applicable
+
+    // ==========================================================
+    // 3. INITIAL QUERY TYPE
+    // ==========================================================
+
     let tabularResult = null;
+
+    let effectiveQueryType = routeResult.queryType;
+
+    let effectiveDepartments = [
+      ...(routeResult.departments || [])
+    ];
+
+
+    // ==========================================================
+    // 4. NORMAL TABULAR ROUTE
+    //
+    // If router already correctly identifies tabular,
+    // process it immediately.
+    // ==========================================================
+
     if (routeResult.queryType === "tabular") {
       const tTab = Date.now();
-      sendEvent("status", { message: "Processing tabular calculations..." });
+
+      sendEvent("status", {
+        message: "Processing tabular calculations..."
+      });
+
       try {
-        tabularResult = await processTabularQuery(question, routeResult.departments);
+        tabularResult = await processTabularQuery(
+          question,
+          routeResult.departments
+        );
+
         timings.tabular = Date.now() - tTab;
+
+        console.log(
+          "[ChatController] Initial tabular result:",
+          tabularResult
+            ? {
+                success: tabularResult.success,
+                operation: tabularResult.operation,
+                column: tabularResult.column,
+                computedValue: tabularResult.computedValue
+              }
+            : null
+        );
+
+        if (
+          !tabularResult ||
+          !tabularResult.success ||
+          tabularResult.computedValue === null
+        ) {
+          console.log(
+            "[ChatController] Tabular query unresolved -> document_qa fallback"
+          );
+
+          tabularResult = null;
+
+          effectiveQueryType = "document_qa";
+          effectiveDepartments = [];
+        }
       } catch (e) {
-        console.warn(`[Stream Tabular notice] ${e.message}`);
+        console.warn(
+          `[Stream Tabular notice] ${e.message}`
+        );
+
+        tabularResult = null;
+
+        effectiveQueryType = "document_qa";
+        effectiveDepartments = [];
       }
     }
 
-    // 4. Text Embedding & Retrieval
-    const tEmb = Date.now();
-    const textEmb = await generateTextEmbedding(question);
-    timings.textEmbedding = Date.now() - tEmb;
 
-    const tRet = Date.now();
-    const textChunks = await retrieveRelevantTextChunks(
-      textEmb,
-      routeResult.departments,
-      5,
-      undefined,
-      question
-    );
-    timings.textRetrieval = Date.now() - tRet;
-    const sources = formatSources(textChunks);
+    // ==========================================================
+    // 5. TEXT EMBEDDING + TEXT RETRIEVAL
+    //
+    // We intentionally perform retrieval BEFORE tabular rescue.
+    //
+    // Why?
+    //
+    // The router may incorrectly say:
+    //
+    // document_qa
+    //
+    // while retrieval can still discover:
+    //
+    // student_marks_dataset.csv
+    //
+    // That CSV discovery allows us to invoke the tabular processor.
+    // ==========================================================
 
-    // 5. Image Embedding & Retrieval via SigLIP2
-    let images = [];
-    let imageCitations = [];
-    if (routeResult.queryType === "visual_qa" || isVisualQuery(question)) {
-      const tSiglip = Date.now();
-      sendEvent("status", { message: "Searching visual diagrams..." });
-      try {
-        const siglipEmb = await siglipClient.embedText(question);
-        timings.siglipEmbedding = Date.now() - tSiglip;
+    const isStrictVisual =
+  effectiveQueryType === "visual_qa" &&
+  /\b(screenshot|describe\s+only\s+the\s+visual|visual\s+elements|do\s+not\s+use\s+surrounding\s+text)\b/i.test(question);
 
-        const tImgRet = Date.now();
-        images = await retrieveRelevantImages(
-          siglipEmb,
-          routeResult.departments,
-          3,
-          undefined,
+    let textChunks = [];
+    let sources = [];
+
+
+    if (!isStrictVisual) {
+      // --------------------------------------------------------
+      // TEXT EMBEDDING
+      // --------------------------------------------------------
+
+      const tEmb = Date.now();
+
+      const textEmb =
+        await generateTextEmbedding(question);
+
+      timings.textEmbedding =
+        Date.now() - tEmb;
+
+
+      // --------------------------------------------------------
+      // TEXT RETRIEVAL
+      // --------------------------------------------------------
+
+      const tRet = Date.now();
+
+      const retrieval =
+        await retrieveWithScopeFallback(
+          textEmb,
+          effectiveDepartments,
+          5,
           question
         );
-        timings.imageRetrieval = Date.now() - tImgRet;
-        imageCitations = formatImageCitations(images);
+
+      textChunks = retrieval.chunks || [];
+
+      if (
+        retrieval.widened &&
+        textChunks.length > 0
+      ) {
+        effectiveDepartments = [
+          ...new Set(
+            textChunks
+              .map((c) => c.department)
+              .filter(Boolean)
+          )
+        ];
+      }
+
+      timings.textRetrieval =
+        Date.now() - tRet;
+
+      sources =
+        formatSources(textChunks);
+
+
+      // ========================================================
+      // 5A. TABULAR RESCUE
+      //
+      // IMPORTANT FIX
+      //
+      // If router says document_qa but retrieval discovers a
+      // CSV, give the tabular processor one chance.
+      //
+      // This fixes:
+      //
+      // "What is the typical mathematics performance..."
+      //
+      // where the router currently returns document_qa.
+      // ========================================================
+
+      const csvChunks =
+        textChunks.filter((chunk) =>
+          /\.csv$/i.test(
+            chunk.documentName || ""
+          )
+        );
+
+
+      const hasCsvEvidence =
+        csvChunks.length > 0;
+
+
+      const shouldAttemptTabularRescue =
+        !tabularResult &&
+        hasCsvEvidence &&
+        effectiveQueryType !== "visual_qa";
+
+
+      if (shouldAttemptTabularRescue) {
+        console.log(
+          "[Tabular Rescue] CSV evidence detected:",
+          [
+            ...new Set(
+              csvChunks.map(
+                (c) => c.documentName
+              )
+            )
+          ]
+        );
+
+        const tTabRescue = Date.now();
+
+        sendEvent("status", {
+          message:
+            "Analyzing the uploaded table..."
+        });
+
+
+        try {
+          /*
+           * IMPORTANT:
+           *
+           * Do NOT force the current PDF department here.
+           *
+           * The router may have returned:
+           *
+           * ["College Information"]
+           *
+           * even though the CSV belongs to another
+           * department / scope.
+           *
+           * Passing [] lets the tabular processor locate
+           * the actual table dataset.
+           */
+          tabularResult =
+            await processTabularQuery(
+              question,
+              []
+            );
+
+
+          timings.tabular =
+            Date.now() - tTabRescue;
+
+
+          console.log(
+            "[Tabular Rescue] Result:",
+            tabularResult
+              ? {
+                  success:
+                    tabularResult.success,
+                  documentName:
+                    tabularResult.documentName,
+                  operation:
+                    tabularResult.operation,
+                  column:
+                    tabularResult.column,
+                  computedValue:
+                    tabularResult.computedValue
+                }
+              : null
+          );
+
+
+          // ----------------------------------------------------
+          // SUCCESSFUL TABULAR RESCUE
+          // ----------------------------------------------------
+
+          if (
+            tabularResult &&
+            tabularResult.success &&
+            tabularResult.computedValue !== null
+          ) {
+            console.log(
+              "[Tabular Rescue] SUCCESS"
+            );
+
+            console.log(
+              `[Tabular Rescue] ${tabularResult.operation}(${tabularResult.column}) = ${tabularResult.computedValue}`
+            );
+
+
+            /*
+             * This is the critical state change.
+             *
+             * From this point onward the question is treated
+             * as a trusted tabular query.
+             */
+            effectiveQueryType = "tabular";
+
+
+            /*
+             * The actual tabular document is authoritative.
+             *
+             * We don't want the PDF department returned by the
+             * router to influence the evidence gate.
+             */
+            if (tabularResult.documentName) {
+              const matchingCsv =
+                textChunks.find(
+                  (chunk) =>
+                    chunk.documentName ===
+                    tabularResult.documentName
+                );
+
+              if (
+                matchingCsv?.department
+              ) {
+                effectiveDepartments = [
+                  matchingCsv.department
+                ];
+              }
+            }
+          } else {
+            console.log(
+              "[Tabular Rescue] No valid tabular result. Continuing normal document QA."
+            );
+
+            tabularResult = null;
+          }
+        } catch (e) {
+          console.warn(
+            `[Tabular Rescue notice] ${e.message}`
+          );
+
+          tabularResult = null;
+        }
+      }
+    } else {
+      timings.textEmbedding = 0;
+      timings.textRetrieval = 0;
+    }
+
+
+    // ==========================================================
+    // 6. IMAGE EMBEDDING + IMAGE RETRIEVAL
+    // ==========================================================
+
+    let images = [];
+    let imageCitations = [];
+
+
+    if (
+      routeResult.queryType === "visual_qa" ||
+      isVisualQuery(question)
+    ) {
+      const tSiglip = Date.now();
+
+      sendEvent("status", {
+        message:
+          "Searching visual diagrams..."
+      });
+
+
+      try {
+        const siglipEmb =
+          await siglipClient.embedText(
+            question
+          );
+
+        timings.siglipEmbedding =
+          Date.now() - tSiglip;
+
+
+        const tImgRet = Date.now();
+
+        images =
+          await retrieveRelevantImages(
+            siglipEmb,
+            routeResult.departments,
+            3,
+            undefined,
+            question
+          );
+
+
+        timings.imageRetrieval =
+          Date.now() - tImgRet;
+
+
+        imageCitations =
+          formatImageCitations(images);
       } catch (e) {
-        console.warn(`[Stream SigLIP notice] ${e.message}`);
+        console.warn(
+          `[Stream SigLIP notice] ${e.message}`
+        );
+
+        timings.siglipEmbedding =
+          Date.now() - tSiglip;
+
+        timings.imageRetrieval = 0;
       }
     } else {
       timings.siglipEmbedding = 0;
       timings.imageRetrieval = 0;
     }
 
-    // 6. Build context
+
+    // ==========================================================
+    // 7. BUILD RAG CONTEXT
+    // ==========================================================
+
     const tCtx = Date.now();
-    const context = buildRAGContext(textChunks, images, tabularResult, question);
-    timings.contextBuilder = Date.now() - tCtx;
 
-    // 7. Stream LLM answer
+    const context =
+      buildRAGContext(
+        textChunks,
+        images,
+        tabularResult,
+        question
+      );
+
+    timings.contextBuilder =
+      Date.now() - tCtx;
+
+
+    // ==========================================================
+    // DEBUG
+    // ==========================================================
+
+    console.log(
+      "\n========== CHAT CONTROLLER DEBUG =========="
+    );
+
+    console.log(
+      "Question:",
+      question
+    );
+
+    console.log(
+      "Router query type:",
+      routeResult.queryType
+    );
+
+    console.log(
+      "Effective query type:",
+      effectiveQueryType
+    );
+
+    console.log(
+      "CSV evidence:",
+      textChunks
+        .filter((c) =>
+          /\.csv$/i.test(
+            c.documentName || ""
+          )
+        )
+        .map((c) => c.documentName)
+    );
+
+    console.log(
+      "Tabular result:",
+      tabularResult
+        ? {
+            success:
+              tabularResult.success,
+            operation:
+              tabularResult.operation,
+            column:
+              tabularResult.column,
+            computedValue:
+              tabularResult.computedValue
+          }
+        : null
+    );
+
+    console.log(
+      "Context has tabular:",
+      /TABULAR TOOL RESULT/i.test(
+        context.contextPrompt || ""
+      )
+    );
+
+    console.log(
+      "===========================================\n"
+    );
+
+
+    // ==========================================================
+    // 8. EVIDENCE + LLM
+    // ==========================================================
+
     let fullAnswer = "";
-    let finalSources = sources;
-    let finalImageCitations = imageCitations;
 
-    // Pre-LLM Evidence Support Gate
-    const gate = checkEvidenceSupportGate(question, context.contextPrompt, routeResult.queryType);
+    let finalSources = sources;
+
+    let finalImageCitations =
+      imageCitations;
+
+    let fallbackReason = null;
+
+
+    // ----------------------------------------------------------
+    // Evidence metadata
+    // ----------------------------------------------------------
+
+    const evidenceMeta = {
+      topSimilarity: Math.max(
+        0,
+        ...textChunks.map(
+          (c) => c.similarity || 0
+        )
+      )
+    };
+
+
+    // ----------------------------------------------------------
+    // IMPORTANT FIX:
+    //
+    // If tabularResult is successful, the authoritative
+    // calculation itself is sufficient evidence.
+    //
+    // Therefore DO NOT run the normal lexical evidence gate.
+    //
+    // This prevents:
+    //
+    // typical -> missing_attribute
+    //
+    // ----------------------------------------------------------
+
+    let gate;
+
+
+    if (
+      tabularResult &&
+      tabularResult.success &&
+      tabularResult.computedValue !== null
+    ) {
+      gate = {
+        supported: true,
+        reason:
+          "tabular_tool_result_present"
+      };
+
+      console.log(
+        "[Evidence Gate] Tabular result present -> automatically supported"
+      );
+    } else {
+      gate =
+        checkEvidenceSupportGate(
+          question,
+          context.contextPrompt,
+          effectiveQueryType,
+          evidenceMeta
+        );
+    }
+
+
+    // ==========================================================
+    // 9. EVIDENCE REJECTED
+    // ==========================================================
 
     if (!gate.supported) {
-      console.log(`[Evidence Gate Stream] Question "${question}" rejected: ${gate.reason}. Skipping LLM stream.`);
-      fullAnswer = FALLBACK_MESSAGE;
-      sendEvent("token", { token: fullAnswer });
+      console.log(
+        `[Evidence Gate Stream] Question "${question}" rejected: ${gate.reason}. Skipping LLM stream.`
+      );
+
+      fullAnswer =
+        FALLBACK_MESSAGE;
+
+      fallbackReason =
+        gate.reason;
+
+      sendEvent("token", {
+        token: fullAnswer
+      });
+
       timings.llm = 0;
+
       finalSources = [];
+
       finalImageCitations = [];
-    } else {
-      sendEvent("status", { message: "Generating grounded response..." });
+    }
+
+
+    // ==========================================================
+    // 10. LLM STREAM
+    // ==========================================================
+
+    else {
+      sendEvent("status", {
+        message:
+          "Generating grounded response..."
+      });
+
       const tLLM = Date.now();
 
-      await streamAnswer(question, context.contextPrompt, history, (token) => {
-        fullAnswer += token;
-        sendEvent("token", { token });
-      }, routeResult.queryType);
-      timings.llm = Date.now() - tLLM;
+      const meta = {};
+
+
+      fullAnswer =
+        await streamAnswer(
+          question,
+          context.contextPrompt,
+          history,
+          (token) => {
+            sendEvent("token", {
+              token
+            });
+          },
+          effectiveQueryType,
+          evidenceMeta,
+          meta
+        );
+
+
+      timings.llm =
+        Date.now() - tLLM;
+
+
+      // ========================================================
+      // Determine whether this was a successful tabular answer
+      // ========================================================
+
+      const tool =
+        tabularResult &&
+        tabularResult.success &&
+        tabularResult.computedValue !== null &&
+        tabularResult.operation !==
+          "preview"
+          ? tabularResult
+          : null;
+
+
+      // ========================================================
+      // LLM FALLBACK
+      // ========================================================
 
       if (isFallbackAnswer(fullAnswer)) {
-        fullAnswer = FALLBACK_MESSAGE;
+        fullAnswer =
+          FALLBACK_MESSAGE;
+
+        fallbackReason =
+          meta.reason ||
+          "insufficient_evidence";
+
         finalSources = [];
+
         finalImageCitations = [];
+      }
+
+
+      // ========================================================
+      // TABULAR SOURCES
+      // ========================================================
+
+      else if (tool) {
+        console.log(
+          "[ChatController] Final answer is tabular."
+        );
+
+
+        /*
+         * Only cite the actual dataset used by the
+         * deterministic tabular processor.
+         */
+
+        const fromDataset =
+          (sources || []).filter(
+            (s) =>
+              s.documentName ===
+              tool.documentName
+          );
+
+
+        finalSources =
+          fromDataset.length > 0
+            ? fromDataset.slice(0, 1)
+            : [
+                {
+                  documentName:
+                    tool.documentName,
+                  pageNumber: 1,
+                  chunkIndex: 0,
+                  snippet:
+                    tool.summary?.slice(
+                      0,
+                      200
+                    )
+                }
+              ];
+
+
+        finalImageCitations = [];
+      }
+
+
+      // ========================================================
+      // VISUAL QA SOURCES
+      // ========================================================
+
+      else if (
+        effectiveQueryType ===
+          "visual_qa" &&
+        images.length > 0
+      ) {
+        const visualDocNames =
+          new Set(
+            images.map(
+              (img) =>
+                img.documentName
+            )
+          );
+
+
+        const visualPages =
+          new Set(
+            images.map(
+              (img) =>
+                img.pageNumber
+            )
+          );
+
+
+        const matchingTextSources =
+          (sources || []).filter(
+            (s) =>
+              visualDocNames.has(
+                s.documentName
+              ) &&
+              visualPages.has(
+                s.pageNumber
+              )
+          );
+
+
+        finalSources =
+          matchingTextSources.length > 0
+            ? matchingTextSources
+            : images.map(
+                (img) => ({
+                  documentId:
+                    img.documentId,
+                  documentName:
+                    img.documentName,
+                  pageNumber:
+                    img.pageNumber || 1,
+                  chunkIndex: 0,
+                  snippet: img.caption
+                    ? `[Image] ${img.caption}`
+                    : `[Screenshot] Page ${img.pageNumber}`,
+                  similarity:
+                    img.similarity
+                })
+              );
+      }
+
+
+      // ========================================================
+      // NORMAL DOCUMENT SOURCES
+      // ========================================================
+
+      else {
+        finalSources =
+          filterSupportingSources(
+            sources,
+            fullAnswer,
+            textChunks,
+            question
+          );
       }
     }
 
-    timings.total = Date.now() - tTotal;
 
-    // 8. Save conversation
+    // ==========================================================
+    // 11. FINAL TIMINGS
+    // ==========================================================
+
+    timings.total =
+      Date.now() - tTotal;
+
+    timings.fallbackReason =
+      fallbackReason;
+
+
+    // ==========================================================
+    // 12. SAVE USER MESSAGE
+    // ==========================================================
+
     await Message.create({
       conversationId: convId,
       role: "user",
       content: question
     });
 
-    const assistantMsg = await Message.create({
-      conversationId: convId,
-      role: "assistant",
-      content: fullAnswer,
-      routedDepartments: routeResult.departments,
-      sources: finalSources,
-      images: finalImageCitations,
-      timings
-    });
 
-    await Conversation.findByIdAndUpdate(convId, { updatedAt: new Date() });
+    // ==========================================================
+    // 13. SAVE ASSISTANT MESSAGE
+    // ==========================================================
 
-    // Send complete event with metadata
+    const assistantMsg =
+      await Message.create({
+        conversationId: convId,
+        role: "assistant",
+        content: fullAnswer,
+        routedDepartments:
+          effectiveDepartments,
+        sources: finalSources,
+        images:
+          finalImageCitations,
+        timings
+      });
+
+
+    // ==========================================================
+    // 14. UPDATE CONVERSATION
+    // ==========================================================
+
+    await Conversation.findByIdAndUpdate(
+      convId,
+      {
+        updatedAt: new Date()
+      }
+    );
+
+
+    // ==========================================================
+    // 15. SEND COMPLETE SSE EVENT
+    // ==========================================================
+
     sendEvent("complete", {
-      messageId: assistantMsg._id,
+      messageId:
+        assistantMsg._id,
       answer: fullAnswer,
+      fallbackReason,
       sources: finalSources,
-      images: finalImageCitations,
+      images:
+        finalImageCitations,
       timings
     });
+
 
     res.end();
   } catch (error) {
-    console.error(`[askQuestionStream error] ${error.stack || error.message}`);
-    sendEvent("error", { message: "An unexpected error occurred while processing your request." });
+    console.error(
+      `[askQuestionStream error] ${
+        error.stack ||
+        error.message
+      }`
+    );
+
+    try {
+      sendEvent("error", {
+        message:
+          "An unexpected error occurred while processing your request."
+      });
+    } catch (_) {
+      // Ignore SSE write errors during connection failure.
+    }
+
     res.end();
   }
 }
 
-/**
- * Message feedback handler (like / dislike)
- */
-export async function submitFeedback(req, res) {
-  try {
-    const { messageId } = req.params;
-    const { feedback } = req.body;
 
-    if (!["like", "dislike", null].includes(feedback)) {
-      return res.status(400).json({ error: "Invalid feedback value" });
+/**
+ * Message feedback handler
+ */
+export async function submitFeedback(
+  req,
+  res
+) {
+  try {
+    const { messageId } =
+      req.params;
+
+    const { feedback } =
+      req.body;
+
+
+    if (
+      ![
+        "like",
+        "dislike",
+        null
+      ].includes(feedback)
+    ) {
+      return res.status(400).json({
+        error:
+          "Invalid feedback value"
+      });
     }
 
-    const message = await Message.findByIdAndUpdate(
-      messageId,
-      { feedback },
-      { new: true }
-    );
+
+    const message =
+      await Message.findByIdAndUpdate(
+        messageId,
+        {
+          feedback
+        },
+        {
+          new: true
+        }
+      );
+
 
     if (!message) {
-      return res.status(404).json({ error: "Message not found" });
+      return res.status(404).json({
+        error:
+          "Message not found"
+      });
     }
 
-    res.json({ success: true, message });
+
+    res.json({
+      success: true,
+      message
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      error: error.message
+    });
   }
 }

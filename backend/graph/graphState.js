@@ -71,5 +71,9 @@ export const RAGStateAnnotation = Annotation.Root({
   timings: Annotation({
     reducer: (curr, update) => ({ ...(curr || {}), ...(update || {}) }),
     default: () => ({})
+  }),
+  fallbackReason: Annotation({
+    reducer: (curr, update) => update ?? curr,
+    default: () => null
   })
 });

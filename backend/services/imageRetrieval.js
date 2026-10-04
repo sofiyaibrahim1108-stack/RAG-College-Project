@@ -105,6 +105,19 @@ export async function retrieveRelevantImages(
     }
   }
 
+  // If a specific target page was requested, restrict strictly to matching page images
+  if (targetPage !== null) {
+    const pageMatches = scored.filter((img) => img.pageNumber === targetPage);
+    if (pageMatches.length > 0) {
+      pageMatches.sort((a, b) => b.rankingScore - a.rankingScore);
+      const results = pageMatches.slice(0, topK).map(({ _isPageMatch, ...rest }) => rest);
+      console.log(
+        `[ImageRetrieval] Retrieved ${results.length} strictly page-matched images for Page ${targetPage} in ${Date.now() - startTime}ms`
+      );
+      return results;
+    }
+  }
+
   // Sort: explicit page matches first, then descending by ranking score
   scored.sort((a, b) => {
     if (a._isPageMatch && !b._isPageMatch) return -1;

@@ -5,11 +5,11 @@ import { Conversation } from "../models/Conversation.js";
 import { routeDepartment } from "../services/router.js";
 import { processTabularQuery } from "../services/tabularProcessor.js";
 import { generateTextEmbedding } from "../services/embeddingService.js";
-import { retrieveRelevantTextChunks } from "../services/textRetrieval.js";
+import { retrieveWithScopeFallback } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
 import { retrieveRelevantImages } from "../services/imageRetrieval.js";
 import { buildRAGContext } from "../services/contextBuilder.js";
-import { generateAnswer, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate } from "../services/llm.js";
+import { generateAnswerDetailed, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate, filterSupportingSources } from "../services/llm.js";
 import { formatSources, formatImageCitations } from "../utils/citations.js";
 
 /**
@@ -86,13 +86,26 @@ async function tabularNode(state) {
     const duration = Date.now() - t0;
     console.log(`[Timing] Tabular Tool: ${duration} ms`);
 
+    if (result && result.success && result.computedValue !== null) {
+      return {
+        tabularResult: result,
+        timings: { tabular: duration }
+      };
+    }
+
+    // Fallback: If tabular query cannot be resolved or computed, route to document QA
+    console.log(`[Node: tabular] Tabular query unresolved -> falling back to document_qa and widening scope`);
     return {
-      tabularResult: result,
+      queryType: "document_qa",
+      routedDepartments: [],
+      tabularResult: null,
       timings: { tabular: duration }
     };
   } catch (err) {
     console.warn(`[Node: tabular] Notice: ${err.message}`);
     return {
+      queryType: "document_qa",
+      routedDepartments: [],
       tabularResult: null,
       timings: { tabular: Date.now() - t0 }
     };
@@ -134,23 +147,33 @@ async function textRetrievalNode(state) {
     return { retrievedChunks: [], sources: [], timings: { textRetrieval: 0 } };
   }
 
+  // Skip unrelated text retrieval for strict visual QA queries referring to a screenshot/image
+  const isStrictVisual = state.queryType === "visual_qa" &&
+    /\b(screenshot|describe\s+only\s+the\s+visual|visual\s+elements|do\s+not\s+use\s+surrounding\s+text)\b/i.test(state.question);
+  if (isStrictVisual) {
+    return { retrievedChunks: [], sources: [], timings: { textRetrieval: 0 } };
+  }
+
   const t0 = Date.now();
   try {
-    const chunks = await retrieveRelevantTextChunks(
+    const { chunks, widened } = await retrieveWithScopeFallback(
       state.queryEmbedding,
       state.routedDepartments,
       5,
-      undefined,
       state.question
     );
     const duration = Date.now() - t0;
-    console.log(`[Retrieval] ${duration}ms`);
+    console.log(`[Retrieval] ${duration}ms${widened ? " (widened beyond routed scope)" : ""}`);
 
-    return {
+    const update = {
       retrievedChunks: chunks,
       sources: formatSources(chunks),
       timings: { textRetrieval: duration, retrieval: duration }
     };
+    if (widened) {
+      update.routedDepartments = [...new Set(chunks.map((c) => c.department).filter(Boolean))];
+    }
+    return update;
   } catch (err) {
     console.error(`[Node: textRetrieval] Error: ${err.message}`);
     return {
@@ -271,22 +294,26 @@ async function generateAnswerNode(state) {
     console.log(`[Generation] 0ms`);
     return {
       finalAnswer: FALLBACK_MESSAGE,
+      fallbackReason: "out_of_scope",
       sources: [],
       imageCitations: [],
       timings: { evidenceGate: gateDuration, generation: 0, llm: 0 }
     };
   }
 
-  // Pre-LLM Evidence Support Gate
-  const gate = checkEvidenceSupportGate(state.question, state.contextPrompt, state.queryType);
+  // Pre-LLM Evidence Sufficiency Check (lexical + semantic signal)
+  const topSimilarity = Math.max(0, ...(state.retrievedChunks || []).map((c) => c.similarity || 0));
+  const evidenceMeta = { topSimilarity };
+  const gate = checkEvidenceSupportGate(state.question, state.contextPrompt, state.queryType, evidenceMeta);
   const gateDuration = Date.now() - tGate;
-  console.log(`[Evidence Gate] ${gateDuration}ms`);
+  console.log(`[Evidence Gate] ${gateDuration}ms (result=${gate.reason}, topSim=${topSimilarity.toFixed(3)})`);
 
   if (!gate.supported) {
     console.log(`[Evidence Gate] Question "${state.question}" rejected: ${gate.reason}. Skipping LLM call.`);
     console.log(`[Generation] 0ms`);
     return {
       finalAnswer: FALLBACK_MESSAGE,
+      fallbackReason: gate.reason,
       sources: [],
       imageCitations: [],
       timings: { evidenceGate: gateDuration, generation: 0, llm: 0 }
@@ -295,28 +322,75 @@ async function generateAnswerNode(state) {
 
   try {
     const tGen = Date.now();
-    const answer = await generateAnswer(
+    const { answer, reason } = await generateAnswerDetailed(
       state.question,
       state.contextPrompt,
       state.conversationHistory,
-      state.queryType
+      state.queryType,
+      evidenceMeta
     );
     const genDuration = Date.now() - tGen;
-    console.log(`[Generation] ${genDuration}ms`);
+    console.log(`[Generation] ${genDuration}ms${reason ? ` (withheld: ${reason})` : ""}`);
 
     const isMissing = isFallbackAnswer(answer);
     const finalAnswer = isMissing ? FALLBACK_MESSAGE : answer;
+    const fallbackReason = isMissing ? (reason || "insufficient_evidence") : null;
+
+    let finalSources = isMissing ? [] : filterSupportingSources(state.sources, finalAnswer, state.retrievedChunks, state.question);
+    let finalImageCitations = isMissing ? [] : state.imageCitations;
+    let routedDepts = state.routedDepartments;
+
+    // Tool-computed answers cite the dataset the tool actually used
+    const tool = state.tabularResult;
+    if (!isMissing && tool && tool.success && tool.operation !== "preview") {
+      const fromDataset = (state.sources || []).filter((s) => s.documentName === tool.documentName);
+      finalSources = fromDataset.length > 0
+        ? fromDataset.slice(0, 1)
+        : [{ documentName: tool.documentName, pageNumber: 1, chunkIndex: 0, snippet: tool.summary?.slice(0, 200) }];
+      finalImageCitations = [];
+    }
+
+    if (!isMissing && state.queryType === "visual_qa" && state.retrievedImages?.length > 0) {
+      // In visual QA, citations must only refer to the requested visual source/page
+      const visualDocNames = new Set(state.retrievedImages.map((img) => img.documentName));
+      const visualPages = new Set(state.retrievedImages.map((img) => img.pageNumber));
+
+      const matchingTextSources = (state.sources || []).filter(
+        (s) => visualDocNames.has(s.documentName) && visualPages.has(s.pageNumber)
+      );
+
+      finalSources = matchingTextSources.length > 0
+        ? matchingTextSources
+        : state.retrievedImages.map((img) => ({
+            documentId: img.documentId,
+            documentName: img.documentName,
+            pageNumber: img.pageNumber || 1,
+            chunkIndex: 0,
+            snippet: img.caption ? `[Image] ${img.caption}` : `[Screenshot] Page ${img.pageNumber}`,
+            similarity: img.similarity
+          }));
+
+      const visualDepts = [...new Set(state.retrievedImages.map((img) => img.department).filter(Boolean))];
+      if (visualDepts.length > 0) {
+        routedDepts = visualDepts;
+      }
+    }
 
     return {
       finalAnswer,
-      sources: isMissing ? [] : state.sources,
-      imageCitations: isMissing ? [] : state.imageCitations,
+      fallbackReason,
+      sources: finalSources,
+      imageCitations: finalImageCitations,
+      routedDepartments: routedDepts,
       timings: { evidenceGate: gateDuration, generation: genDuration, llm: genDuration }
     };
   } catch (err) {
     console.error(`[Node: generateAnswer] Error: ${err.message}`);
     return {
       finalAnswer: FALLBACK_MESSAGE,
+      fallbackReason: "insufficient_evidence",
+      sources: [],
+      imageCitations: [],
       timings: { evidenceGate: gateDuration, generation: Date.now() - t0, llm: Date.now() - t0 }
     };
   }
@@ -351,7 +425,7 @@ async function saveConversationNode(state) {
       routedDepartments: state.routedDepartments,
       sources: state.sources,
       images: state.imageCitations,
-      timings: state.timings
+      timings: { ...(state.timings || {}), fallbackReason: state.fallbackReason }
     });
 
     await Conversation.findByIdAndUpdate(convId, { updatedAt: new Date() });

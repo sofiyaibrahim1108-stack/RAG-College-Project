@@ -99,73 +99,41 @@ function computeLexicalScore(queryTerms, rawQuestion, content, scopeTokens = new
 
   let tokenCoverage = termMatches / activeTerms.length;
 
-  // Metric & value bonus: prioritize chunks that contain actual measurements or entity facts
-  let metricBonus = 0;
-  const qLower = (rawQuestion || "").toLowerCase();
-
-  // 1. Accuracy & performance queries
-  const asksAccuracy = /\b(?:accuracy|percentage|rate|val_accuracy)\b/.test(qLower);
-  if (asksAccuracy) {
-    const hasMetricValue = /(?:\b\d+(\.\d+)?%|\b0\.\d{2,}\b)/.test(content);
-    const hasAccuracyWord = /\b(?:accuracy|acc)\b/i.test(content);
-    if (hasMetricValue && hasAccuracyWord) {
-      metricBonus = Math.max(metricBonus, 0.40);
-    } else if (!hasMetricValue && hasAccuracyWord) {
-      metricBonus -= 0.10;
-    }
-  }
-
-  // 2. Training stages / two-stage fine tuning
-  const asksTwoStage = /\b(?:two[- ]stage|training\s+stages?|stage\s+1|stage\s+2|fine[- ]tuning)\b/i.test(qLower);
-  if (asksTwoStage) {
-    if (/\b(?:two[- ]stage|stage\s+1|stage\s+2|fine[- ]tuning)\b/i.test(content)) {
-      metricBonus = Math.max(metricBonus, 0.40);
-    }
-  }
-
-  // 3. Confusion matrix
-  const asksConfusionMatrix = /\b(?:confusion\s+matrix|matrix\s+results?)\b/i.test(qLower);
-  if (asksConfusionMatrix) {
-    if (/\b(?:confusion\s+matrix|classification\s+report)\b/i.test(content) || content.includes("[[") || content.includes("353")) {
-      metricBonus = Math.max(metricBonus, 0.45);
-    }
-  }
-
-  // 4. Input size / dimensions
-  const asksInputSize = /\b(?:input\s+size|dimensions?|image\s+size|resized\s+to|img_size)\b/i.test(qLower);
-  if (asksInputSize) {
-    if (/\b(?:224\s*x\s*224|224|input_shape|img_size)\b/i.test(content)) {
-      metricBonus = Math.max(metricBonus, 0.40);
-    }
-  }
-
-  // 5. Optimizer
-  const asksOptimizer = /\b(?:optimizer|adam)\b/i.test(qLower);
-  if (asksOptimizer) {
-    if (/\b(?:adam|optimizer)\b/i.test(content)) {
-      metricBonus = Math.max(metricBonus, 0.40);
-    }
-  }
-
-  // 6. Placements & Packages
-  const asksPlacements = /\b(?:placement|placements|package|highest\s+package|average\s+package|placed)\b/i.test(qLower);
-  if (asksPlacements) {
-    if (/\b(?:placement|package|lpa|placed)\b/i.test(content)) {
-      metricBonus = Math.max(metricBonus, 0.40);
-    }
-  }
-
-  // 7. Numeric range check (e.g. 85 in "81–90" for grade scale)
-  if (checkRangeMatch(rawQuestion, content)) {
-    metricBonus = Math.max(metricBonus, 0.45);
-  }
-
-  // Bonus for exact sub-phrase match (>= 3 words)
+  // Domain-agnostic relevance bonuses
   let phraseBonus = 0;
+  let metricBonus = 0;
+
+  // 1. Exact Continuous Phrase Matching (2 or more contiguous terms from query)
+  if (activeTerms.length >= 2) {
+    for (let i = 0; i < activeTerms.length - 1; i++) {
+      const bigram = `${activeTerms[i]} ${activeTerms[i + 1]}`;
+      if (contentLower.includes(bigram)) {
+        phraseBonus = Math.max(phraseBonus, 0.25);
+        if (i < activeTerms.length - 2) {
+          const trigram = `${bigram} ${activeTerms[i + 2]}`;
+          if (contentLower.includes(trigram)) {
+            phraseBonus = Math.max(phraseBonus, 0.35);
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Numeric range & exact number check from query
+  if (checkRangeMatch(rawQuestion, content)) {
+    metricBonus = Math.max(metricBonus, 0.35);
+  } else {
+    const numsInQ = (rawQuestion || "").match(/\b\d+\b/g) || [];
+    if (numsInQ.length > 0 && numsInQ.some((n) => content.includes(n))) {
+      metricBonus = Math.max(metricBonus, 0.20);
+    }
+  }
+
+  // 3. Exact Sub-phrase / Full Question match bonus
   if (queryTerms.length >= 3) {
     const cleanQ = rawQuestion.toLowerCase().replace(/[^a-z0-9\s]/g, " ").trim();
-    if (contentLower.includes(cleanQ)) {
-      phraseBonus = 0.20;
+    if (cleanQ.length >= 10 && contentLower.includes(cleanQ)) {
+      phraseBonus = Math.max(phraseBonus, 0.40);
     }
   }
 
@@ -373,4 +341,120 @@ export async function retrieveRelevantTextChunks(
   }
 
   return strongChunks.map(({ _isPageMatch, ...rest }) => rest);
+}
+
+/**
+ * Evaluates whether retrieved chunks contain sufficient evidence for the given question.
+ * Generic across all domains, document types, and questions.
+ *
+ * @param {Array<Object>} chunks
+ * @param {string} question
+ * @returns {{ sufficient: boolean, reason: string, coverageRatio: number, topScore: number }}
+ */
+export function isEvidenceSufficient(chunks, question) {
+  if (!chunks || !Array.isArray(chunks) || chunks.length === 0) {
+    return { sufficient: false, reason: "no_chunks", coverageRatio: 0, topScore: 0 };
+  }
+
+  const topSimilarity = Math.max(...chunks.map((c) => c.similarity || 0));
+  const topRanking = Math.max(...chunks.map((c) => c.rankingScore || 0));
+  const topScore = Math.max(topSimilarity, topRanking);
+
+  // If even the best chunk has very low similarity/ranking score
+  if (topScore < 0.48) {
+    return { sufficient: false, reason: "low_score", coverageRatio: 0, topScore };
+  }
+
+  // Extract meaningful query content terms
+  const queryTerms = extractQueryTerms(question);
+  if (queryTerms.length === 0) {
+    return { sufficient: topScore >= 0.55, reason: topScore >= 0.55 ? "sufficient" : "low_score", coverageRatio: 1, topScore };
+  }
+
+  // Check content term coverage across retrieved chunks
+  const combinedContent = chunks.map((c) => (c.content || "").toLowerCase()).join(" ");
+  let matchedCount = 0;
+  for (const term of queryTerms) {
+    if (combinedContent.includes(term)) {
+      matchedCount++;
+    } else {
+      const root = term.replace(/(?:ing|ed|es|s)$/i, "");
+      if (root.length >= 3 && combinedContent.includes(root)) {
+        matchedCount++;
+      }
+    }
+  }
+
+  const coverageRatio = matchedCount / queryTerms.length;
+
+  // Decisive sufficiency: strong score and good query term coverage
+  if (topScore >= 0.68 && coverageRatio >= 0.50) {
+    return { sufficient: true, reason: "strong_evidence", coverageRatio, topScore };
+  }
+
+  // Moderate score with at least 40% coverage
+  if (topScore >= 0.55 && coverageRatio >= 0.40) {
+    return { sufficient: true, reason: "moderate_evidence", coverageRatio, topScore };
+  }
+
+  // If coverage ratio is poor (< 35%), the chunks are likely missing the question's core subject
+  if (coverageRatio < 0.35 && topScore < 0.82) {
+    return { sufficient: false, reason: "poor_term_coverage", coverageRatio, topScore };
+  }
+
+  return { sufficient: topScore >= 0.60, reason: topScore >= 0.60 ? "score_pass" : "insufficient_coverage", coverageRatio, topScore };
+}
+
+/**
+ * Generic routing safety net.
+ * Router scoping is a targeted optimization. If the initial scoped retrieval returns
+ * zero chunks or clearly insufficient evidence, or if broad retrieval reveals significantly
+ * better evidence, automatically widen to broad retrieval.
+ *
+ * @param {number[]} queryEmbedding
+ * @param {string[]} routedDepartments
+ * @param {number} topK
+ * @param {string} question
+ * @returns {Promise<{ chunks: Array<Object>, widened: boolean }>}
+ */
+export async function retrieveWithScopeFallback(queryEmbedding, routedDepartments = [], topK = 5, question = "") {
+  // If no routed departments specified, search broadly across all documents
+  if (!routedDepartments || routedDepartments.length === 0) {
+    const broad = await retrieveRelevantTextChunks(queryEmbedding, [], topK, undefined, question);
+    return { chunks: broad, widened: false };
+  }
+
+  // 1. Scoped retrieval within the routed departments
+  const scoped = await retrieveRelevantTextChunks(queryEmbedding, routedDepartments, topK, undefined, question);
+  const scopedEval = isEvidenceSufficient(scoped, question);
+
+  // If scoped retrieval is decisively strong, preserve targeted retrieval (do not search everything)
+  if (scopedEval.sufficient && scopedEval.topScore >= 0.70 && scopedEval.coverageRatio >= 0.55) {
+    console.log(`[TextRetrieval] Scoped retrieval [${routedDepartments.join(", ")}] sufficient: top=${scopedEval.topScore.toFixed(3)}, cov=${(scopedEval.coverageRatio * 100).toFixed(0)}%`);
+    return { chunks: scoped, widened: false };
+  }
+
+  // 2. If scoped retrieval has 0 chunks, low score, or insufficient coverage:
+  // Automatically fall back to broader retrieval across all departments
+  console.log(
+    `[TextRetrieval] Scoped evidence insufficient or marginal [${routedDepartments.join(", ")}] (${scopedEval.reason}, top=${scopedEval.topScore.toFixed(3)}, cov=${(scopedEval.coverageRatio * 100).toFixed(0)}%) -> falling back to broad retrieval`
+  );
+
+  const broad = await retrieveRelevantTextChunks(queryEmbedding, [], topK, undefined, question);
+  const broadEval = isEvidenceSufficient(broad, question);
+
+  // Broad wins if scoped was empty/insufficient, OR broad has better ranking score/coverage
+  const broadIsBetter =
+    !scopedEval.sufficient ||
+    broadEval.topScore > scopedEval.topScore ||
+    (broadEval.coverageRatio > scopedEval.coverageRatio && broadEval.topScore >= scopedEval.topScore - 0.05);
+
+  if (broad.length > 0 && broadIsBetter) {
+    console.log(
+      `[TextRetrieval] Broad retrieval accepted: top=${broadEval.topScore.toFixed(3)}, cov=${(broadEval.coverageRatio * 100).toFixed(0)}% (vs scoped top=${scopedEval.topScore.toFixed(3)}, cov=${(scopedEval.coverageRatio * 100).toFixed(0)}%)`
+    );
+    return { chunks: broad, widened: true };
+  }
+
+  return { chunks: scoped, widened: false };
 }
