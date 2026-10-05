@@ -188,6 +188,8 @@ export class DriveService {
       size: stats.size,
       departmentId: departmentId,
       department: department,
+      departmentIds: departmentId ? [departmentId] : [],
+      departments: department ? [department] : [],
       isTestData: isTestData,
       status: "processing",
       source: "google-drive",

@@ -35,7 +35,10 @@ export async function retrieveRelevantImages(
   const mongoQuery = {};
 
   if (routedDepartments && routedDepartments.length > 0) {
-    mongoQuery.department = { $in: routedDepartments };
+    mongoQuery.$or = [
+      { department: { $in: routedDepartments } },
+      { departments: { $in: routedDepartments } }
+    ];
   }
 
   if (filterMeta.documentId) {
@@ -47,7 +50,7 @@ export async function retrieveRelevantImages(
   mongoQuery.isUseless = { $ne: true };
 
   let candidates = await ImageModel.find(mongoQuery)
-    .select("imageId documentId documentName pageNumber filename imagePath department embedding caption description ocrText")
+    .select("imageId documentId documentName pageNumber filename imagePath department departments embedding caption description ocrText")
     .lean();
 
       console.log(

@@ -104,7 +104,15 @@ export function chunkDocumentPages(pages, documentMeta) {
         pageNumber: page.pageNumber || 1,
         chunkIndex: globalChunkIndex++,
         content: structuredContent,
+        departmentId: documentMeta.departmentId || null,
+        departmentIds: Array.isArray(documentMeta.departmentIds) && documentMeta.departmentIds.length > 0
+          ? documentMeta.departmentIds
+          : (documentMeta.departmentId ? [documentMeta.departmentId] : []),
         department: documentMeta.department || "General",
+        departments: Array.isArray(documentMeta.departments) && documentMeta.departments.length > 0
+          ? documentMeta.departments
+          : [documentMeta.department || "General"],
+        isTestData: documentMeta.isTestData || false,
         sourceType: documentMeta.source || "upload",
         sourcePath: documentMeta.path || ""
       });

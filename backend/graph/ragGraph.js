@@ -21,10 +21,23 @@ import { verifyAnswerSupport } from "../services/hallucinationGuard.js";
 async function loadConversationHistoryNode(state) {
   const t0 = Date.now();
   let history = state.conversationHistory || [];
+  let convId = state.conversationId;
 
-  if (state.conversationId && history.length === 0) {
+  if (!convId) {
     try {
-      const recentMsgs = await Message.find({ conversationId: state.conversationId })
+      const titleSnippet = (state.originalQuestion || state.question).slice(0, 40);
+      const newConv = await Conversation.create({
+        title: titleSnippet || "New Conversation"
+      });
+      convId = newConv._id.toString();
+    } catch (err) {
+      console.warn(`[Node: loadHistory] Warning: ${err.message}`);
+    }
+  }
+
+  if (convId && history.length === 0) {
+    try {
+      const recentMsgs = await Message.find({ conversationId: convId })
         .sort({ createdAt: -1 })
         .limit(6)
         .lean();
@@ -39,7 +52,12 @@ async function loadConversationHistoryNode(state) {
     }
   }
 
+  if (convId) {
+    state.onEvent?.("conversationId", { conversationId: convId });
+  }
+
   return {
+    conversationId: convId,
     conversationHistory: history,
     originalQuestion: state.originalQuestion || state.question,
     timings: { history: Date.now() - t0 }
@@ -68,10 +86,19 @@ async function normalizeQueryNode(state) {
  */
 async function routerNode(state) {
   const t0 = Date.now();
+  state.onEvent?.("status", { message: "Searching your documents..." });
   try {
     const routeResult = await routeDepartment(state.question, state.conversationHistory);
     const duration = Date.now() - t0;
     console.log(`[Router] ${duration}ms (Type: ${routeResult.queryType}, Depts: [${routeResult.departments.join(", ")}])`);
+
+    state.onEvent?.("routed", {
+      queryType: routeResult.queryType,
+      departments: routeResult.departments,
+      candidates: routeResult.candidates,
+      confidence: routeResult.confidence,
+      duration
+    });
 
     return {
       queryType: routeResult.queryType,
@@ -82,12 +109,20 @@ async function routerNode(state) {
     };
   } catch (err) {
     console.warn(`[Node: router] Fallback triggered: ${err.message}`);
+    const duration = Date.now() - t0;
+    state.onEvent?.("routed", {
+      queryType: "document_qa",
+      departments: [],
+      candidates: [],
+      confidence: 0.5,
+      duration
+    });
     return {
       queryType: "document_qa",
       routedDepartments: [],
       routerCandidates: [],
       routerConfidence: 0.5,
-      timings: { router: Date.now() - t0 }
+      timings: { router: duration }
     };
   }
 }
@@ -100,6 +135,8 @@ async function tabularNode(state) {
   if (state.queryType !== "tabular") {
     return { tabularResult: null, timings: { tabular: 0 } };
   }
+
+  state.onEvent?.("status", { message: "Processing tabular calculations..." });
 
   const t0 = Date.now();
   try {
@@ -338,6 +375,7 @@ async function generateAnswerNode(state) {
     const gateDuration = Date.now() - tGate;
     console.log(`[Evidence Gate] ${gateDuration}ms (out_of_scope)`);
     console.log(`[Generation] 0ms`);
+    state.onEvent?.("token", { token: FALLBACK_MESSAGE });
     return {
       finalAnswer: FALLBACK_MESSAGE,
       fallbackReason: "out_of_scope",
@@ -348,10 +386,10 @@ async function generateAnswerNode(state) {
     };
   }
 
-  // Pre-LLM Evidence Sufficiency Check (lexical + semantic signal)
+  // Pre-LLM Evidence Sufficiency Check (lexical + semantic signal + coverage gate)
   const topSimilarity = Math.max(0, ...(state.retrievedChunks || []).map((c) => c.similarity || 0));
-  const evidenceMeta = { topSimilarity };
-  const gate = checkEvidenceSupportGate(state.question, state.contextPrompt, state.queryType, evidenceMeta);
+  const evidenceMeta = { topSimilarity, retrievedChunks: state.retrievedChunks };
+  const gate = await checkEvidenceSupportGate(state.question, state.contextPrompt, state.queryType, evidenceMeta);
   const gateDuration = Date.now() - tGate;
   console.log(`[Evidence Gate] ${gateDuration}ms (result=${gate.reason}, topSim=${topSimilarity.toFixed(3)})`);
 
@@ -378,6 +416,8 @@ async function generateAnswerNode(state) {
       const dept = matchingChunk?.department || (state.routedDepartments && state.routedDepartments[0]);
       const effectiveDepartments = dept ? [dept] : (state.routedDepartments || []);
 
+      state.onEvent?.("token", { token: templateAnswer });
+
       return {
         finalAnswer: templateAnswer,
         fallbackReason: null,
@@ -388,6 +428,8 @@ async function generateAnswerNode(state) {
       };
     }
   }
+
+  state.onEvent?.("status", { message: "Generating response..." });
 
   try {
     const tGen = Date.now();
@@ -414,7 +456,19 @@ async function generateAnswerNode(state) {
     let usedSources = state.sources;
     let guardMatchingChunks = usedChunks;
 
-    if (!isMissing) {
+    if (!isMissing && answerWasGenerated) {
+      // 1. Strict factual grounding check (numbers, currency, percentages, entities, code identifiers)
+      const grounding = verifyAnswerGrounding(answer, state.contextPrompt, state.question);
+      if (!grounding.valid) {
+        console.log(`[Grounding] Rejected answer: ${grounding.reason} (${(grounding.unsupported || []).join(", ")})`);
+        isMissing = true;
+        reason = grounding.reason || "unsupported_grounding";
+        answer = FALLBACK_MESSAGE;
+      }
+    }
+
+    if (!isMissing && answerWasGenerated) {
+      // 2. Sentence-level semantic support check
       const guard = await verifyAnswerSupport({
         answer,
         contextChunks: usedChunks
@@ -434,7 +488,8 @@ async function generateAnswerNode(state) {
     // Rewrite retry: run ONLY when retrieval or evidence was insufficient before any answer was generated
     if (isMissing && !answerWasGenerated && state.queryType !== "out_of_scope") {
       const tRetry = Date.now();
-      const retry = await rewriteRetry({
+      const timeoutMs = RAG_CONFIG.rewriteTimeoutMs || RAG_CONFIG.queryRewriteTimeoutMs || 5000;
+      const retryPromise = rewriteRetry({
         originalQuestion: state.originalQuestion || state.question,
         history: state.conversationHistory,
         chunks: state.retrievedChunks,
@@ -447,23 +502,32 @@ async function generateAnswerNode(state) {
           return r.answer;
         }
       });
+      const timeoutPromise = new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs));
+      const retry = await Promise.race([retryPromise, timeoutPromise]);
       retryDuration = Date.now() - tRetry;
       if (retry) {
-        const retryGuard = await verifyAnswerSupport({
-          answer: retry.answer,
-          contextChunks: retry.chunks
-        });
-
-        if (!retryGuard.accepted) {
-          answer = retryGuard.answer;
-          reason = retryGuard.fallbackReason || "unsupported_hallucination";
+        const retryGrounding = verifyAnswerGrounding(retry.answer, state.contextPrompt, state.question);
+        if (!retryGrounding.valid) {
+          answer = FALLBACK_MESSAGE;
+          reason = retryGrounding.reason || "unsupported_grounding";
           isMissing = true;
         } else {
-          answer = retryGuard.answer;
-          usedChunks = retryGuard.matchingChunks;
-          usedSources = retryGuard.sources;
-          guardMatchingChunks = retryGuard.matchingChunks;
-          isMissing = false;
+          const retryGuard = await verifyAnswerSupport({
+            answer: retry.answer,
+            contextChunks: retry.chunks
+          });
+
+          if (!retryGuard.accepted) {
+            answer = retryGuard.answer;
+            reason = retryGuard.fallbackReason || "unsupported_hallucination";
+            isMissing = true;
+          } else {
+            answer = retryGuard.answer;
+            usedChunks = retryGuard.matchingChunks;
+            usedSources = retryGuard.sources;
+            guardMatchingChunks = retryGuard.matchingChunks;
+            isMissing = false;
+          }
         }
         console.log(`[Generation Retry] ${retryDuration}ms`);
       }
@@ -501,6 +565,9 @@ async function generateAnswerNode(state) {
       }
     }
 
+    // Do NOT send answer text to UI until grounding and hallucination checks pass!
+    state.onEvent?.("token", { token: finalAnswer });
+
     console.log(`[Stage Timings] retrieval: ${state.timings?.textRetrieval || 0}ms | generation: ${genDuration}ms | retry: ${retryDuration}ms | grounding: ${groundingDuration}ms`);
 
     return {
@@ -513,6 +580,7 @@ async function generateAnswerNode(state) {
     };
   } catch (err) {
     console.error(`[Node: generateAnswer] Error: ${err.message}`);
+    state.onEvent?.("token", { token: FALLBACK_MESSAGE });
     return {
       finalAnswer: FALLBACK_MESSAGE,
       fallbackReason: "insufficient_evidence",
@@ -530,6 +598,7 @@ async function generateAnswerNode(state) {
 async function saveConversationNode(state) {
   const t0 = Date.now();
   let convId = state.conversationId;
+  let assistantMsg = null;
 
   try {
     if (!convId) {
@@ -546,7 +615,7 @@ async function saveConversationNode(state) {
       content: state.originalQuestion || state.question
     });
 
-    await Message.create({
+    assistantMsg = await Message.create({
       conversationId: convId,
       role: "assistant",
       content: state.finalAnswer,
@@ -562,9 +631,31 @@ async function saveConversationNode(state) {
   }
 
   const duration = Date.now() - t0;
-  const timings = state.timings || {};
-  const total = Object.values(timings).reduce((acc, v) => acc + (typeof v === "number" ? v : 0), 0) + duration;
+  const timings = { ...(state.timings || {}), saveConversation: duration };
+  const total = Object.values(timings).reduce((acc, v) => acc + (typeof v === "number" ? v : 0), 0);
+  timings.total = total;
   console.log(`[Total] ${total}ms`);
+
+  // Emit complete event for streaming UI
+  state.onEvent?.("complete", {
+    messageId: assistantMsg ? assistantMsg._id.toString() : null,
+    answer: state.finalAnswer,
+    fallbackReason: state.fallbackReason || null,
+    sources: state.sources || [],
+    images: state.imageCitations || [],
+    routedDepartments: state.routedDepartments || [],
+    timings
+  });
+
+  // Requirement 11: Add one log line per request showing the path taken (router -> document/tabular -> gate -> LLM or skipped -> grounding -> result).
+  const routePath = state.tabularResult && state.tabularResult.success ? "tabular" : (state.queryType === "out_of_scope" ? "out_of_scope" : "document");
+  const gateResult = state.fallbackReason === "out_of_scope" ? "out_of_scope" : (state.tabularResult ? "tabular_tool" : (state.fallbackReason?.includes("coverage") ? "fail_coverage" : (state.fallbackReason?.includes("insufficient_evidence") ? "fail_evidence" : "pass")));
+  const llmStep = (state.timings?.generation === 0 || state.tabularResult) ? "skipped" : "LLM";
+  const groundingResult = state.fallbackReason && (state.fallbackReason.includes("unsupported") || state.fallbackReason.includes("grounding")) ? "fail" : "pass";
+  const resultSummary = state.fallbackReason ? `fallback(${state.fallbackReason})` : "answer";
+  console.log(
+    `[RAG Request] router(${state.queryType}, [${(state.routedDepartments || []).join(", ")}]) -> ${routePath} -> gate(${gateResult}) -> ${llmStep} -> grounding(${groundingResult}) -> result(${resultSummary})`
+  );
 
   return {
     conversationId: convId,

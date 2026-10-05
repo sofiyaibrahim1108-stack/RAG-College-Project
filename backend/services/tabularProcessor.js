@@ -104,20 +104,40 @@ export function loadRows(doc) {
 
 export function getEntityColumn(colInfo, rows = []) {
   if (!colInfo || colInfo.length === 0) return null;
-  const byName = colInfo.find((c) => !c.isNumeric && /^(?:name|employee|student|user|person|customer|member)$/i.test(c.name));
-  if (byName) return byName;
-  const bySub = colInfo.find((c) => !c.isNumeric && /name|employee|student|user|person|customer/i.test(c.name));
-  if (bySub) return bySub;
-  const minDistinct = 4;
-  const found = colInfo.find(
-    (c) =>
-      !c.isNumeric &&
-      c.distinct &&
-      c.distinct.length >= Math.min(minDistinct, rows.length) &&
-      (rows.length === 0 || c.distinct.length / rows.length >= 0.6)
-  );
-  if (found) return found;
-  return colInfo.find((c) => !c.isNumeric) || colInfo[0];
+  const nonNumeric = colInfo.filter((c) => !c.isNumeric);
+  if (nonNumeric.length === 0) return colInfo[0];
+
+  const minRatio = RAG_CONFIG.contextMinScoreRatio ?? 0.6;
+  const minDistinct = RAG_CONFIG.entityColumnMinDistinct ?? 8;
+  const rowCount = rows.length;
+
+  let bestCol = null;
+  let bestRatio = -1;
+
+  for (const col of nonNumeric) {
+    const distinctCount = Array.isArray(col.distinct) ? col.distinct.length : 0;
+    const ratio = rowCount > 0 ? distinctCount / rowCount : 1;
+    if (distinctCount >= Math.min(minDistinct, rowCount) && ratio >= minRatio) {
+      if (ratio > bestRatio) {
+        bestRatio = ratio;
+        bestCol = col;
+      }
+    }
+  }
+
+  if (bestCol) return bestCol;
+
+  // Fallback to non-numeric column with highest distinct ratio, ties broken by column order
+  for (const col of nonNumeric) {
+    const distinctCount = Array.isArray(col.distinct) ? col.distinct.length : 0;
+    const ratio = rowCount > 0 ? distinctCount / rowCount : 0;
+    if (ratio > bestRatio) {
+      bestRatio = ratio;
+      bestCol = col;
+    }
+  }
+
+  return bestCol || nonNumeric[0];
 }
 
 function escRe(s) {
@@ -195,47 +215,35 @@ function normalizeOp(opStr) {
 }
 
 /**
- * Generic domain-agnostic function words & query conversational filler terms.
+ * Standard English grammatical stop words (no domain, operator or column-like words).
  */
 export const QUERY_FUNCTION_WORDS = new Set([
-  "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-  "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
-  "being", "have", "has", "had", "do", "does", "did", "it", "its",
-  "this", "that", "these", "those", "i", "me", "my", "we", "our",
-  "you", "your", "he", "she", "they", "them", "their", "who", "whom",
-  "whose", "which", "what", "when", "where", "how", "why",
-  "would", "could", "should", "will", "can", "may", "might",
-  "so", "if", "as", "up", "out", "about", "also", "then", "both",
-  "all", "each", "every", "than", "into", "wanto", "want", "know",
-  "tell", "show", "give", "find", "get", "list", "please", "mark",
-  "marks", "score", "scores", "student", "students", "record",
-  "records", "row", "rows", "value", "values", "data", "table",
-  "details", "information", "info", "person", "people",
-  "class", "classes", "batch", "batches", "course", "courses",
-  "section", "sections", "dataset", "datasets", "school", "college",
-  "university", "many", "much", "overall", "across", "among", "between",
-  "employee", "employees", "staff", "worker", "workers", "member", "members", "there", "got"
+  "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "aren't",
+  "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
+  "can", "can't", "cannot", "could", "couldn't", "did", "didn't", "do", "does", "doesn't", "doing",
+  "don't", "down", "during", "each", "few", "for", "from", "further", "had", "hadn't", "has", "hasn't",
+  "have", "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here", "here's", "hers", "herself",
+  "him", "himself", "his", "how", "how's", "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is",
+  "isn't", "it", "it's", "its", "itself", "let's", "me", "more", "most", "mustn't", "my", "myself",
+  "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other", "ought", "our", "ours",
+  "ourselves", "out", "over", "own", "same", "shan't", "she", "she'd", "she'll", "she's", "should",
+  "shouldn't", "so", "some", "such", "than", "that", "that's", "the", "their", "theirs", "them",
+  "themselves", "then", "there", "there's", "these", "they", "they'd", "they'll", "they're", "they've",
+  "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "wasn't", "we",
+  "we'd", "we'll", "we're", "we've", "were", "weren't", "what", "what's", "when", "when's", "where",
+  "where's", "which", "while", "who", "who's", "whom", "why", "why's", "with", "won't", "would",
+  "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours", "yourself", "yourselves",
+  "across", "among", "per"
 ]);
 
 /**
- * Common query operators, ordinals, and comparison words that are consumed by query plans.
+ * Hand-written operator list removed in favor of embedding classification and dynamic schema matching.
+ * Exported empty to preserve public interface compatibility.
  */
-export const QUERY_OPERATOR_WORDS = new Set([
-  "above", "greater", "more", "higher", "over", "exceeding", "exceeds",
-  "below", "less", "lower", "under", "fewer", "least", "most",
-  "equal", "equals", "average", "mean", "avg", "sum", "total",
-  "count", "percentage", "percent", "distribution", "min", "minimum",
-  "lowest", "bottom", "max", "maximum", "highest", "top", "rank",
-  "ranked", "order", "ordered", "first", "1st", "second", "2nd",
-  "third", "3rd", "fourth", "4th", "fifth", "5th", "sixth", "6th",
-  "seventh", "7th", "eighth", "8th", "ninth", "9th", "tenth", "10th",
-  "sort", "sorted", "sorting", "asc", "desc", "ascending", "descending",
-  "difference", "range", "spread", "median", "compare", "comparison", "versus", "vs"
-]);
+export const QUERY_OPERATOR_WORDS = new Set();
 
 /**
- * Personal pronouns (the same set the parser already used inline for its follow-up guard,
- * now defined once). Used to detect unresolved follow-ups and to treat pronouns as filler.
+ * Personal pronouns.
  */
 export const QUERY_PRONOUNS = new Set(["he", "she", "they", "his", "her", "their", "him", "them", "it"]);
 const PRONOUN_RE = new RegExp(`\\b(?:${[...QUERY_PRONOUNS].join("|")})\\b`, "i");
@@ -336,15 +344,10 @@ export function isFillerToken(token) {
   if (!t) return true;
   if (/^\d+(\.\d+)?$/.test(t)) return true;
   if (QUERY_PRONOUNS.has(t)) return true;
+  if (QUERY_FUNCTION_WORDS.has(t)) return true;
   const ts = stemWord(t);
-  for (const set of [QUERY_FUNCTION_WORDS, QUERY_OPERATOR_WORDS]) {
-    if (set.has(t)) return true;
-    for (const w of set) {
-      if (stemWord(w) === ts) return true;
-      if (t.length >= 5 && w.length >= 5 && Math.abs(t.length - w.length) <= 1 && editDistance(t, w) <= 1) {
-        return true;
-      }
-    }
+  for (const w of QUERY_FUNCTION_WORDS) {
+    if (stemWord(w) === ts) return true;
   }
   return false;
 }
@@ -406,6 +409,91 @@ export function resolveEntityFromHistory(history, colInfo, rows = []) {
 }
 
 /**
+ * Short descriptions of supported operations for embedding-based classification.
+ * These define the code's computational contract, not domain vocabulary.
+ */
+export const OPERATION_DESCRIPTIONS = {
+  average: "calculate the average, mean, or typical value of a numeric column",
+  sum: "calculate the total sum or aggregate amount of a numeric column",
+  count: "count the total number of items, rows, or records",
+  min: "find the lowest, smallest, least, or minimum value",
+  max: "find the highest, greatest, largest, or maximum value",
+  median: "find the median or middle value of a numeric column",
+  top_n: "find the top, leading, or highest n items ranked by value",
+  bottom_n: "find the bottom, worst, or lowest n items ranked by value",
+  filter: "filter rows or find which records match specific conditions",
+  lookup: "look up specific attributes or column values for an entity",
+  sort: "sort or order rows by column values ascending or descending",
+  difference: "calculate the difference or spread between values or extreme values",
+  compare: "compare values across entities or columns",
+  percentage: "calculate percentage, proportion, or share",
+  distribution: "distribution or breakdown of records across categories",
+  group_by: "group records by category and summarize each group",
+  rank: "rank or find the position of items"
+};
+
+let operationEmbeddingCache = null;
+
+export async function getOperationEmbeddings() {
+  if (operationEmbeddingCache) return operationEmbeddingCache;
+  const cache = new Map();
+  for (const [op, desc] of Object.entries(OPERATION_DESCRIPTIONS)) {
+    try {
+      const emb = await generateTextEmbedding(desc);
+      if (emb) cache.set(op, emb);
+    } catch (e) {
+      console.warn(`[Tabular Processor] Failed to embed operation "${op}": ${e.message}`);
+    }
+  }
+  operationEmbeddingCache = cache;
+  return cache;
+}
+
+export async function classifyOperationByEmbedding(question) {
+  if (!question) return { operation: null, escalateToLlm: true, reason: "empty question" };
+  const opMap = await getOperationEmbeddings();
+  if (!opMap || opMap.size === 0) return { operation: null, escalateToLlm: true, reason: "no operation embeddings" };
+
+  let qEmb;
+  try {
+    qEmb = await generateTextEmbedding(question);
+  } catch (err) {
+    return { operation: null, escalateToLlm: true, reason: `Embedding failed: ${err.message}` };
+  }
+  if (!qEmb) return { operation: null, escalateToLlm: true, reason: "no question embedding" };
+
+  const scored = [];
+  for (const [op, emb] of opMap.entries()) {
+    const sim = cosineSimilarity(qEmb, emb);
+    scored.push({ op, sim });
+  }
+  scored.sort((a, b) => b.sim - a.sim);
+
+  const top = scored[0];
+  const second = scored[1];
+  const closeRatio = RAG_CONFIG.routerCloseScoreRatio ?? 0.80;
+  const minThreshold = RAG_CONFIG.textSimilarityThreshold ?? 0.48;
+
+  const isClose = second && top.sim > 0 && (second.sim / top.sim >= closeRatio);
+
+  if (top.sim < minThreshold || isClose) {
+    return {
+      operation: top.op,
+      escalateToLlm: true,
+      reason: isClose
+        ? `Ambiguous operation: top "${top.op}" (${top.sim.toFixed(3)}) and second "${second.op}" (${second.sim.toFixed(3)}) margin below threshold`
+        : `Low confidence operation: "${top.op}" similarity (${top.sim.toFixed(3)}) below threshold`
+    };
+  }
+
+  return {
+    operation: top.op,
+    escalateToLlm: false,
+    similarity: top.sim
+  };
+}
+
+/**
  * Requirement 1: Computes plan coverage.
  * Determines which content tokens of the question were NOT consumed by the plan.
  *
@@ -418,7 +506,7 @@ export function resolveEntityFromHistory(history, colInfo, rows = []) {
  *         content word, since the question can only be asking for an attribute of that entity.
  *       The plan must never silently drop these.
  */
-export function checkPlanCoverage(question, plan, colInfo, rows = []) {
+export async function checkPlanCoverage(question, plan, colInfo, rows = []) {
   if (!question || !plan) {
     return {
       isComplete: false,
@@ -486,19 +574,23 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
     consumedTokens.add(String(plan.operation).toLowerCase());
   }
 
-  // Entity-scoped plan: filter / lookup where an equality filter hits a column whose values
-  // are (nearly) unique per row, derived from the data (e.g. Name / ID), not from column names.
+  // Aggregate & ranking plans that scan all rows:
+  // a noun in the question that matches a row-identifying column (values ~unique per row, derived from the data)
+  // is explained by the plan, so it is consumed without triggering LLM escalation.
+  const isAllRowScanPlan = ["max", "min", "top_n", "bottom_n", "sum", "average", "median", "count"].includes(plan.operation) &&
+    !(Array.isArray(plan.filters) && plan.filters.some((f) => f && f.op === "eq"));
+  const minRatio = RAG_CONFIG.contextMinScoreRatio ?? 0.6;
   const minDistinct = RAG_CONFIG.entityColumnMinDistinct ?? 8;
-  const entityScoped =
-    (plan.operation === "filter" || plan.operation === "lookup") &&
-    Array.isArray(plan.filters) &&
-    plan.filters.some((f) => {
-      if (!f || f.op !== "eq") return false;
-      const col = colInfo.find((c) => c.name === f.column);
-      if (!col || col.isNumeric || !col.distinct) return false;
-      const uniqueRatio = rows.length > 0 ? col.distinct.length / rows.length : 1;
-      return col.distinct.length >= minDistinct && uniqueRatio >= 0.8;
-    });
+  const isRowIdentifyingColumn = (colName) => {
+    const col = colInfo.find((c) => c.name === colName);
+    if (!col || col.isNumeric || !col.distinct) return false;
+    const ratio = rows.length > 0 ? col.distinct.length / rows.length : 1;
+    return col.distinct.length >= Math.min(minDistinct, rows.length) && ratio >= minRatio;
+  };
+
+  // Operation embedding for similarity-based token consumption
+  const opMap = await getOperationEmbeddings();
+  const opEmb = plan.operation ? opMap.get(plan.operation) : null;
 
   // Find unconsumed content tokens
   const unconsumedTokens = [];
@@ -527,19 +619,46 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
     }
     if (isConsumedByStem) continue;
 
-    // 3. Is it an operator word?
-    if (QUERY_OPERATOR_WORDS.has(token)) continue;
-
-    // 4. Is it a generic function / stopword or morphological filler?
+    // 3. Is it a standard stopword or filler?
     if (QUERY_FUNCTION_WORDS.has(token) || isFillerToken(token)) continue;
 
-    // 5. This is an unconsumed content token!
-    // Check if it plausibly refers to schema columns or row values
+    // 4. Is it explained by the chosen operation (embedding similarity)?
+    if (plan.operation) {
+      if (token === plan.operation || stemWord(token) === stemWord(plan.operation)) continue;
+      if (opEmb && token.length >= 3) {
+        try {
+          const tEmb = await generateTextEmbedding(token);
+          if (tEmb && cosineSimilarity(tEmb, opEmb) >= (RAG_CONFIG.termEmbeddingMinSim ?? 0.50)) {
+            continue;
+          }
+        } catch {
+          // ignore embedding error
+        }
+      }
+    }
+
+    // 5. Check if it plausibly refers to schema columns or row values
     const match = checkPlausibleSchemaMatch(token, colInfo, rows);
+
+    // 5b. Row-identifying column selector of a ranking or all-row aggregate plan
+    if (isAllRowScanPlan && match && match.type !== "row_value" && isRowIdentifyingColumn(match.match)) {
+      continue;
+    }
+
     unconsumedTokens.push({ token, plausibleMatch: match || null });
 
     // 6. Matches nothing in the schema, and the question is about one entity:
-    //    this word is the attribute being asked for (unless it is a morphological filler variant).
+    const entityScoped =
+      (plan.operation === "filter" || plan.operation === "lookup") &&
+      Array.isArray(plan.filters) &&
+      plan.filters.some((f) => {
+        if (!f || f.op !== "eq") return false;
+        const col = colInfo.find((c) => c.name === f.column);
+        if (!col || col.isNumeric || !col.distinct) return false;
+        const uniqueRatio = rows.length > 0 ? col.distinct.length / rows.length : 1;
+        return col.distinct.length >= (RAG_CONFIG.entityColumnMinDistinct ?? 8) && uniqueRatio >= minRatio;
+      });
+
     if (!match && entityScoped && token.length >= 3 && !isFillerToken(token)) {
       suspectIdx.push(i);
     }
@@ -576,10 +695,21 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
   entityMisses.forEach(pushUnique);
 
   const plausibleUnconsumed = unconsumedTokens.filter((u) => u.plausibleMatch !== null);
-  const isComplete = plausibleUnconsumed.length === 0 && unresolvedAttributes.length === 0;
+
+  // Aggregate plans need the metric column to be named by the question. If the parser had to
+  // default to some numeric column and other content words remain unexplained, do not trust it.
+  let targetNotMentioned = false;
+  if (["max", "min", "average", "sum", "median"].includes(plan.operation) && plan.targetColumn && unconsumedTokens.length > 0) {
+    targetNotMentioned = !qTokens.some((t) => matchTokenToColumn(t, plan.targetColumn) ||
+      String(plan.targetColumn).toLowerCase().split(/[_\-\s]+/).some((st) => st.length >= 3 && stemWord(t) === stemWord(st)));
+  }
+
+  const isComplete = plausibleUnconsumed.length === 0 && unresolvedAttributes.length === 0 && !targetNotMentioned;
 
   let reason = "All content tokens consumed by plan";
-  if (plausibleUnconsumed.length > 0) {
+  if (targetNotMentioned) {
+    reason = `Target column ${plan.targetColumn} is not referenced by the question; unexplained terms: ${unconsumedTokens.map((u) => u.token).join(", ")}`;
+  } else if (plausibleUnconsumed.length > 0) {
     reason = `Unconsumed tokens with plausible schema match: ${plausibleUnconsumed.map((u) => `${u.token} -> ${u.plausibleMatch.match}`).join(", ")}`;
   } else if (unresolvedAttributes.length > 0) {
     reason = `Requested attribute(s) not found in schema: ${unresolvedAttributes.join(", ")}`;
@@ -587,6 +717,7 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
 
   return {
     isComplete,
+    targetNotMentioned,
     unconsumedTokens,
     plausibleUnconsumed,
     unresolvedAttributes,
@@ -598,7 +729,7 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
  * Fast deterministic parser for structured queries.
  * Identifies column names, comparison operators, thresholds, and target operations directly from table schema.
  */
-export function parseDeterministicQueryPlan(question, colInfo, rows = [], history = []) {
+export async function parseDeterministicQueryPlan(question, colInfo, rows = [], history = []) {
   if (!question || !colInfo || colInfo.length === 0) return null;
   let q = question.trim();
 
@@ -636,78 +767,31 @@ export function parseDeterministicQueryPlan(question, colInfo, rows = [], histor
   }
   foundCols.sort((a, b) => a.index - b.index);
 
-  // Check if query asks for a column with words like "mark", "score", "rate"
-  const unknownColMatch = /\b([a-zA-Z]{3,})\s+(?:mark|marks|score|scores)\b/i.exec(q);
-  if (unknownColMatch) {
-    const cand = unknownColMatch[1];
-    const closest = findClosestColumn(cand, colInfo);
-    if (closest && !seenCols.has(closest.name)) {
-      foundCols.push({ col: closest, index: unknownColMatch.index, length: cand.length, matchedText: cand });
-      seenCols.add(closest.name);
-      foundCols.sort((a, b) => a.index - b.index);
-    } else if (!colInfo.some(c => matchTokenToColumn(cand, c.name)) &&
-        !QUERY_FUNCTION_WORDS.has(cand.toLowerCase()) &&
-        !QUERY_OPERATOR_WORDS.has(cand.toLowerCase())) {
-      if (foundCols.length === 0) {
-        return {
-          operation: "column_not_found",
-          missingColumn: cand,
-          columns: colInfo.map(c => c.name),
-          reason: `Column "${cand}" not in schema`,
-          isComplete: true
-        };
-      }
-    }
-  }
-
-  // 2. Identify operation
+  // 2. Identify operation using embedding-based classification
   let operation = null;
   let subOperation = null;
   let limit = null;
   let rankIndex = null;
-  let sortOrder = /\b(?:ascending|asc|lowest\s+first|least\s+first)\b/i.test(q) ? "asc" : "desc";
+  let sortOrder = /\b(?:ascending|asc)\b/i.test(q) ? "asc" : "desc";
   let groupColumn = null;
 
-  const topNMatch = /\b(?:top|best|highest|leading)\s*(\d+)\b/i.exec(q);
-  const bottomNMatch = /\b(?:bottom|worst|lowest)\s*(\d+)\b/i.exec(q);
-  const diffMatch = /\b(?:difference(?:\s+between)?|range(?:\s+of)?|spread(?:\s+of)?)\b/i.exec(q);
-  const compareMatch = /\b(?:compare|comparison|versus|vs\.?)\b/i.exec(q);
-  const groupByMatch = /\b(?:by|per|for\s+each|grouped\s+by)\s+([a-zA-Z0-9_\-]+)\b/i.exec(q);
+  const classification = await classifyOperationByEmbedding(q);
+  if (classification.escalateToLlm) {
+    return null;
+  }
+  operation = classification.operation;
 
-  if (diffMatch) {
-    operation = "difference";
-  } else if (compareMatch) {
-    operation = "compare";
-  } else if (topNMatch) {
-    operation = "top_n";
-    limit = parseInt(topNMatch[1], 10);
-    sortOrder = "desc";
-  } else if (bottomNMatch) {
-    operation = "bottom_n";
-    limit = parseInt(bottomNMatch[1], 10);
-    sortOrder = "asc";
-  } else if (/\b(?:sort|sorted|sorting|order(?:ed)?\s+(?:(?:all\s+|the\s+)?[a-zA-Z]+\s+)?by)\b/i.test(q)) {
-    operation = "sort";
-  } else if (/\bmedian\b/i.test(q)) {
-    operation = "median";
-  } else if (groupByMatch && colInfo.some(c => !c.isNumeric && matchTokenToColumn(groupByMatch[1], c.name))) {
-    operation = "group_by";
-    const matchedCol = colInfo.find(c => !c.isNumeric && matchTokenToColumn(groupByMatch[1], c.name));
-    groupColumn = matchedCol.name;
-  } else if (/\b(?:percentage|percent|%|proportion|fraction)\b/i.test(q)) {
-    operation = "percentage";
-  } else if (/\b(?:how\s+many|count(?:\s+of)?|number\s+of|total\s+number\s+of|total\s+(?:students?|employees?|records?|rows?|people))\b/i.test(q)) {
-    operation = "count";
-  } else if (/\b(?:highest|maximum|max|top|greatest|most|best|who\s+scored\s+highest)\b/i.test(q)) {
-    operation = "max";
-  } else if (/\b(?:lowest|minimum|min|least|bottom|worst)\b/i.test(q)) {
-    operation = "min";
-  } else if (/\b(?:average|mean|avg)\b/i.test(q)) {
-    operation = "average";
-  } else if (/\b(?:sum(?:\s+of)?|total\s+sum|total\b)\b/i.test(q)) {
-    operation = "sum";
-  } else if (/\b(?:which|who|list|names?\s+of|find|show|give\s+me)\b/i.test(q)) {
-    operation = "filter";
+  if (operation === "top_n" || operation === "bottom_n") {
+    const numMatch = /\b\d+\b/.exec(q);
+    limit = numMatch ? parseInt(numMatch[0], 10) : 5;
+    sortOrder = operation === "bottom_n" ? "asc" : "desc";
+  } else if (operation === "sort") {
+    if (/\b(?:ascending|asc)\b/i.test(q)) sortOrder = "asc";
+    else if (/\b(?:descending|desc)\b/i.test(q)) sortOrder = "desc";
+  } else if (operation === "group_by") {
+    const nonNumericCols = colInfo.filter((c) => !c.isNumeric);
+    const matchedCol = nonNumericCols.find((c) => matchTokenToColumn(c.name, q) || q.toLowerCase().includes(c.name.toLowerCase()));
+    if (matchedCol) groupColumn = matchedCol.name;
   }
 
   // 3. Extract filters & entity matches
@@ -775,15 +859,6 @@ export function parseDeterministicQueryPlan(question, colInfo, rows = [], histor
     }
   }
 
-  // If question asked for "failed" / "failing" and Status column exists with Pass/Fail:
-  if (/\b(?:failed|failing|fails?)\b/i.test(q) && !filters.some(f => f.column === "Status")) {
-    const statusCol = colInfo.find(c => /status/i.test(c.name));
-    if (statusCol && statusCol.distinct.some(d => /fail/i.test(d))) {
-      const failVal = statusCol.distinct.find(d => /fail/i.test(d));
-      filters.push({ column: statusCol.name, op: "eq", value: failVal });
-    }
-  }
-
   // Check if question asked for an unknown entity (e.g. "Bruce Wayne" when not in dataset)
   if (matchedEntities.length === 0 && /\b(?:for|of|is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/.test(q)) {
     const unknownEntity = /\b(?:for|of|is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/.exec(q)[1];
@@ -800,16 +875,13 @@ export function parseDeterministicQueryPlan(question, colInfo, rows = [], histor
   let targetColumns = [];
   const numericFound = foundCols.filter((fc) => fc.col.isNumeric);
 
-  // If exactly 1 entity is matched AND operation is not an aggregation/diff/compare:
-  if (matchedEntities.length === 1 && !["difference", "compare", "top_n", "bottom_n", "sort"].includes(operation)) {
+  // If exactly 1 entity is matched AND operation is filter or not specified:
+  if (matchedEntities.length === 1 && (!operation || operation === "filter")) {
     operation = "lookup";
   }
 
   if (operation === "difference") {
-    if (/\b(?:highest|max)\b.*\b(?:lowest|min)\b|\b(?:lowest|min)\b.*\b(?:highest|max)\b/i.test(q)) {
-      subOperation = "max_min";
-      targetColumn = numericFound[0]?.col.name || colInfo.find(c => c.isNumeric)?.name;
-    } else if (matchedEntities.length === 1 && numericFound.length >= 2) {
+    if (matchedEntities.length === 1 && numericFound.length >= 2) {
       subOperation = "two_columns";
       targetColumns = [numericFound[0].col.name, numericFound[1].col.name];
     } else if (matchedEntities.length >= 2 && numericFound.length >= 1) {
@@ -817,7 +889,7 @@ export function parseDeterministicQueryPlan(question, colInfo, rows = [], histor
       targetColumn = numericFound[0].col.name;
     } else {
       subOperation = "max_min";
-      targetColumn = numericFound[0]?.col.name || colInfo.find(c => c.isNumeric)?.name;
+      targetColumn = numericFound[0]?.col.name || null;
     }
   } else if (operation === "compare") {
     if (matchedEntities.length === 1 && numericFound.length >= 2) {
@@ -830,7 +902,8 @@ export function parseDeterministicQueryPlan(question, colInfo, rows = [], histor
       targetColumns = numericFound.map(fc => fc.col.name);
     }
   } else if (operation === "top_n" || operation === "bottom_n") {
-    targetColumn = numericFound[0]?.col.name || colInfo.find(c => c.isNumeric && /total|score|mark|average|salary|rating|revenue/i.test(c.name))?.name || colInfo.find(c => c.isNumeric)?.name;
+    targetColumn = numericFound[0]?.col.name || null;
+    targetColumns = targetColumn ? [targetColumn] : [];
   } else if (operation === "lookup") {
     targetColumns = foundCols.filter(fc => fc.col.name !== entityCol?.name).map(fc => fc.col.name);
     if (targetColumns.length === 0) {
@@ -838,21 +911,16 @@ export function parseDeterministicQueryPlan(question, colInfo, rows = [], histor
     }
     targetColumn = targetColumns[0];
   } else if (["average", "sum", "min", "max", "median"].includes(operation)) {
-    const opColMatch = (c) => {
-      const cLower = c.name.toLowerCase();
-      if (operation === "average" && /average|mean|avg/.test(cLower)) return true;
-      if (operation === "sum" && /sum|total/.test(cLower)) return true;
-      return false;
-    };
-    const specificNumeric = numericFound.filter((fc) => !opColMatch(fc.col));
-    const target = specificNumeric.length > 0 ? specificNumeric[0].col : (numericFound[0]?.col || colInfo.find(c => c.isNumeric));
-    if (target) {
-      targetColumns = [target.name];
-      targetColumn = target.name;
+    if (numericFound.length > 0) {
+      targetColumn = numericFound[0].col.name;
+      targetColumns = [targetColumn];
+    } else {
+      targetColumn = null;
+      targetColumns = [];
     }
   } else if (operation === "sort") {
-    targetColumn = numericFound[0]?.col.name || colInfo.find(c => c.isNumeric)?.name || colInfo[0]?.name;
-    targetColumns = [targetColumn];
+    targetColumn = numericFound[0]?.col.name || null;
+    targetColumns = targetColumn ? [targetColumn] : [];
   } else if (operation === "group_by") {
     targetColumn = numericFound[0]?.col.name || null;
   } else if (operation === "count") {
@@ -867,10 +935,6 @@ export function parseDeterministicQueryPlan(question, colInfo, rows = [], histor
     if (filters.length > 0) {
       operation = "filter";
       targetColumn = entityCol?.name || colInfo[0]?.name;
-      targetColumns = [targetColumn];
-    } else if (numericFound.length === 1) {
-      operation = "average";
-      targetColumn = numericFound[0].col.name;
       targetColumns = [targetColumn];
     }
   }
@@ -1081,15 +1145,13 @@ export function validateSemanticPlan(plan, colInfo, rows) {
 
   let validatedTarget = validatedColumns[0] || null;
 
-  const needsNumeric = ["average", "sum", "min", "max", "median"].includes(normalizedOp);
+  const needsNumeric = ["average", "sum", "min", "max", "median", "top_n", "bottom_n", "sort", "rank"].includes(normalizedOp);
   if (needsNumeric) {
     if (!validatedTarget) {
-      validatedTarget = colInfo.find((c) => c.isNumeric) || null;
-    }
-    if (!validatedTarget) {
+      const numCols = colInfo.filter((c) => c.isNumeric).map((c) => c.name);
       return {
         valid: false,
-        reason: plan.reason || `operation "${normalizedOp}" requires a valid numeric column from the schema, none resolved`
+        reason: `Please specify which column you want to query. Available numeric columns: ${numCols.join(", ")}`
       };
     }
     if (!validatedTarget.isNumeric) {
@@ -1100,18 +1162,13 @@ export function validateSemanticPlan(plan, colInfo, rows) {
     }
   }
 
-  if (["top_n", "bottom_n"].includes(normalizedOp)) {
-    if (!validatedTarget) {
-      validatedTarget = colInfo.find((c) => c.isNumeric && /total|score|mark|average|salary|rating/i.test(c.name)) ||
-                        colInfo.find((c) => c.isNumeric) ||
-                        colInfo[0];
-    }
-  }
-
   if (["difference", "compare"].includes(normalizedOp)) {
     if (!validatedTarget && validatedColumns.length === 0) {
-      validatedTarget = colInfo.find((c) => c.isNumeric) || colInfo[0];
-      if (validatedTarget) validatedColumns.push(validatedTarget);
+      const numCols = colInfo.filter((c) => c.isNumeric).map((c) => c.name);
+      return {
+        valid: false,
+        reason: `Please specify which column you want to compare or differentiate. Available numeric columns: ${numCols.join(", ")}`
+      };
     }
   }
 
@@ -1135,28 +1192,7 @@ export function validateSemanticPlan(plan, colInfo, rows) {
   }
 
   if (normalizedOp === "filter" && !validatedTarget) {
-    validatedTarget = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) ||
-                      colInfo.find((c) => !c.isNumeric) ||
-                      colInfo[0];
-  }
-
-  if (normalizedOp === "sort") {
-    if (!validatedTarget) {
-      validatedTarget = colInfo.find((c) => c.isNumeric && /total|score|mark|average/i.test(c.name)) ||
-                        colInfo.find((c) => c.isNumeric) ||
-                        colInfo[0];
-    }
-  }
-
-  if (normalizedOp === "rank") {
-    if (!validatedTarget) {
-      validatedTarget = colInfo.find((c) => c.isNumeric && /total|score|mark|amount|revenue/i.test(c.name)) ||
-                        colInfo.find((c) => c.isNumeric) ||
-                        colInfo[0];
-    }
-    if (!validatedTarget || !validatedTarget.isNumeric) {
-      return { valid: false, reason: "rank operation requires a numeric column in table schema" };
-    }
+    validatedTarget = getEntityColumn(colInfo, rows) || colInfo[0];
   }
 
   // 3. Validate filters strictly against real columns and dataset values
@@ -1234,8 +1270,8 @@ export function applyFilters(rows, filters) {
     byCol.get(f.column).push(f);
   }
   return rows.filter((row) =>
-    [...byCol.entries()].every(([col, fs]) =>
-      fs.some((f) => {
+    [...byCol.entries()].every(([col, colFilters]) =>
+      colFilters.some((f) => {
         if (f.op === "eq") return String(row[col] ?? "").trim().toLowerCase() === String(f.value).toLowerCase();
         const n = parseNum(row[col]);
         if (n === null) return false;
@@ -1266,24 +1302,24 @@ export function describeFilters(filters) {
  * Returns close candidates by token overlap / edit distance against the real column values.
  */
 export function findEntityMiss(question, colInfo, rows, targetColumn = null) {
-  const minDistinct = RAG_CONFIG.entityColumnMinDistinct ?? 8;
   const minTokenLen = RAG_CONFIG.fuzzyMinTokenLength ?? 4;
   const maxEdit = RAG_CONFIG.fuzzyMaxEditDistance ?? 1;
   const maxSuggestions = RAG_CONFIG.fuzzyMaxSuggestions ?? 3;
 
-  const entityCol = colInfo
-    .filter((c) => !c.isNumeric && c.distinct.length >= minDistinct && c.distinct.every((v) => /^[\p{L}\s.'-]+$/u.test(v)))
-    .sort((a, b) => b.distinct.length - a.distinct.length)[0];
-  if (!entityCol) return null;
+  const entityCol = getEntityColumn(colInfo, rows);
+  if (!entityCol || !Array.isArray(entityCol.distinct) || entityCol.distinct.length === 0) return null;
 
-  const qTokens = (question.match(/\p{L}+/gu) || [])
-    .filter((t) => t.length >= minTokenLen && !colInfo.some((c) => matchTokenToColumn(t, c.name)));
+  const qTokens = (String(question || "").match(/\p{L}+/gu) || [])
+    .filter((t) => t.length >= minTokenLen && !isFillerToken(t) && !colInfo.some((c) => matchTokenToColumn(t, c.name)));
   if (qTokens.length === 0) return null;
 
   const scored = [];
   const matchedQTokens = new Set();
   for (const value of entityCol.distinct) {
-    const nameTokens = value.toLowerCase().split(/[\s.'-]+/).filter(Boolean);
+    if (value === null || value === undefined) continue;
+    const strVal = String(value).trim();
+    if (!strVal) continue;
+    const nameTokens = strVal.toLowerCase().split(/[\s.'-]+/).filter(Boolean);
     let matched = 0;
     let editSum = 0;
     const used = [];
@@ -1296,7 +1332,7 @@ export function findEntityMiss(question, colInfo, rows, targetColumn = null) {
       }
       if (best) { matched++; editSum += best.d; used.push(best.qt); }
     }
-    if (matched > 0) scored.push({ value, matched, ratio: matched / nameTokens.length, editSum, used });
+    if (matched > 0 && nameTokens.length > 0) scored.push({ value: strVal, matched, ratio: matched / nameTokens.length, editSum, used });
   }
   if (scored.length === 0) return null;
 
@@ -1304,11 +1340,12 @@ export function findEntityMiss(question, colInfo, rows, targetColumn = null) {
   const top = scored.slice(0, maxSuggestions);
   top.forEach((s) => s.used.forEach((u) => matchedQTokens.add(u)));
   const mentioned = qTokens.filter((t) => matchedQTokens.has(t)).join(" ");
+  if (!mentioned) return null;
 
   const targetCol = targetColumn ? colInfo.find((c) => c.name === targetColumn && c.isNumeric) : null;
   const labelled = top.map((s) => {
-    const row = rows.find((r) => String(r[entityCol.name]).trim() === s.value);
-    return targetCol && row ? `${s.value} (${row[targetCol.name]})` : s.value;
+    const row = rows.find((r) => String(r[entityCol.name] ?? "").trim().toLowerCase() === s.value.toLowerCase());
+    return targetCol && row && row[targetCol.name] !== undefined ? `${s.value} (${row[targetCol.name]})` : s.value;
   });
   const message = `I couldn't find ${mentioned}. Did you mean ${labelled.join(" or ")}?`;
   return { column: entityCol.name, message, candidates: top.map((s) => s.value) };
@@ -1333,199 +1370,222 @@ export function buildColumnNotFoundMessage(unresolvedAttributes, documentName, c
  *        follow-ups that name no entity (e.g. "her average").
  */
 export async function processTabularQuery(question = "", targetDepartments = [], targetDocuments = [], fallbackQuestion = "", history = []) {
-  const baseQuery = { fileType: { $in: ["csv", "xlsx", "xls"] }, status: "completed" };
-  let docs = [];
-  if (targetDepartments && targetDepartments.length > 0) {
-    docs = await Document.find({ ...baseQuery, department: { $in: targetDepartments } }).sort({ createdAt: -1 }).lean();
-  }
-  if (docs.length === 0) {
-    docs = await Document.find(baseQuery).sort({ createdAt: -1 }).lean();
-  }
-  docs = docs.filter((d) => d.path && fs.existsSync(d.path));
-  if (docs.length === 0) {
-    return { success: false, error: "No tabular document found in uploaded files." };
-  }
-
-  // 1. Pick the best matching tabular document by schema inspection and cell token scoring
-  let scoredCandidates = [];
-  const qCombined = `${question} ${fallbackQuestion}`.toLowerCase();
-  for (const doc of docs) {
-    let rows;
-    try { rows = loadRows(doc); } catch { continue; }
-    if (!rows || rows.length === 0) continue;
-    const colInfo = analyseColumns(rows);
-    let score = 0;
-    for (const c of colInfo) {
-      if (qCombined.includes(c.name.toLowerCase())) score += 10;
-      else if (matchTokenToColumn(c.name, qCombined)) score += 5;
+  try {
+    const baseQuery = { fileType: { $in: ["csv", "xlsx", "xls"] }, status: "completed" };
+    let docs = [];
+    if (targetDepartments && targetDepartments.length > 0) {
+      docs = await Document.find({ ...baseQuery, department: { $in: targetDepartments } }).sort({ createdAt: -1 }).lean();
     }
-    for (const c of colInfo) {
-      if (c.isNumeric || !c.distinct) continue;
-      for (const d of c.distinct) {
-        if (d && String(d).length >= 3 && qCombined.includes(String(d).toLowerCase())) {
-          score += 15;
-          break;
+    if (docs.length === 0) {
+      docs = await Document.find(baseQuery).sort({ createdAt: -1 }).lean();
+    }
+    docs = docs.filter((d) => d.path && fs.existsSync(d.path));
+    if (docs.length === 0) {
+      return {
+        success: false,
+        error: "no_data",
+        errorMessage: "No tabular document found in uploaded files.",
+        computedValue: null
+      };
+    }
+
+    // 1. Pick the best matching tabular document by schema inspection and cell token scoring
+    let scoredCandidates = [];
+    const qCombined = `${question} ${fallbackQuestion}`.toLowerCase();
+    for (const doc of docs) {
+      let rows;
+      try { rows = loadRows(doc); } catch { continue; }
+      if (!rows || rows.length === 0) continue;
+      const colInfo = analyseColumns(rows);
+      let score = 0;
+      for (const c of colInfo) {
+        if (qCombined.includes(c.name.toLowerCase())) score += 10;
+        else if (matchTokenToColumn(c.name, qCombined)) score += 5;
+      }
+      for (const c of colInfo) {
+        if (c.isNumeric || !c.distinct) continue;
+        for (const d of c.distinct) {
+          if (d && String(d).length >= 3 && qCombined.includes(String(d).toLowerCase())) {
+            score += 15;
+            break;
+          }
         }
       }
+      scoredCandidates.push({ doc, rows, colInfo, score });
     }
-    scoredCandidates.push({ doc, rows, colInfo, score });
-  }
 
-  if (scoredCandidates.length === 0) {
-    return { success: false, error: "Dataset is empty or unreadable." };
-  }
-
-  scoredCandidates.sort((a, b) => b.score - a.score);
-  const best = scoredCandidates[0];
-
-  const { doc, rows, colInfo } = best;
-  const documentName = doc.originalName;
-  const columns = colInfo.map((c) => c.name);
-
-  // 2. Query Understanding: Attempt fast deterministic parsing first
-  let semanticPlan = parseDeterministicQueryPlan(question, colInfo, rows, history);
-  let resolvedQuestion = question;
-
-  if (!semanticPlan && fallbackQuestion && fallbackQuestion !== question) {
-    semanticPlan = parseDeterministicQueryPlan(fallbackQuestion, colInfo, rows, history);
-    if (semanticPlan) {
-      resolvedQuestion = fallbackQuestion;
-      console.log(`[Tabular Processor] Deterministic plan resolved using context: ${semanticPlan.operation} on ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "table"}`);
+    if (scoredCandidates.length === 0) {
+      return {
+        success: false,
+        error: "no_data",
+        errorMessage: "Dataset is empty or unreadable.",
+        computedValue: null
+      };
     }
-  } else if (semanticPlan) {
-    console.log(`[Tabular Processor] Deterministic plan resolved: ${semanticPlan.operation} on ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "table"}`);
-  }
 
-  if (semanticPlan && semanticPlan.operation === "column_not_found") {
-    const message = buildColumnNotFoundMessage([semanticPlan.missingColumn], documentName, columns);
-    return {
-      documentName,
-      operation: "column_not_found",
-      column: null,
-      targetColumns: [],
-      filters: [],
-      columns,
-      totalRows: rows.length,
-      rowsUsed: 0,
-      semanticPlan,
-      usedLlmPlanner: false,
-      coverageDecision: "complete",
-      unresolved: [semanticPlan.missingColumn],
-      success: true,
-      computedValue: message,
-      summary: message
-    };
-  }
+    scoredCandidates.sort((a, b) => b.score - a.score);
+    const best = scoredCandidates[0];
 
-  if (semanticPlan && semanticPlan.operation === "entity_not_found") {
-    const message = `I couldn't find any record matching "${semanticPlan.missingEntity}" in ${documentName}.`;
-    return {
-      documentName,
-      operation: "entity_not_found",
-      column: null,
-      targetColumns: [],
-      filters: [],
-      columns,
-      totalRows: rows.length,
-      rowsUsed: 0,
-      semanticPlan,
-      usedLlmPlanner: false,
-      coverageDecision: "complete",
-      unresolved: [semanticPlan.missingEntity],
-      success: true,
-      computedValue: message,
-      summary: message
-    };
-  }
+    const { doc, rows, colInfo } = best;
+    const documentName = doc.originalName;
+    const columns = colInfo.map((c) => c.name);
 
-  // Requirement 1 & 2: Plan coverage check & escalation
-  let coverage = checkPlanCoverage(resolvedQuestion, semanticPlan, colInfo, rows);
-  let usedLlmPlanner = false;
-  let partialMisses = [];
+    // 2. Query Understanding: Attempt fast deterministic parsing first
+    let semanticPlan = await parseDeterministicQueryPlan(question, colInfo, rows, history);
+    let resolvedQuestion = question;
 
-  // Requested attribute(s) match nothing in the schema (e.g. a subject that has no column).
-  // Never silently drop them: answer "not found" unless a lookup can still return its resolved columns.
-  const attrMisses = coverage.unresolvedAttributes || [];
-  if (semanticPlan && attrMisses.length > 0 && coverage.plausibleUnconsumed.length === 0) {
-    const hasResolvedProjection =
-      semanticPlan.operation === "lookup" &&
-      Array.isArray(semanticPlan.targetColumns) &&
-      semanticPlan.targetColumns.length > 0;
+    if (!semanticPlan && fallbackQuestion && fallbackQuestion !== question) {
+      semanticPlan = await parseDeterministicQueryPlan(fallbackQuestion, colInfo, rows, history);
+      if (semanticPlan) {
+        resolvedQuestion = fallbackQuestion;
+        console.log(`[Tabular Processor] Deterministic plan resolved using context: ${semanticPlan.operation} on ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "table"}`);
+      }
+    } else if (semanticPlan) {
+      console.log(`[Tabular Processor] Deterministic plan resolved: ${semanticPlan.operation} on ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "table"}`);
+    }
 
-    if (hasResolvedProjection) {
-      partialMisses = attrMisses;
-      console.log(`[Tabular Processor] Partial lookup: unresolved attribute(s) ${JSON.stringify(attrMisses)} will be reported alongside resolved columns.`);
-    } else {
-      const message = buildColumnNotFoundMessage(attrMisses, documentName, columns);
-      console.log(`[TABULAR SEMANTIC DEBUG]`);
-      console.log(`  - question: "${question}"`);
-      console.log(`  - selected document: ${documentName}`);
-      console.log(`  - schema: [${columns.join(", ")}]`);
-      console.log(`  - coverage decision: incomplete (${coverage.reason})`);
-      console.log(`  - used LLM planner: false`);
-      console.log(`  - semantic operation: ${semanticPlan.operation}`);
-      console.log(`  - semantic filters: ${JSON.stringify(semanticPlan.filters || [])}`);
-      console.log(`  - unresolved: ${JSON.stringify(attrMisses)}`);
-      console.log(`  - computed result: ${message}`);
-      console.log(`  - fallback reason: column_not_found`);
+    if (semanticPlan && semanticPlan.operation === "column_not_found") {
+      const message = buildColumnNotFoundMessage([semanticPlan.missingColumn], documentName, columns);
       return {
         documentName,
         operation: "column_not_found",
         column: null,
         targetColumns: [],
-        filters: semanticPlan.filters || [],
+        filters: [],
         columns,
         totalRows: rows.length,
         rowsUsed: 0,
         semanticPlan,
         usedLlmPlanner: false,
-        coverageDecision: "incomplete",
-        unresolved: attrMisses,
+        coverageDecision: "complete",
+        unresolved: [semanticPlan.missingColumn],
         success: true,
         computedValue: message,
         summary: message
       };
     }
-  }
 
-  // Escalate to the LLM planner only when there is no plan or a plausible schema match was left unused
-  const needsLlm = !semanticPlan || coverage.plausibleUnconsumed.length > 0;
-
-  if (needsLlm) {
-    const qForLlm = contextualQuestion || fallbackQuestion || question;
-    console.log(
-      `[Tabular Processor] Plan ${semanticPlan ? "incomplete" : "null"} (reason: ${coverage.reason}). Escalating to LLM semantic planner.`
-    );
-    semanticPlan = await parseSemanticQueryPlan(qForLlm, documentName, colInfo);
-    resolvedQuestion = qForLlm;
-    usedLlmPlanner = true;
-    partialMisses = [];
-  } else {
-    console.log(`[Tabular Processor] Plan ${coverage.isComplete ? "complete" : "partial"}. Fast path enabled (0 LLM calls).`);
-  }
-
-  const coverageLabel = coverage.isComplete ? "complete" : (partialMisses.length > 0 ? "partial" : "incomplete");
-
-  // 3. Strict Programmatic Validation
-  const validation = validateSemanticPlan(semanticPlan, colInfo, rows);
-
-  if (validation.valid && partialMisses.length > 0) {
-    validation.unresolved = [...(validation.unresolved || [])];
-    for (const m of partialMisses) {
-      if (!validation.unresolved.includes(m)) validation.unresolved.push(m);
+    if (semanticPlan && semanticPlan.operation === "entity_not_found") {
+      const message = `I couldn't find any record matching "${semanticPlan.missingEntity}" in ${documentName}.`;
+      return {
+        documentName,
+        operation: "entity_not_found",
+        column: null,
+        targetColumns: [],
+        filters: [],
+        columns,
+        totalRows: rows.length,
+        rowsUsed: 0,
+        semanticPlan,
+        usedLlmPlanner: false,
+        coverageDecision: "complete",
+        unresolved: [semanticPlan.missingEntity],
+        success: true,
+        computedValue: message,
+        summary: message
+      };
     }
-  }
 
-  return executePlan(
-    documentName,
-    semanticPlan,
-    validation,
-    rows,
-    colInfo,
-    resolvedQuestion,
-    coverageLabel,
-    usedLlmPlanner
-  );
+    // Requirement 1 & 2: Plan coverage check & escalation
+    let coverage = await checkPlanCoverage(resolvedQuestion, semanticPlan, colInfo, rows);
+    let usedLlmPlanner = false;
+    let partialMisses = [];
+
+    // Requested attribute(s) match nothing in the schema (e.g. a subject that has no column).
+    // Never silently drop them: answer "not found" unless a lookup can still return its resolved columns.
+    const attrMisses = coverage.unresolvedAttributes || [];
+    if (semanticPlan && attrMisses.length > 0 && coverage.plausibleUnconsumed.length === 0) {
+      const hasResolvedProjection =
+        semanticPlan.operation === "lookup" &&
+        Array.isArray(semanticPlan.targetColumns) &&
+        semanticPlan.targetColumns.length > 0;
+
+      if (hasResolvedProjection) {
+        partialMisses = attrMisses;
+        console.log(`[Tabular Processor] Partial lookup: unresolved attribute(s) ${JSON.stringify(attrMisses)} will be reported alongside resolved columns.`);
+      } else {
+        const message = buildColumnNotFoundMessage(attrMisses, documentName, columns);
+        console.log(`[TABULAR SEMANTIC DEBUG]`);
+        console.log(`  - question: "${question}"`);
+        console.log(`  - selected document: ${documentName}`);
+        console.log(`  - schema: [${columns.join(", ")}]`);
+        console.log(`  - coverage decision: incomplete (${coverage.reason})`);
+        console.log(`  - used LLM planner: false`);
+        console.log(`  - semantic operation: ${semanticPlan.operation}`);
+        console.log(`  - semantic filters: ${JSON.stringify(semanticPlan.filters || [])}`);
+        console.log(`  - unresolved: ${JSON.stringify(attrMisses)}`);
+        console.log(`  - computed result: ${message}`);
+        console.log(`  - fallback reason: column_not_found`);
+        return {
+          documentName,
+          operation: "column_not_found",
+          column: null,
+          targetColumns: [],
+          filters: semanticPlan.filters || [],
+          columns,
+          totalRows: rows.length,
+          rowsUsed: 0,
+          semanticPlan,
+          usedLlmPlanner: false,
+          coverageDecision: "incomplete",
+          unresolved: attrMisses,
+          success: true,
+          computedValue: message,
+          summary: message
+        };
+      }
+    }
+
+    // Escalate to the LLM planner only when there is no plan or target column is missing or a plausible schema match was left unused
+    const needsLlm = !semanticPlan || (!semanticPlan.targetColumn && ["average", "sum", "min", "max", "median", "top_n", "bottom_n", "sort"].includes(semanticPlan.operation)) || coverage.plausibleUnconsumed.length > 0 || coverage.targetNotMentioned === true;
+
+    if (needsLlm) {
+      const qForLlm = fallbackQuestion || question;
+      console.log(
+        `[Tabular Processor] Plan ${semanticPlan ? "incomplete" : "null"} (reason: ${coverage.reason}). Escalating to LLM semantic planner.`
+      );
+      semanticPlan = await parseSemanticQueryPlan(qForLlm, documentName, colInfo);
+      resolvedQuestion = qForLlm;
+      usedLlmPlanner = true;
+      partialMisses = [];
+      if (semanticPlan) {
+        coverage = await checkPlanCoverage(resolvedQuestion, semanticPlan, colInfo, rows);
+      }
+    } else {
+      console.log(`[Tabular Processor] Plan ${coverage.isComplete ? "complete" : "partial"}. Fast path enabled (0 LLM calls).`);
+    }
+
+    const coverageLabel = coverage.isComplete ? "complete" : (partialMisses.length > 0 ? "partial" : "incomplete");
+
+    // 3. Strict Programmatic Validation
+    const validation = validateSemanticPlan(semanticPlan, colInfo, rows);
+
+    if (validation.valid && partialMisses.length > 0) {
+      validation.unresolved = [...(validation.unresolved || [])];
+      for (const m of partialMisses) {
+        if (!validation.unresolved.includes(m)) validation.unresolved.push(m);
+      }
+    }
+
+    return executePlan(
+      documentName,
+      semanticPlan,
+      validation,
+      rows,
+      colInfo,
+      resolvedQuestion,
+      coverageLabel,
+      usedLlmPlanner
+    );
+  } catch (error) {
+    console.error("[Tabular Processor] Internal error during query execution:", error && error.stack ? error.stack : error);
+    return {
+      success: false,
+      error: "internal_error",
+      errorMessage: error ? error.message : "Internal error",
+      computedValue: null
+    };
+  }
 }
 
 export function executePlan(
@@ -1588,8 +1648,9 @@ export function executePlan(
     };
   }
 
-  // 3b. Name-like value that matches no row: never fall back to an unfiltered aggregate
-  if (validation.filters.length === 0) {
+  // 3b. Name-like value that matches no row: only for entity lookups / filters, never for table-wide aggregations
+  const isTableWideOp = ["average", "sum", "min", "max", "median", "count", "percentage", "distribution", "group_by", "difference", "top_n", "bottom_n", "sort"].includes(operation);
+  if (!isTableWideOp && (operation === "lookup" || operation === "filter") && validation.filters.length === 0) {
     const miss = findEntityMiss(question, colInfo, rows, validation.target ? validation.target.name : null);
     if (miss) {
       logTabularSemanticDebug(miss.message, "entity_not_found", 0);
@@ -1736,6 +1797,7 @@ export function executePlan(
       computedValue,
       rowsUsed: nums.length,
       records: holders,
+      entityColumn: entityCol,
       summary: `${operation === "max" ? "Highest" : "Lowest"} ${target.name} = ${computedValue} across ${nums.length} rows (filters: ${filterText}). Row(s) with this value: ${holders.map((h) => h[label]).join(", ")}. Full record(s): ${JSON.stringify(holders)}`
     };
   }
@@ -2161,7 +2223,7 @@ export function formatTabularTemplateAnswer(tabularResult, question = "") {
 
   if (operation === "max" || operation === "highest") {
     if (records && records.length > 0) {
-      const names = records.map((r) => r.Name || r.Employee || (Object.values(r)[0])).filter(Boolean).join(", ");
+      const names = records.map((r) => (tabularResult.entityColumn && r[tabularResult.entityColumn]) || r.Name || r.Employee || (Object.values(r)[0])).filter(Boolean).join(", ");
       const verb = records.length > 1 ? "have" : "has";
       if (names) {
         return `${names} ${verb} the highest ${column} with ${computedValue}.${unresolvedNotice}`;
@@ -2172,7 +2234,7 @@ export function formatTabularTemplateAnswer(tabularResult, question = "") {
 
   if (operation === "min" || operation === "lowest") {
     if (records && records.length > 0) {
-      const names = records.map((r) => r.Name || r.Employee || (Object.values(r)[0])).filter(Boolean).join(", ");
+      const names = records.map((r) => (tabularResult.entityColumn && r[tabularResult.entityColumn]) || r.Name || r.Employee || (Object.values(r)[0])).filter(Boolean).join(", ");
       const verb = records.length > 1 ? "have" : "has";
       if (names) {
         return `${names} ${verb} the lowest ${column} with ${computedValue}.${unresolvedNotice}`;

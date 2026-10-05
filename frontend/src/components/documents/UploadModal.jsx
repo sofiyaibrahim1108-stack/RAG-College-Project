@@ -9,7 +9,7 @@ export function UploadModal() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [departments, setDepartments] = useState([]);
   const [loadingDepts, setLoadingDepts] = useState(false);
-  const [selectedDeptId, setSelectedDeptId] = useState("");
+  const [selectedDeptIds, setSelectedDeptIds] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState(null);
@@ -48,8 +48,8 @@ export function UploadModal() {
   }
 
   async function handleUpload() {
-    if (!selectedDeptId) {
-      setErrorMessage("Please select a department before uploading.");
+    if (selectedDeptIds.length === 0) {
+      setErrorMessage("Please select at least one department before uploading.");
       return;
     }
 
@@ -58,9 +58,9 @@ export function UploadModal() {
       return;
     }
 
-    const deptObj = departments.find((d) => d._id === selectedDeptId);
-    if (!deptObj) {
-      setErrorMessage("Please select a department before uploading.");
+    const selectedDepts = departments.filter((d) => selectedDeptIds.includes(d._id));
+    if (selectedDepts.length === 0) {
+      setErrorMessage("Please select at least one valid department before uploading.");
       return;
     }
 
@@ -72,9 +72,10 @@ export function UploadModal() {
       await documentApi.uploadDocument(
         selectedFile,
         {
-          departmentId: deptObj._id,
-          department: deptObj.name,
-          isTestData: deptObj.isTestData === true
+          departmentIds: selectedDeptIds,
+          departmentId: selectedDepts[0]._id,
+          department: selectedDepts[0].name,
+          isTestData: selectedDepts.some((d) => d.isTestData === true)
         },
         (progressEvent) => {
           const percent = Math.round((progressEvent.loaded * 100) / progressEvent.total);
@@ -86,6 +87,7 @@ export function UploadModal() {
       setTimeout(() => {
         setIsUploading(false);
         setSelectedFile(null);
+        setSelectedDeptIds([]);
         setUploadProgress(0);
         setStatusMessage(null);
         setShowUploadModal(false);
@@ -123,11 +125,11 @@ export function UploadModal() {
           </button>
         </div>
 
-        {/* Dynamic Department Selector */}
+        {/* Dynamic Multi-Department Selector */}
         <div className="mb-4">
           <div className="flex items-center justify-between mb-1.5">
             <label className="text-sm font-medium text-neutral-800 dark:text-neutral-200">
-              Select Department *
+              Departments *
             </label>
             <button
               type="button"
@@ -157,22 +159,44 @@ export function UploadModal() {
               </p>
             </div>
           ) : (
-            <select
-              value={selectedDeptId}
-              onChange={(e) => {
-                setSelectedDeptId(e.target.value);
-                if (errorMessage) setErrorMessage(null);
-              }}
-              disabled={isUploading}
-              className="w-full text-sm p-2.5 rounded-xl border border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 focus:outline-none focus:ring-2 focus:ring-blue-500 font-medium"
-            >
-              <option value="">Select Department</option>
-              {departments.map((dept) => (
-                <option key={dept._id} value={dept._id}>
-                  {dept.name}
-                </option>
-              ))}
-            </select>
+            <div className="border border-neutral-300 dark:border-neutral-700 rounded-xl p-2.5 max-h-40 overflow-y-auto space-y-1.5 bg-neutral-50 dark:bg-neutral-950">
+              {departments.map((dept) => {
+                const isChecked = selectedDeptIds.includes(dept._id);
+                return (
+                  <label
+                    key={dept._id}
+                    className={`flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-sm cursor-pointer transition select-none ${
+                      isChecked
+                        ? "bg-blue-50 dark:bg-blue-950/50 text-blue-900 dark:text-blue-200 font-medium"
+                        : "text-neutral-700 dark:text-neutral-300 hover:bg-neutral-100 dark:hover:bg-neutral-900"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      value={dept._id}
+                      checked={isChecked}
+                      disabled={isUploading}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        if (checked) {
+                          setSelectedDeptIds((prev) => [...new Set([...prev, dept._id])]);
+                        } else {
+                          setSelectedDeptIds((prev) => prev.filter((id) => id !== dept._id));
+                        }
+                        if (errorMessage) setErrorMessage(null);
+                      }}
+                      className="w-4 h-4 text-blue-600 rounded border-neutral-300 dark:border-neutral-700 focus:ring-blue-500 cursor-pointer"
+                    />
+                    <span className="truncate">{dept.name}</span>
+                  </label>
+                );
+              })}
+            </div>
+          )}
+          {selectedDeptIds.length > 0 && (
+            <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1.5">
+              {selectedDeptIds.length} department{selectedDeptIds.length > 1 ? "s" : ""} selected
+            </p>
           )}
         </div>
 
@@ -249,8 +273,8 @@ export function UploadModal() {
         {/* Footer Actions */}
         <div className="mt-5 flex items-center justify-between">
           <div className="text-xs text-neutral-400">
-            {!selectedDeptId
-              ? "Select department to continue"
+            {selectedDeptIds.length === 0
+              ? "Select department(s) to continue"
               : !selectedFile
               ? "Choose file to upload"
               : ""}
@@ -266,9 +290,9 @@ export function UploadModal() {
             </button>
             <button
               onClick={handleUpload}
-              disabled={!selectedFile || !selectedDeptId || departments.length === 0 || isUploading}
+              disabled={!selectedFile || selectedDeptIds.length === 0 || departments.length === 0 || isUploading}
               className={`px-5 py-2.5 text-sm font-semibold rounded-xl shadow-xs transition flex items-center space-x-1.5 ${
-                selectedFile && selectedDeptId && !isUploading
+                selectedFile && selectedDeptIds.length > 0 && !isUploading
                   ? "bg-blue-600 hover:bg-blue-700 text-white cursor-pointer"
                   : "bg-neutral-200 dark:bg-neutral-800 text-neutral-400 cursor-not-allowed opacity-80"
               }`}

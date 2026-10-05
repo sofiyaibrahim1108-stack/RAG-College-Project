@@ -3,6 +3,7 @@ import { Document } from "../models/Document.js";
 import { DocumentChunk } from "../models/DocumentChunk.js";
 import { ImageModel } from "../models/Image.js";
 import { matchTokenToColumn, loadRows, analyseColumns, stemWord } from "./tabularProcessor.js";
+import { RAG_CONFIG } from "../config/rag.js";
 
 /**
  * Centralized Generic Router Configuration
@@ -126,7 +127,7 @@ export async function buildDepartmentProfiles() {
 
     try {
       const dbDepts = await Department.find().select("name description").lean();
-    const docs = await Document.find({ status: "completed" }).select("title originalName department fileType path").lean();
+    const docs = await Document.find({ status: "completed" }).select("title originalName department departments fileType path").lean();
 
     const deptMap = new Map();
     for (const d of dbDepts) {
@@ -150,74 +151,85 @@ export async function buildDepartmentProfiles() {
       }
     }
 
-    // Associate documents with department profiles
+    // Associate documents with department profiles (supports documents with multiple departments)
     for (const doc of docs) {
-      const dName = doc.department ? doc.department.trim() : "";
-      if (!dName) continue;
-      if (!deptMap.has(dName)) {
-        deptMap.set(dName, {
-          name: dName,
-          description: "",
-          docs: [],
-          fileTypes: [],
-          tabularDocs: [],
-          tabularColumns: [],
-          tabularCellValues: new Set(),
-          isTabular: false,
-          isCode: false,
-          rawAcronymMap: new Map(),
-          rawModelMap: new Map(),
-          termFreq: new Map(),
-          phraseFreq: new Map()
-        });
+      const docDepts = new Set();
+      if (Array.isArray(doc.departments) && doc.departments.length > 0) {
+        for (const d of doc.departments) {
+          if (d && d.trim()) docDepts.add(d.trim());
+        }
       }
-
-      const profile = deptMap.get(dName);
-      const docName = doc.title || doc.originalName || "";
-      if (docName && !profile.docs.includes(docName)) {
-        profile.docs.push(docName);
+      if (doc.department && doc.department.trim()) {
+        docDepts.add(doc.department.trim());
       }
+      if (docDepts.size === 0) continue;
 
-      const fType = (doc.fileType || "").toLowerCase();
-      if (fType && !profile.fileTypes.includes(fType)) {
-        profile.fileTypes.push(fType);
-      }
+      for (const dName of docDepts) {
+        if (!deptMap.has(dName)) {
+          deptMap.set(dName, {
+            name: dName,
+            description: "",
+            docs: [],
+            fileTypes: [],
+            tabularDocs: [],
+            tabularColumns: [],
+            tabularCellValues: new Set(),
+            isTabular: false,
+            isCode: false,
+            rawAcronymMap: new Map(),
+            rawModelMap: new Map(),
+            termFreq: new Map(),
+            phraseFreq: new Map()
+          });
+        }
 
-      // Check code file types from fileType or filename extension
-      if (/\.(?:js|ts|jsx|tsx|py|java|cpp|c|cs|html|css|sh|rb|go)$/i.test(doc.originalName || "") ||
-          ["js", "ts", "py", "java", "cpp", "c", "cs", "html", "css"].includes(fType)) {
-        profile.isCode = true;
-      }
+        const profile = deptMap.get(dName);
+        const docName = doc.title || doc.originalName || "";
+        if (docName && !profile.docs.includes(docName)) {
+          profile.docs.push(docName);
+        }
 
-      // Extract schema and sample cell values for tabular datasets
-      if (["csv", "xlsx", "xls"].includes(fType) && doc.path) {
-        profile.isTabular = true;
-        profile.tabularDocs.push(doc);
-        try {
-          const rows = loadRows(doc);
-          if (rows && rows.length > 0) {
-            const cols = analyseColumns(rows);
-            for (const col of cols) {
-              if (!profile.tabularColumns.some((c) => c.name === col.name)) {
-                profile.tabularColumns.push({
-                  name: col.name,
-                  isNumeric: col.isNumeric,
-                  distinct: col.distinct || []
-                });
-              }
-              // Store non-numeric sample cell values
-              if (!col.isNumeric && col.distinct) {
-                for (const d of col.distinct) {
-                  const cleaned = String(d || "").trim().toLowerCase();
-                  if (cleaned && cleaned.length >= 2) {
-                    profile.tabularCellValues.add(cleaned);
+        const fType = (doc.fileType || "").toLowerCase();
+        if (fType && !profile.fileTypes.includes(fType)) {
+          profile.fileTypes.push(fType);
+        }
+
+        // Check code file types from fileType or filename extension
+        if (/\.(?:js|ts|jsx|tsx|py|java|cpp|c|cs|html|css|sh|rb|go)$/i.test(doc.originalName || "") ||
+            ["js", "ts", "py", "java", "cpp", "c", "cs", "html", "css"].includes(fType)) {
+          profile.isCode = true;
+        }
+
+        // Extract schema and sample cell values for tabular datasets
+        if (["csv", "xlsx", "xls"].includes(fType) && doc.path) {
+          profile.isTabular = true;
+          profile.tabularDocs.push(doc);
+          try {
+            const rows = loadRows(doc);
+            if (rows && rows.length > 0) {
+              const cols = analyseColumns(rows);
+              for (const col of cols) {
+                if (!profile.tabularColumns.some((c) => c.name === col.name)) {
+                  profile.tabularColumns.push({
+                    name: col.name,
+                    isNumeric: col.isNumeric,
+                    distinct: col.distinct || []
+                  });
+                }
+                // Store non-numeric sample cell values
+                if (!col.isNumeric && col.distinct) {
+                  for (const d of col.distinct) {
+                    const cleaned = String(d || "").trim().toLowerCase();
+                    if (cleaned && cleaned.length >= 2) {
+                      profile.tabularCellValues.add(cleaned);
+                    }
                   }
                 }
               }
             }
+          } catch (e) {
+            // ignore unreadable spreadsheet
           }
-        } catch (e) {
-          // ignore unreadable spreadsheet
         }
       }
     }
@@ -232,12 +244,12 @@ export async function buildDepartmentProfiles() {
       let chunks = [];
       try {
         chunks = await DocumentChunk.aggregate([
-          { $match: { department: deptName } },
+          { $match: { $or: [{ department: deptName }, { departments: deptName }] } },
           { $sample: { size: ROUTER_CONFIG.SAMPLE_CHUNKS_PER_DEPT } },
           { $project: { content: 1 } }
         ]);
       } catch (err) {
-        chunks = await DocumentChunk.find({ department: deptName })
+        chunks = await DocumentChunk.find({ $or: [{ department: deptName }, { departments: deptName }] })
           .select("content")
           .limit(ROUTER_CONFIG.SAMPLE_CHUNKS_PER_DEPT)
           .lean();
@@ -435,17 +447,20 @@ export async function routeDepartment(question, conversationHistory = []) {
   if (pageMatch) {
     const targetPage = parseInt(pageMatch[1], 10);
     try {
-      let targetDoc = await DocumentChunk.findOne({ pageNumber: targetPage }).select("department").lean();
+      let targetDoc = await DocumentChunk.findOne({ pageNumber: targetPage }).select("department departments").lean();
       if (!targetDoc) {
-        targetDoc = await ImageModel.findOne({ pageNumber: targetPage }).select("department").lean();
+        targetDoc = await ImageModel.findOne({ pageNumber: targetPage }).select("department departments").lean();
       }
-      if (targetDoc && targetDoc.department) {
+      const depts = (Array.isArray(targetDoc?.departments) && targetDoc.departments.length > 0)
+        ? targetDoc.departments
+        : (targetDoc?.department ? [targetDoc.department] : []);
+      if (depts.length > 0) {
         const elapsed = Date.now() - startTime;
-        console.log(`[Router] Page ${targetPage} specifier resolved to department [${targetDoc.department}] in ${elapsed}ms`);
+        console.log(`[Router] Page ${targetPage} specifier resolved to departments [${depts.join(", ")}] in ${elapsed}ms`);
         return {
           queryType: "document_qa",
-          candidates: [{ department: targetDoc.department, confidence: 0.95 }],
-          departments: [targetDoc.department],
+          candidates: depts.map((d) => ({ department: d, confidence: 0.95 })),
+          departments: depts,
           confidence: 0.95
         };
       }
@@ -598,12 +613,13 @@ export async function routeDepartment(question, conversationHistory = []) {
     const top = candidateScores[0];
     const second = candidateScores[1];
 
-    // Multi-department question support
+    // Multi-department question support: return multiple departments when scores are close, or multi-topic question
+    const closeRatio = RAG_CONFIG.routerCloseScoreRatio ?? 0.80;
+    const isCloseScores = second && second.score >= 2.5 && second.score >= top.score * closeRatio;
     const isMultiDepartment =
       second &&
       second.score >= 2.5 &&
-      second.score >= top.score * 0.45 &&
-      isMultiTopicQuestion;
+      (isCloseScores || (second.score >= top.score * 0.45 && isMultiTopicQuestion));
 
     const depts = isMultiDepartment ? [top.department, second.department] : [top.department];
     const confidence = isMultiDepartment ? 0.85 : (top.score >= 3.5 ? 0.95 : 0.85);

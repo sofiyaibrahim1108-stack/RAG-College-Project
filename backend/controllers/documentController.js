@@ -18,33 +18,62 @@ export async function uploadDocument(req, res) {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const { departmentId, department: deptNameParam, isTestData, title } = req.body;
+    const { departmentId, departmentIds: deptIdsParam, department: deptNameParam, isTestData, title } = req.body;
+
+    // Parse requested department IDs (supports JSON string, array, or comma-separated)
+    let requestedDeptIds = [];
+    if (deptIdsParam) {
+      if (Array.isArray(deptIdsParam)) {
+        requestedDeptIds = deptIdsParam;
+      } else if (typeof deptIdsParam === "string") {
+        try {
+          const parsed = JSON.parse(deptIdsParam);
+          if (Array.isArray(parsed)) {
+            requestedDeptIds = parsed;
+          } else if (parsed) {
+            requestedDeptIds = [parsed];
+          }
+        } catch {
+          requestedDeptIds = deptIdsParam.split(",").map((s) => s.trim()).filter(Boolean);
+        }
+      }
+    } else if (departmentId) {
+      requestedDeptIds = [departmentId];
+    }
+
+    // Deduplicate requested department IDs
+    requestedDeptIds = [...new Set(requestedDeptIds.map((id) => String(id).trim()).filter(Boolean))];
 
     // Requirement: Department selection is mandatory - no silent default
-    if (!departmentId && (!deptNameParam || !deptNameParam.trim())) {
+    if (requestedDeptIds.length === 0 && (!deptNameParam || !deptNameParam.trim())) {
       return res.status(400).json({
-        error: "Department selection is mandatory. Please select or create a department before uploading."
+        error: "At least one department must be selected before uploading."
       });
     }
 
-    // Verify department against database
-    let departmentDoc = null;
-    if (departmentId) {
-      departmentDoc = await Department.findById(departmentId);
+    // Verify departments against database
+    let departmentDocs = [];
+    if (requestedDeptIds.length > 0) {
+      departmentDocs = await Department.find({ _id: { $in: requestedDeptIds } });
     } else if (deptNameParam) {
-      departmentDoc = await Department.findOne({
+      const singleDoc = await Department.findOne({
         name: { $regex: new RegExp(`^${deptNameParam.trim()}$`, "i") }
       });
+      if (singleDoc) departmentDocs = [singleDoc];
     }
 
-    if (!departmentDoc) {
+    if (!departmentDocs || departmentDocs.length === 0) {
       return res.status(400).json({
-        error: `Selected department is invalid or does not exist in the database. Please select a valid department.`
+        error: "Selected department(s) are invalid or do not exist in the database."
       });
     }
 
     const file = req.file;
-    const departmentName = departmentDoc.name;
+    const primaryDept = departmentDocs[0];
+    const deptIds = departmentDocs.map((d) => d._id);
+    const deptNames = departmentDocs.map((d) => d.name);
+    const isTestDataFlag = isTestData === "true" || isTestData === true || departmentDocs.some((d) => d.isTestData === true);
+
     const ext = path.extname(file.originalname).toLowerCase().replace(".", "");
 
     let fileType = "other";
@@ -70,9 +99,11 @@ export async function uploadDocument(req, res) {
       fileType: fileType,
       mimeType: file.mimetype,
       size: file.size,
-      departmentId: departmentDoc._id,
-      department: departmentName,
-      isTestData: isTestData === "true" || isTestData === true || departmentDoc.isTestData === true,
+      departmentId: primaryDept._id,
+      department: primaryDept.name,
+      departmentIds: deptIds,
+      departments: deptNames,
+      isTestData: isTestDataFlag,
       status: "processing",
       source: "upload"
     });
@@ -99,21 +130,26 @@ export async function uploadDocument(req, res) {
 export async function getDocuments(req, res) {
   try {
     const { department, status, search } = req.query;
-    const query = {};
+    const andConditions = [];
 
     if (department && department !== "All") {
-      query.department = department;
+      andConditions.push({
+        $or: [{ department: department }, { departments: department }]
+      });
     }
     if (status) {
-      query.status = status;
+      andConditions.push({ status });
     }
     if (search) {
-      query.$or = [
-        { originalName: { $regex: search, $options: "i" } },
-        { title: { $regex: search, $options: "i" } }
-      ];
+      andConditions.push({
+        $or: [
+          { originalName: { $regex: search, $options: "i" } },
+          { title: { $regex: search, $options: "i" } }
+        ]
+      });
     }
 
+    const query = andConditions.length > 0 ? { $and: andConditions } : {};
     const documents = await Document.find(query).sort({ createdAt: -1 });
     res.json({ success: true, count: documents.length, documents });
   } catch (error) {

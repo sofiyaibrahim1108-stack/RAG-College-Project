@@ -240,7 +240,12 @@ async function tryVectorSearch(queryEmbedding, routedDepartments = [], filterMet
     };
 
     if (routedDepartments && routedDepartments.length > 0) {
-      vectorStage.filter = { department: { $in: routedDepartments } };
+      vectorStage.filter = {
+        $or: [
+          { department: { $in: routedDepartments } },
+          { departments: { $in: routedDepartments } }
+        ]
+      };
     }
 
     const pipeline = [
@@ -253,6 +258,7 @@ async function tryVectorSearch(queryEmbedding, routedDepartments = [], filterMet
           chunkIndex: 1,
           content: 1,
           department: 1,
+          departments: 1,
           sourceType: 1,
           imageRef: 1,
           embedding: 1,
@@ -312,7 +318,10 @@ export async function retrieveRelevantTextChunks(
     const mongoQuery = {};
 
     if (routedDepartments && routedDepartments.length > 0) {
-      mongoQuery.department = { $in: routedDepartments };
+      mongoQuery.$or = [
+        { department: { $in: routedDepartments } },
+        { departments: { $in: routedDepartments } }
+      ];
     }
 
     if (filterMeta.documentId) {
@@ -324,7 +333,7 @@ export async function retrieveRelevantTextChunks(
     mongoQuery.isUseless = { $ne: true };
 
     candidates = await DocumentChunk.find(mongoQuery)
-      .select("documentId documentName pageNumber chunkIndex content department sourceType imageRef embedding isUseless")
+      .select("documentId documentName pageNumber chunkIndex content department departments sourceType imageRef embedding isUseless")
       .lean();
   }
 
@@ -427,6 +436,7 @@ export async function retrieveRelevantTextChunks(
         chunkIndex: chunk.chunkIndex,
         content: chunk.content,
         department: chunk.department,
+        departments: Array.isArray(chunk.departments) && chunk.departments.length > 0 ? chunk.departments : (chunk.department ? [chunk.department] : []),
         sourceType: chunk.sourceType || "text",
         imageRef: chunk.imageRef || null,
         similarity: parseFloat(sim.toFixed(4)),
@@ -440,32 +450,14 @@ export async function retrieveRelevantTextChunks(
     }
   }
 
-  // 6. Modality-aware dual-pool ranking: rank text chunks and image_chunks in separate pools, then merge (Requirement 2)
-  const textCandidates = [];
-  const imageChunkCandidates = [];
+  // 6. Build evidence from one unified ranked pool (text chunks and image-derived chunks)
+  scoredCandidates.sort((a, b) => {
+    if (a._isPageMatch && !b._isPageMatch) return -1;
+    if (!a._isPageMatch && b._isPageMatch) return 1;
+    return b.rankingScore - a.rankingScore;
+  });
 
-  for (const c of scoredCandidates) {
-    if (c.sourceType === "image_chunk" || Boolean(c.imageRef?.filename)) {
-      imageChunkCandidates.push(c);
-    } else {
-      textCandidates.push(c);
-    }
-  }
-
-  const sortPool = (pool) => {
-    pool.sort((a, b) => {
-      if (a._isPageMatch && !b._isPageMatch) return -1;
-      if (!a._isPageMatch && b._isPageMatch) return 1;
-      return b.rankingScore - a.rankingScore;
-    });
-  };
-
-  sortPool(textCandidates);
-  sortPool(imageChunkCandidates);
-
-  const topKTextLimit = RAG_CONFIG.topKTextChunks || topK || 5;
-  const topKImageLimit = RAG_CONFIG.topKImageChunks || 2;
-
+  const topKLimit = RAG_CONFIG.topKText || topK || 5;
   const isValidChunk = (c) => {
     if (!c._isPageMatch && c.rankingScore < 0.40 && c.lexicalScore < 0.15 && c.similarity < 0.40) {
       return false;
@@ -473,40 +465,24 @@ export async function retrieveRelevantTextChunks(
     return true;
   };
 
-  const seenTextPages = new Set();
-  const selectedText = [];
-  for (const c of textCandidates) {
-    if (selectedText.length >= topKTextLimit) break;
-    const pageKey = `${c.documentName}_p${c.pageNumber}`;
-    if (!c._isPageMatch && seenTextPages.has(pageKey)) continue;
+  const seenKeys = new Set();
+  const selectedChunks = [];
+  for (const c of scoredCandidates) {
+    if (selectedChunks.length >= topKLimit) break;
+    const key = c.imageRef?.filename || `${c.documentName}_p${c.pageNumber}_i${c.chunkIndex}`;
+    if (seenKeys.has(key)) continue;
     if (isValidChunk(c)) {
-      seenTextPages.add(pageKey);
-      selectedText.push(c);
+      seenKeys.add(key);
+      selectedChunks.push(c);
+      if (c.sourceType === "image_chunk" || Boolean(c.imageRef?.filename)) {
+        console.log(
+          `[Multimodal] Retrieved image-derived chunk: page ${c.pageNumber}, rankScore=${c.rankingScore}, sim=${c.similarity}, doc="${c.documentName}", file="${c.imageRef?.filename || 'n/a'}"`
+        );
+      }
     }
   }
 
-  const seenImageKeys = new Set();
-  const selectedImages = [];
-  for (const c of imageChunkCandidates) {
-    if (selectedImages.length >= topKImageLimit) break;
-    const imgKey = c.imageRef?.filename || `${c.documentName}_p${c.pageNumber}`;
-    if (seenImageKeys.has(imgKey)) continue;
-    if (isValidChunk(c)) {
-      seenImageKeys.add(imgKey);
-      selectedImages.push(c);
-      console.log(
-        `[Multimodal] Retrieved image-derived chunk: page ${c.pageNumber}, rankScore=${c.rankingScore}, sim=${c.similarity}, doc="${c.documentName}", file="${c.imageRef?.filename || 'n/a'}"`
-      );
-    }
-  }
-
-  // Merge and sort by ranking score
-  const strongChunks = [...selectedText, ...selectedImages];
-  strongChunks.sort((a, b) => {
-    if (a._isPageMatch && !b._isPageMatch) return -1;
-    if (!a._isPageMatch && b._isPageMatch) return 1;
-    return b.rankingScore - a.rankingScore;
-  });
+  const strongChunks = selectedChunks;
 
   // Safely augment very short chunks with immediate adjacent sibling to maintain sentence continuity without blowing up prompt tokens
   for (const c of strongChunks) {

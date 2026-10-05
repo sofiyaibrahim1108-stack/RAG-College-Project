@@ -16,6 +16,9 @@ export const documentApi = {
     formData.append("file", file);
 
     if (typeof departmentData === "object" && departmentData !== null) {
+      if (departmentData.departmentIds && Array.isArray(departmentData.departmentIds)) {
+        formData.append("departmentIds", JSON.stringify(departmentData.departmentIds));
+      }
       if (departmentData.departmentId) formData.append("departmentId", departmentData.departmentId);
       if (departmentData.department) formData.append("department", departmentData.department);
       if (departmentData.isTestData !== undefined) formData.append("isTestData", departmentData.isTestData);

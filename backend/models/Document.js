@@ -18,7 +18,15 @@ const DocumentSchema = new mongoose.Schema(
       default: null,
       index: true
     },
-    department: { type: String, required: true, trim: true, index: true },
+    department: { type: String, trim: true, index: true },
+    departmentIds: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Department",
+        index: true
+      }
+    ],
+    departments: [{ type: String, trim: true, index: true }],
     isTestData: { type: Boolean, default: false, index: true },
     createdBy: { type: String, default: "user" },
     status: {
@@ -38,6 +46,7 @@ const DocumentSchema = new mongoose.Schema(
 );
 
 DocumentSchema.index({ department: 1, status: 1 });
+DocumentSchema.index({ departments: 1, status: 1 });
 DocumentSchema.index({ createdAt: -1 });
 
 export const Document = mongoose.model("Document", DocumentSchema);

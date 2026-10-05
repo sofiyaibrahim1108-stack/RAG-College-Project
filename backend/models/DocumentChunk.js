@@ -18,7 +18,15 @@ const DocumentChunkSchema = new mongoose.Schema(
       default: null,
       index: true
     },
-    department: { type: String, required: true, trim: true, index: true },
+    department: { type: String, trim: true, index: true },
+    departmentIds: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Department",
+        index: true
+      }
+    ],
+    departments: [{ type: String, trim: true, index: true }],
     isTestData: { type: Boolean, default: false, index: true },
     isUseless: { type: Boolean, default: false, index: true },
     sourceType: { type: String, default: "upload" },
@@ -41,6 +49,7 @@ const DocumentChunkSchema = new mongoose.Schema(
 );
 
 DocumentChunkSchema.index({ department: 1, documentId: 1 });
+DocumentChunkSchema.index({ departments: 1, documentId: 1 });
 DocumentChunkSchema.index({ documentName: 1, pageNumber: 1 });
 
 export const DocumentChunk = mongoose.model("DocumentChunk", DocumentChunkSchema);

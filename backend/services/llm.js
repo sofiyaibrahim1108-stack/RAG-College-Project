@@ -3,6 +3,8 @@ import axios from "axios";
 import { ENV } from "../config/env.js";
 import { RAG_CONFIG } from "../config/rag.js";
 import { extractQueryTerms } from "./textRetrieval.js";
+import { cosineSimilarity } from "../utils/similarity.js";
+import { generateTextEmbedding } from "./embeddingService.js";
 
 export const FALLBACK_MESSAGE =
   "I couldn't find this information in the uploaded documents.";
@@ -491,7 +493,54 @@ export function isEntityInContext(
 /**
  * Evidence Sufficiency Check.
  */
-export function checkEvidenceSupportGate(
+export function extractFrequencyBasedContentTerms(question = "", retrievedChunks = []) {
+  if (!question) return [];
+
+  const rawTokens = question
+    .toLowerCase()
+    .replace(/[^a-z0-9_\-\s]/g, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 2 && !/^\d+$/.test(w));
+
+  if (rawTokens.length === 0) return [];
+
+  const totalChunks = Array.isArray(retrievedChunks) ? retrievedChunks.length : 0;
+  const chunkDocFreq = new Map();
+
+  if (totalChunks > 1) {
+    for (const chunk of retrievedChunks) {
+      const cWords = new Set(
+        (chunk.content || "")
+          .toLowerCase()
+          .replace(/[^a-z0-9_\-\s]/g, " ")
+          .split(/\s+/)
+          .filter(Boolean)
+      );
+      for (const t of rawTokens) {
+        if (cWords.has(t)) {
+          chunkDocFreq.set(t, (chunkDocFreq.get(t) || 0) + 1);
+        }
+      }
+    }
+  }
+
+  const contentTerms = [];
+  for (const token of rawTokens) {
+    if (token.length < 3) continue;
+    if (totalChunks >= 3 && (chunkDocFreq.get(token) || 0) / totalChunks >= 0.8) {
+      continue;
+    }
+    contentTerms.push(token);
+  }
+
+  return contentTerms.length > 0 ? contentTerms : rawTokens;
+}
+
+/**
+ * Evidence Sufficiency Check with Coverage Gate.
+ */
+export async function checkEvidenceSupportGate(
   question = "",
   contextPrompt = "",
   queryType = "document_qa",
@@ -528,7 +577,7 @@ export function checkEvidenceSupportGate(
       ? evidenceMeta.topSimilarity
       : 0;
 
-  const STRONG_SEMANTIC = 0.65;
+  const STRONG_SEMANTIC = RAG_CONFIG.strongEvidenceThreshold ?? 0.62;
 
   // Explicit page constraint.
   const pageMatch = question
@@ -622,58 +671,57 @@ export function checkEvidenceSupportGate(
     }
   }
 
-  // Overall lexical/semantic relevance.
-  const exempt = answerTypeWords(question);
+  // Coverage check on question content terms (Requirement 5)
+  const chunks = evidenceMeta.retrievedChunks || [];
+  const contentTerms = extractFrequencyBasedContentTerms(question, chunks);
 
-  if (parsed) {
-    exempt.add(parsed.head);
-  }
+  if (contentTerms.length > 0) {
+    const unsupportedTerms = [];
+    for (const term of contentTerms) {
+      if (isStemInContext(term, contextLower)) {
+        continue;
+      }
+      // Embedding similarity fallback
+      let supportedByEmbedding = false;
+      if (chunks.length > 0) {
+        try {
+          const termEmb = await generateTextEmbedding(term);
+          const termMinSim = RAG_CONFIG.termEmbeddingMinSim ?? 0.50;
+          for (const chunk of chunks) {
+            if (chunk.embedding && chunk.embedding.length > 0) {
+              const sim = cosineSimilarity(termEmb, chunk.embedding);
+              if (sim >= termMinSim) {
+                supportedByEmbedding = true;
+                break;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+      if (!supportedByEmbedding) {
+        unsupportedTerms.push(term);
+      }
+    }
 
-  const terms = extractQueryTerms(question).filter(
-    (t) => !exempt.has(t)
-  );
+    const unsupportedRatio = unsupportedTerms.length / contentTerms.length;
+    const maxUnsupported = RAG_CONFIG.questionTermMaxUnsupportedRatio ?? 0.40;
 
-  if (terms.length > 0) {
-    const matched = terms.filter((t) =>
-      isStemInContext(t, contextLower)
-    );
-
-    const coverage = matched.length / terms.length;
-
-    if (
-      matched.length === 0 &&
-      topSim < STRONG_SEMANTIC
-    ) {
+    if (unsupportedRatio > maxUnsupported && topSim < STRONG_SEMANTIC) {
       console.log(
-        `[Evidence Gate] No lexical overlap and weak semantic similarity (${topSim.toFixed(
-          3
-        )}) -> insufficient_evidence`
+        `[Evidence Gate] Coverage failed: unsupportedRatio=${(unsupportedRatio * 100).toFixed(0)}% > max=${(maxUnsupported * 100).toFixed(0)}% (unsupported: [${unsupportedTerms.join(", ")}]) -> insufficient_coverage`
       );
-
       return {
         supported: false,
-        reason: "insufficient_evidence",
+        reason: "insufficient_coverage",
+        unsupportedTerms
       };
     }
 
-    if (
-      terms.length >= 3 &&
-      coverage < 0.25 &&
-      topSim < STRONG_SEMANTIC
-    ) {
-      console.log(
-        `[Evidence Gate] Coverage ${(
-          coverage * 100
-        ).toFixed(
-          0
-        )}% and similarity ${topSim.toFixed(
-          3
-        )} too low -> insufficient_evidence`
-      );
-
+    if (unsupportedTerms.length === contentTerms.length && topSim < STRONG_SEMANTIC) {
       return {
         supported: false,
         reason: "insufficient_evidence",
+        unsupportedTerms
       };
     }
   }
@@ -1050,6 +1098,125 @@ function isCurrencyAssociatedWithEntity(occ, entity, normalizedContext) {
 }
 
 /**
+ * Extracts genuine code identifiers and programming tokens from text:
+ * - Programming operators (===, !==, ==, !=, <=, >=, &&, ||, ++, --, +=, -=, *=, /=, =>, ->, ::)
+ * - Structural dotted paths (e.g. Math.sqrt, console.log, arr.length, pkg.Class)
+ * - Snake_case tokens with underscores (e.g. user_id, process_data, MAX_VAL, _private)
+ * - Compound CamelCase / PascalCase with internal capitalization (e.g. myFunction, UserService)
+ * - Tokens with dollar signs (e.g. $scope, jQuery, $el)
+ * - Bracket indexing syntax (e.g. arr[i], items[0])
+ * - Syntactic function call invocations strictly attached with parens without whitespace
+ * - Identifiers declared or assigned in fenced code blocks
+ *
+ * Ordinary English words in prose are NEVER treated as code identifiers.
+ */
+export function extractCodeIdentifiers(text = "") {
+  if (!text) return [];
+  const out = new Set();
+
+  // 1. Actual programming operators (>= 2 chars)
+  const operators = text.match(/(?:===|!==|==|!=|<=|>=|&&|\|\||\+\+|--|\+=|-=|\*=|(?<!\/)\/=(?!\/)|\b=>|->|::)/g) || [];
+  for (const op of operators) {
+    out.add(op);
+  }
+
+  // 2. Tokens with structural dots (e.g. Math.sqrt, console.log, arr.length, pkg.Class)
+  // Excludes file extensions and common Latin abbreviations
+  const dotted = text.match(/\b[a-zA-Z_$][a-zA-Z0-9_$]*(?:\.[a-zA-Z_$][a-zA-Z0-9_$]+)+\b/g) || [];
+  for (const d of dotted) {
+    if (
+      !/\.(?:pdf|csv|xlsx?|docx?|txt|pptx?|png|jpe?g|gif|webp|svg|html?|css|json)$/i.test(d) &&
+      !/^(?:e\.g|i\.e|vs)\b/i.test(d)
+    ) {
+      out.add(d);
+    }
+  }
+
+  // 3. Tokens with underscores (snake_case, SCREAMING_SNAKE, leading/trailing underscore)
+  const snake = text.match(/\b[a-zA-Z0-9$]*_[a-zA-Z0-9_$]+\b|\b_[a-zA-Z0-9_$]+\b/g) || [];
+  for (const s of snake) {
+    if (s.length >= 3 && /[a-zA-Z]/.test(s)) {
+      out.add(s);
+    }
+  }
+
+  // 4. CamelCase or compound PascalCase (internal uppercase transitions: lower/digit followed by upper, or upper-lower-upper)
+  // Ordinary English words (e.g. "different", "Types", "Because") NEVER match this.
+  const camel = text.match(/\b(?:[a-z0-9]+[A-Z]|[A-Z]+[a-z0-9]+[A-Z])[a-zA-Z0-9]*\b/g) || [];
+  for (const c of camel) {
+    if (c.length >= 3 && !isNumberWordToken(c)) {
+      out.add(c);
+    }
+  }
+
+  // 5. Tokens with dollar signs (e.g. $scope, jQuery, $el), excluding currency amounts
+  const dollars = text.match(/\b[a-zA-Z0-9]*\$[a-zA-Z0-9_$]*\b|\$[a-zA-Z0-9_$]+\b/g) || [];
+  for (const d of dollars) {
+    if (d.length >= 2 && !/^\$\d+/.test(d)) {
+      out.add(d);
+    }
+  }
+
+  // 6. Bracketed member / array indexing syntax (e.g. arr[i], items[0], data[])
+  const bracketed = text.match(/\b[a-zA-Z_$][a-zA-Z0-9_$]*\[[^\]\n]{0,30}\]/g) || [];
+  for (const b of bracketed) {
+    out.add(b);
+  }
+
+  // 7. Function call invocations (strictly attached parentheses without intervening whitespace)
+  // 7a. Direct empty parentheses: e.g. render(), getData(), toString()
+  const emptyParens = text.match(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\(\s*\)/g) || [];
+  for (const ep of emptyParens) {
+    const fnName = ep.replace(/\(\s*\)/, "").trim();
+    if (fnName.length >= 2) {
+      out.add(fnName);
+    }
+  }
+
+  // 7b. Parentheses with code arguments: e.g. Math.max(a, b), parseInt("10"), calc(x)
+  // Requires NO whitespace between identifier and '(', and arguments must not be English prose.
+  const argCalls = text.match(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\(([^()\n]+)\)/g) || [];
+  for (const ac of argCalls) {
+    const m = ac.match(/^([a-zA-Z_$][a-zA-Z0-9_$]*)\((.*)\)$/);
+    if (!m) continue;
+    const fnName = m[1];
+    const argsText = m[2].trim();
+    // Exclude English prose parentheticals
+    const isProse =
+      /[;:!?]/.test(argsText) ||
+      /\b(?:e\.g|i\.e|such as|for example|because|which|that|when|and|or|they|it|is|are|with|from)\b/i.test(argsText) ||
+      argsText.split(",").some((part) => part.trim().split(/\s+/).length > 2);
+
+    if (!isProse && argsText.length <= 60 && fnName.length >= 2) {
+      if (
+        /[_$.]/.test(fnName) ||
+        /[a-z0-9][A-Z]/.test(fnName) ||
+        /^[a-zA-Z0-9_$,\s'"]+$/.test(argsText)
+      ) {
+        out.add(fnName);
+      }
+    }
+  }
+
+  // 8. Declarations and assignments inside fenced code blocks
+  const codeBlocks = text.match(/```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)```/g) || [];
+  for (const cb of codeBlocks) {
+    const decls = cb.match(/(?:const|let|var|function|def|class|val|int|float|double|char|boolean|void)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g) || [];
+    for (const d of decls) {
+      const id = d.replace(/^(?:const|let|var|function|def|class|val|int|float|double|char|boolean|void)\s+/, "").trim();
+      if (id.length >= 2) out.add(id);
+    }
+    const assigns = cb.match(/^\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=[^=]/gm) || [];
+    for (const a of assigns) {
+      const id = a.replace(/\s*=[^=].*$/, "").trim();
+      if (id.length >= 2) out.add(id);
+    }
+  }
+
+  return [...out];
+}
+
+/**
  * Post-generation factual grounding.
  */
 export function verifyAnswerGrounding(
@@ -1283,6 +1450,29 @@ export function verifyAnswerGrounding(
     };
   }
 
+  // ---------------------------------------------------------
+  // 4. Code identifier grounding (Requirement 6)
+  // ---------------------------------------------------------
+  const codeIdentifiers = extractCodeIdentifiers(answer);
+  const badCodeIdentifiers = [];
+  for (const cid of codeIdentifiers) {
+    if (isEntityInContext(cid, question) || questionLower.includes(cid.toLowerCase())) {
+      continue;
+    }
+    const inContext = isEntityInContext(cid, cleanContext) || contextLower.includes(cid.toLowerCase());
+    if (!inContext) {
+      badCodeIdentifiers.push(cid);
+    }
+  }
+
+  if (badCodeIdentifiers.length > 0) {
+    return {
+      valid: false,
+      reason: "unsupported_code_identifier",
+      unsupported: badCodeIdentifiers.map((c) => `Code: ${c}`),
+    };
+  }
+
   return {
     valid: true,
     reason: null,
@@ -1392,7 +1582,7 @@ export async function generateAnswerDetailed(
 
   // 1. Pre-generation evidence gate.
   const gate =
-    checkEvidenceSupportGate(
+    await checkEvidenceSupportGate(
       question,
       contextPrompt,
       queryType,
@@ -1565,7 +1755,7 @@ export async function streamAnswer(
 ) {
   // 1. Pre-generation evidence gate.
   const gate =
-    checkEvidenceSupportGate(
+    await checkEvidenceSupportGate(
       question,
       contextPrompt,
       queryType,
@@ -1732,12 +1922,12 @@ export function isProgramInContext(
   );
 }
 
-export function checkProgramEntityGrounding(
+export async function checkProgramEntityGrounding(
   question = "",
   contextPrompt = ""
 ) {
   const gate =
-    checkEvidenceSupportGate(
+    await checkEvidenceSupportGate(
       question,
       contextPrompt
     );
@@ -1949,6 +2139,7 @@ export async function warmOllamaModels() {
           messages: [{ role: "user", content: "warmup" }],
           stream: false,
           options: { num_predict: 1 },
+          
           keep_alive: "30m"
         },
         { timeout: 15000 }

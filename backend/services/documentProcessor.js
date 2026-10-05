@@ -717,6 +717,13 @@ export async function processDocument(documentId) {
           console.warn(`[DocumentProcessor] OCR extraction notice for ${img.filename}: ${ocrErr.message}`);
         }
 
+        const deptIds = Array.isArray(document.departmentIds) && document.departmentIds.length > 0
+          ? document.departmentIds
+          : (document.departmentId ? [document.departmentId] : []);
+        const deptNames = Array.isArray(document.departments) && document.departments.length > 0
+          ? document.departments
+          : [document.department || "General"];
+
         const imageRecord = await ImageModel.create({
           imageId: img.imageId,
           documentId: document._id,
@@ -725,7 +732,11 @@ export async function processDocument(documentId) {
           filename: img.filename,
           imagePath: img.filePath,
           mimeType: img.mimeType,
+          departmentId: document.departmentId || null,
+          departmentIds: deptIds,
           department: document.department || "General",
+          departments: deptNames,
+          isTestData: document.isTestData || false,
           embedding: siglipEmb,
           caption: img.caption || "",
           description: img.description || "",
@@ -744,7 +755,11 @@ export async function processDocument(documentId) {
             pageNumber: img.pageNumber || 1,
             chunkIndex: 0, // reassigned below
             content: chunkContent,
+            departmentId: document.departmentId || null,
+            departmentIds: deptIds,
             department: document.department || "General",
+            departments: deptNames,
+            isTestData: document.isTestData || false,
             sourceType: "image_chunk",
             sourcePath: img.filePath,
             imageRef: {

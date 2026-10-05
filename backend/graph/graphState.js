@@ -79,5 +79,9 @@ export const RAGStateAnnotation = Annotation.Root({
   fallbackReason: Annotation({
     reducer: (curr, update) => update ?? curr,
     default: () => null
+  }),
+  onEvent: Annotation({
+    reducer: (curr, update) => update ?? curr,
+    default: () => null
   })
 });

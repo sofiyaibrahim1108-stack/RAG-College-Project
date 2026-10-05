@@ -27,6 +27,10 @@ export const RAG_CONFIG = {
   queryRewriteTimeoutMs: 5000,
   tabularFuzzyMaxEdit: 2,
   tabularFuzzyMinLength: 3,
+  routerCloseScoreRatio: 0.80,
+  questionTermMaxUnsupportedRatio: 0.40,
+  termEmbeddingMinSim: 0.50,
+  rewriteTimeoutMs: 5000,
   historyWindow: 3, // number of previous messages to consider in context
   llm: {
     temperature: 0.2,

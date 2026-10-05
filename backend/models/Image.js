@@ -20,7 +20,15 @@ const ImageSchema = new mongoose.Schema(
       default: null,
       index: true
     },
-    department: { type: String, required: true, trim: true, index: true },
+    department: { type: String, trim: true, index: true },
+    departmentIds: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Department",
+        index: true
+      }
+    ],
+    departments: [{ type: String, trim: true, index: true }],
     isTestData: { type: Boolean, default: false, index: true },
     embedding: {
       type: [Number],
@@ -37,5 +45,6 @@ const ImageSchema = new mongoose.Schema(
 );
 
 ImageSchema.index({ documentId: 1, pageNumber: 1 });
+ImageSchema.index({ departments: 1, documentId: 1 });
 
 export const ImageModel = mongoose.model("Image", ImageSchema);

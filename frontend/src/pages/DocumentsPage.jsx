@@ -364,9 +364,19 @@ export function DocumentsPage() {
                   </p>
 
                   <div className="mt-4 pt-3 border-t border-neutral-100 dark:border-neutral-800/80 flex items-center justify-between text-sm text-neutral-600 dark:text-neutral-400">
-                    <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-neutral-100 dark:bg-neutral-800 text-neutral-800 dark:text-neutral-200">
-                      {doc.department}
-                    </span>
+                    <div className="flex flex-wrap gap-1 max-w-[60%]">
+                      {Array.isArray(doc.departments) && doc.departments.length > 0 ? (
+                        doc.departments.map((deptName) => (
+                          <span key={deptName} className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-neutral-100 dark:bg-neutral-800 text-neutral-800 dark:text-neutral-200">
+                            {deptName}
+                          </span>
+                        ))
+                      ) : (
+                        <span className="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-neutral-100 dark:bg-neutral-800 text-neutral-800 dark:text-neutral-200">
+                          {doc.department}
+                        </span>
+                      )}
+                    </div>
 
                     <div className="flex items-center gap-3 text-sm">
                       <span className="flex items-center gap-1 font-medium text-neutral-700 dark:text-neutral-300">
@@ -488,7 +498,9 @@ export function DocumentsPage() {
                   {selectedDocDetails.document.originalName} • {selectedDocDetails.chunks?.length || 0} Chunks •{" "}
                   {selectedDocDetails.images?.length || 0} Extracted Images • Department:{" "}
                   <span className="font-medium text-neutral-700 dark:text-neutral-300">
-                    {selectedDocDetails.document.department}
+                    {Array.isArray(selectedDocDetails.document.departments) && selectedDocDetails.document.departments.length > 0
+                      ? selectedDocDetails.document.departments.join(", ")
+                      : selectedDocDetails.document.department}
                   </span>
                 </p>
               </div>
