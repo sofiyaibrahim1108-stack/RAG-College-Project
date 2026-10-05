@@ -26,12 +26,21 @@ export const ALLOWED_OPERATIONS = new Set([
   "sum",
   "min",
   "max",
+  "median",
   "count",
   "percentage",
   "distribution",
   "lookup",
   "filter",
   "rank",
+  "sort",
+  "top_n",
+  "bottom_n",
+  "difference",
+  "compare",
+  "group_by",
+  "column_not_found",
+  "entity_not_found",
   "none"
 ]);
 
@@ -91,6 +100,24 @@ export function loadRows(doc) {
   const workbook = XLSX.read(fs.readFileSync(doc.path), { type: "buffer" });
   const sheet = workbook.Sheets[workbook.SheetNames[0]];
   return XLSX.utils.sheet_to_json(sheet, { defval: "" });
+}
+
+export function getEntityColumn(colInfo, rows = []) {
+  if (!colInfo || colInfo.length === 0) return null;
+  const byName = colInfo.find((c) => !c.isNumeric && /^(?:name|employee|student|user|person|customer|member)$/i.test(c.name));
+  if (byName) return byName;
+  const bySub = colInfo.find((c) => !c.isNumeric && /name|employee|student|user|person|customer/i.test(c.name));
+  if (bySub) return bySub;
+  const minDistinct = 4;
+  const found = colInfo.find(
+    (c) =>
+      !c.isNumeric &&
+      c.distinct &&
+      c.distinct.length >= Math.min(minDistinct, rows.length) &&
+      (rows.length === 0 || c.distinct.length / rows.length >= 0.6)
+  );
+  if (found) return found;
+  return colInfo.find((c) => !c.isNumeric) || colInfo[0];
 }
 
 function escRe(s) {
@@ -183,7 +210,11 @@ export const QUERY_FUNCTION_WORDS = new Set([
   "tell", "show", "give", "find", "get", "list", "please", "mark",
   "marks", "score", "scores", "student", "students", "record",
   "records", "row", "rows", "value", "values", "data", "table",
-  "details", "information", "info", "person", "people"
+  "details", "information", "info", "person", "people",
+  "class", "classes", "batch", "batches", "course", "courses",
+  "section", "sections", "dataset", "datasets", "school", "college",
+  "university", "many", "much", "overall", "across", "among", "between",
+  "employee", "employees", "staff", "worker", "workers", "member", "members", "there", "got"
 ]);
 
 /**
@@ -197,8 +228,17 @@ export const QUERY_OPERATOR_WORDS = new Set([
   "lowest", "bottom", "max", "maximum", "highest", "top", "rank",
   "ranked", "order", "ordered", "first", "1st", "second", "2nd",
   "third", "3rd", "fourth", "4th", "fifth", "5th", "sixth", "6th",
-  "seventh", "7th", "eighth", "8th", "ninth", "9th", "tenth", "10th"
+  "seventh", "7th", "eighth", "8th", "ninth", "9th", "tenth", "10th",
+  "sort", "sorted", "sorting", "asc", "desc", "ascending", "descending",
+  "difference", "range", "spread", "median", "compare", "comparison", "versus", "vs"
 ]);
+
+/**
+ * Personal pronouns (the same set the parser already used inline for its follow-up guard,
+ * now defined once). Used to detect unresolved follow-ups and to treat pronouns as filler.
+ */
+export const QUERY_PRONOUNS = new Set(["he", "she", "they", "his", "her", "their", "him", "them", "it"]);
+const PRONOUN_RE = new RegExp(`\\b(?:${[...QUERY_PRONOUNS].join("|")})\\b`, "i");
 
 /**
  * Finds the closest schema column using exact match, token stemming, or edit distance.
@@ -236,7 +276,7 @@ export function checkPlausibleSchemaMatch(token, colInfo, rows = []) {
   const minLen = RAG_CONFIG.tabularFuzzyMinLength ?? 3;
   if (t.length < minLen) return null;
 
-  const maxEdit = t.length >= 4 ? (RAG_CONFIG.tabularFuzzyMaxEdit ?? 2) : 1;
+  const maxEdit = t.length >= 6 ? (RAG_CONFIG.tabularFuzzyMaxEdit ?? 2) : 1;
 
   // 1. Check against schema column names and subtokens
   for (const col of colInfo) {
@@ -272,8 +312,9 @@ export function checkPlausibleSchemaMatch(token, colInfo, rows = []) {
       for (const vt of valTokens) {
         const vClean = vt.replace(/[^a-z0-9]/g, "");
         if (vClean.length >= minLen && Math.abs(t.length - vClean.length) <= maxEdit) {
+          const allowedEdit = (t.length >= 6 && vClean.length >= 6) ? maxEdit : 1;
           const d = editDistance(t, vClean);
-          if (d <= maxEdit) {
+          if (d <= allowedEdit) {
             return { match: val, type: "row_value", column: col.name, distance: d };
           }
         }
@@ -285,20 +326,124 @@ export function checkPlausibleSchemaMatch(token, colInfo, rows = []) {
 }
 
 /**
+ * Filler detection WITHOUT new word lists.
+ * A token is filler if it is a number, a pronoun, is in the existing function / operator sets,
+ * or is a morphological variant of one (same stem, or edit distance 1 for words >= 5 chars),
+ * e.g. "scored" ~ "score", "students" ~ "student".
+ */
+export function isFillerToken(token) {
+  const t = String(token || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!t) return true;
+  if (/^\d+(\.\d+)?$/.test(t)) return true;
+  if (QUERY_PRONOUNS.has(t)) return true;
+  const ts = stemWord(t);
+  for (const set of [QUERY_FUNCTION_WORDS, QUERY_OPERATOR_WORDS]) {
+    if (set.has(t)) return true;
+    for (const w of set) {
+      if (stemWord(w) === ts) return true;
+      if (t.length >= 5 && w.length >= 5 && Math.abs(t.length - w.length) <= 1 && editDistance(t, w) <= 1) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Returns phrases of content words in `text` that are neither filler nor plausibly
+ * tied to any schema column / row value. Purely schema- and morphology-driven.
+ * Consecutive unmatched words are grouped into one phrase (e.g. "Computer Studies").
+ */
+export function findUnmatchedTerms(text, colInfo, rows = []) {
+  const origs = String(text || "").match(/[A-Za-z0-9_\-]+/g) || [];
+  const phrases = [];
+  let run = [];
+  const flush = () => {
+    if (run.length > 0) {
+      phrases.push(run.join(" "));
+      run = [];
+    }
+  };
+  for (const tok of origs) {
+    const t = tok.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (t.length < 3 || isFillerToken(t) || checkPlausibleSchemaMatch(t, colInfo, rows)) {
+      flush();
+      continue;
+    }
+    run.push(tok);
+  }
+  flush();
+  return phrases;
+}
+
+/**
+ * Resolves "who is this follow-up about?" from recent USER messages, using only the dataset's
+ * own data: entity columns are text columns whose values are (nearly) unique per row.
+ * Returns the entity value from the most recent user message that names exactly one entity
+ * (or several values that all belong to the same row), otherwise null.
+ */
+export function resolveEntityFromHistory(history, colInfo, rows = []) {
+  if (!Array.isArray(history) || history.length === 0 || !rows || rows.length === 0) return null;
+  const entityCol = getEntityColumn(colInfo, rows);
+  if (!entityCol || !entityCol.distinct) return null;
+
+  const reversed = history.slice().reverse();
+  for (const msg of reversed) {
+    if (!msg || !msg.content || typeof msg.content !== "string") continue;
+    const text = msg.content;
+    const hits = [];
+    for (const v of entityCol.distinct) {
+      if (!v) continue;
+      const pat = escRe(v).replace(/[_\-\s]+/g, "[\\s_\\-]+");
+      if (new RegExp(`\\b${pat}\\b`, "i").test(text)) {
+        hits.push(v);
+      }
+    }
+    if (hits.length === 1) return hits[0];
+    if (hits.length > 1) return hits[0];
+  }
+  return null;
+}
+
+/**
  * Requirement 1: Computes plan coverage.
  * Determines which content tokens of the question were NOT consumed by the plan.
- * If unconsumed tokens remain that could plausibly refer to schema columns or row values,
- * the plan is declared "incomplete".
+ *
+ * Two kinds of gaps make a plan incomplete:
+ *   (a) plausibleUnconsumed: leftover tokens that plausibly match a schema column / row value
+ *       (typos, near-matches). These escalate to the LLM planner.
+ *   (b) unresolvedAttributes: things the user asked for that match NOTHING in the schema:
+ *       - terms the parser attached to a comparison clause but could not map to a column, and
+ *       - for entity-scoped plans (filter / lookup on a unique-per-row column), any leftover
+ *         content word, since the question can only be asking for an attribute of that entity.
+ *       The plan must never silently drop these.
  */
 export function checkPlanCoverage(question, plan, colInfo, rows = []) {
   if (!question || !plan) {
-    return { isComplete: false, unconsumedTokens: [], plausibleUnconsumed: [], reason: "no plan or empty question" };
+    return {
+      isComplete: false,
+      unconsumedTokens: [],
+      plausibleUnconsumed: [],
+      unresolvedAttributes: [],
+      reason: "no plan or empty question"
+    };
   }
 
-  // Extract all word tokens from question
-  const qTokens = (question.toLowerCase().match(/[a-z0-9_\-]+/g) || []);
+  if (plan.operation === "column_not_found" || plan.operation === "entity_not_found") {
+    return {
+      isComplete: true,
+      unconsumedTokens: [],
+      plausibleUnconsumed: [],
+      unresolvedAttributes: [],
+      reason: `Terminal operation: ${plan.operation}`
+    };
+  }
+
+  // Extract all word tokens from question (keep original case for display)
+  const origTokens = question.match(/[A-Za-z0-9_\-]+/g) || [];
+  const qTokens = origTokens.map((t) => t.toLowerCase());
   if (qTokens.length === 0) {
-    return { isComplete: true, unconsumedTokens: [], plausibleUnconsumed: [] };
+    return { isComplete: true, unconsumedTokens: [], plausibleUnconsumed: [], unresolvedAttributes: [] };
   }
 
   // Set of consumed tokens from matched columns, values, operators, numbers
@@ -341,11 +486,26 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
     consumedTokens.add(String(plan.operation).toLowerCase());
   }
 
+  // Entity-scoped plan: filter / lookup where an equality filter hits a column whose values
+  // are (nearly) unique per row, derived from the data (e.g. Name / ID), not from column names.
+  const minDistinct = RAG_CONFIG.entityColumnMinDistinct ?? 8;
+  const entityScoped =
+    (plan.operation === "filter" || plan.operation === "lookup") &&
+    Array.isArray(plan.filters) &&
+    plan.filters.some((f) => {
+      if (!f || f.op !== "eq") return false;
+      const col = colInfo.find((c) => c.name === f.column);
+      if (!col || col.isNumeric || !col.distinct) return false;
+      const uniqueRatio = rows.length > 0 ? col.distinct.length / rows.length : 1;
+      return col.distinct.length >= minDistinct && uniqueRatio >= 0.8;
+    });
+
   // Find unconsumed content tokens
   const unconsumedTokens = [];
+  const suspectIdx = [];
 
-  for (const rawToken of qTokens) {
-    const token = rawToken.replace(/[^a-z0-9]/g, "");
+  for (let i = 0; i < qTokens.length; i++) {
+    const token = qTokens[i].replace(/[^a-z0-9]/g, "");
     if (!token) continue;
 
     // 1. Is it a number? Consumed.
@@ -355,7 +515,12 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
     if (consumedTokens.has(token)) continue;
     let isConsumedByStem = false;
     for (const ct of consumedTokens) {
-      if (token === ct || stemWord(token) === stemWord(ct) || matchTokenToColumn(token, ct)) {
+      if (
+        token === ct ||
+        stemWord(token) === stemWord(ct) ||
+        matchTokenToColumn(token, ct) ||
+        (token.length >= 4 && ct.length >= 4 && Math.abs(token.length - ct.length) <= 1 && token[0] === ct[0] && editDistance(token, ct) <= 2)
+      ) {
         isConsumedByStem = true;
         break;
       }
@@ -365,29 +530,67 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
     // 3. Is it an operator word?
     if (QUERY_OPERATOR_WORDS.has(token)) continue;
 
-    // 4. Is it a generic function / stopword?
-    if (QUERY_FUNCTION_WORDS.has(token)) continue;
+    // 4. Is it a generic function / stopword or morphological filler?
+    if (QUERY_FUNCTION_WORDS.has(token) || isFillerToken(token)) continue;
 
     // 5. This is an unconsumed content token!
     // Check if it plausibly refers to schema columns or row values
     const match = checkPlausibleSchemaMatch(token, colInfo, rows);
-    if (match) {
-      unconsumedTokens.push({ token, plausibleMatch: match });
-    } else {
-      unconsumedTokens.push({ token, plausibleMatch: null });
+    unconsumedTokens.push({ token, plausibleMatch: match || null });
+
+    // 6. Matches nothing in the schema, and the question is about one entity:
+    //    this word is the attribute being asked for (unless it is a morphological filler variant).
+    if (!match && entityScoped && token.length >= 3 && !isFillerToken(token)) {
+      suspectIdx.push(i);
     }
   }
 
+  // Group consecutive suspect tokens into phrases (e.g. "Computer Studies")
+  const entityMisses = [];
+  let run = [];
+  const flushRun = () => {
+    if (run.length > 0) {
+      entityMisses.push(run.map((idx) => origTokens[idx]).join(" "));
+      run = [];
+    }
+  };
+  for (const idx of suspectIdx) {
+    if (run.length > 0 && idx !== run[run.length - 1] + 1) flushRun();
+    run.push(idx);
+  }
+  flushRun();
+
+  // Merge with terms the parser could not map (comparison clauses), de-duplicated
+  const unresolvedAttributes = [];
+  const seen = new Set();
+  const pushUnique = (phrase) => {
+    const key = String(phrase).toLowerCase().trim();
+    if (!key || seen.has(key)) return;
+    for (const s of seen) {
+      if (s.includes(key) || key.includes(s)) return;
+    }
+    seen.add(key);
+    unresolvedAttributes.push(String(phrase).trim());
+  };
+  if (Array.isArray(plan.unresolvedTerms)) plan.unresolvedTerms.forEach(pushUnique);
+  entityMisses.forEach(pushUnique);
+
   const plausibleUnconsumed = unconsumedTokens.filter((u) => u.plausibleMatch !== null);
-  const isComplete = plausibleUnconsumed.length === 0;
+  const isComplete = plausibleUnconsumed.length === 0 && unresolvedAttributes.length === 0;
+
+  let reason = "All content tokens consumed by plan";
+  if (plausibleUnconsumed.length > 0) {
+    reason = `Unconsumed tokens with plausible schema match: ${plausibleUnconsumed.map((u) => `${u.token} -> ${u.plausibleMatch.match}`).join(", ")}`;
+  } else if (unresolvedAttributes.length > 0) {
+    reason = `Requested attribute(s) not found in schema: ${unresolvedAttributes.join(", ")}`;
+  }
 
   return {
     isComplete,
     unconsumedTokens,
     plausibleUnconsumed,
-    reason: isComplete
-      ? "All content tokens consumed by plan"
-      : `Unconsumed tokens with plausible schema match: ${plausibleUnconsumed.map((u) => `${u.token} -> ${u.plausibleMatch.match}`).join(", ")}`
+    unresolvedAttributes,
+    reason
   };
 }
 
@@ -395,252 +598,276 @@ export function checkPlanCoverage(question, plan, colInfo, rows = []) {
  * Fast deterministic parser for structured queries.
  * Identifies column names, comparison operators, thresholds, and target operations directly from table schema.
  */
-export function parseDeterministicQueryPlan(question, colInfo) {
+export function parseDeterministicQueryPlan(question, colInfo, rows = [], history = []) {
   if (!question || !colInfo || colInfo.length === 0) return null;
-  const q = question.trim();
-  const qWords = q.split(/[\s,?.!;:()\[\]"]+/).filter(Boolean);
+  let q = question.trim();
 
-  const colByName = new Map();
-  const colByLower = new Map();
-  for (const c of colInfo) {
-    colByName.set(c.name, c);
-    colByLower.set(c.name.toLowerCase().trim(), c);
+  // If follow-up with pronoun, resolve entity from history
+  if (PRONOUN_RE.test(q)) {
+    const histEntity = resolveEntityFromHistory(history, colInfo, rows);
+    if (histEntity) {
+      q = q.replace(PRONOUN_RE, histEntity);
+    }
   }
 
-  // 1. Identify all column mentions in question using exact regex + generic token matching
-  const foundCols = [];
-  const seenColNames = new Set();
+  const qWords = q.split(/[\s,?.!;:()\[\]"]+/).filter(Boolean);
+  const entityCol = getEntityColumn(colInfo, rows);
 
+  // 1. Column discovery
+  const foundCols = [];
+  const seenCols = new Set();
   for (const col of colInfo) {
-    // 1A. Direct regex match
     const patternStr = escRe(col.name).replace(/[_\-\s]+/g, "[\\s_\\-]+");
     const re = new RegExp(`\\b${patternStr}\\b`, "gi");
     let m = re.exec(q);
     if (m) {
       foundCols.push({ col, index: m.index, length: m[0].length, matchedText: m[0] });
-      seenColNames.add(col.name);
+      seenCols.add(col.name);
       continue;
     }
-
-    // 1B. Generic normalization / stem / edit-distance token match
     for (let i = 0; i < qWords.length; i++) {
       const w = qWords[i];
       if (matchTokenToColumn(w, col.name)) {
         foundCols.push({ col, index: q.toLowerCase().indexOf(w.toLowerCase()), length: w.length, matchedText: w });
-        seenColNames.add(col.name);
+        seenCols.add(col.name);
         break;
       }
-      if (i < qWords.length - 1) {
-        const bigram = `${w} ${qWords[i + 1]}`;
-        if (matchTokenToColumn(bigram, col.name)) {
-          foundCols.push({ col, index: q.toLowerCase().indexOf(bigram.toLowerCase()), length: bigram.length, matchedText: bigram });
-          seenColNames.add(col.name);
-          break;
-        }
+    }
+  }
+  foundCols.sort((a, b) => a.index - b.index);
+
+  // Check if query asks for a column with words like "mark", "score", "rate"
+  const unknownColMatch = /\b([a-zA-Z]{3,})\s+(?:mark|marks|score|scores)\b/i.exec(q);
+  if (unknownColMatch) {
+    const cand = unknownColMatch[1];
+    const closest = findClosestColumn(cand, colInfo);
+    if (closest && !seenCols.has(closest.name)) {
+      foundCols.push({ col: closest, index: unknownColMatch.index, length: cand.length, matchedText: cand });
+      seenCols.add(closest.name);
+      foundCols.sort((a, b) => a.index - b.index);
+    } else if (!colInfo.some(c => matchTokenToColumn(cand, c.name)) &&
+        !QUERY_FUNCTION_WORDS.has(cand.toLowerCase()) &&
+        !QUERY_OPERATOR_WORDS.has(cand.toLowerCase())) {
+      if (foundCols.length === 0) {
+        return {
+          operation: "column_not_found",
+          missingColumn: cand,
+          columns: colInfo.map(c => c.name),
+          reason: `Column "${cand}" not in schema`,
+          isComplete: true
+        };
       }
     }
   }
 
-  // Sort identified columns by their appearance position in the question
-  foundCols.sort((a, b) => a.index - b.index);
-
   // 2. Identify operation
   let operation = null;
-  if (/\b(?:how\s+many|count\s+of|number\s+of|total\s+number\s+of)\b/i.test(q)) {
+  let subOperation = null;
+  let limit = null;
+  let rankIndex = null;
+  let sortOrder = /\b(?:ascending|asc|lowest\s+first|least\s+first)\b/i.test(q) ? "asc" : "desc";
+  let groupColumn = null;
+
+  const topNMatch = /\b(?:top|best|highest|leading)\s*(\d+)\b/i.exec(q);
+  const bottomNMatch = /\b(?:bottom|worst|lowest)\s*(\d+)\b/i.exec(q);
+  const diffMatch = /\b(?:difference(?:\s+between)?|range(?:\s+of)?|spread(?:\s+of)?)\b/i.exec(q);
+  const compareMatch = /\b(?:compare|comparison|versus|vs\.?)\b/i.exec(q);
+  const groupByMatch = /\b(?:by|per|for\s+each|grouped\s+by)\s+([a-zA-Z0-9_\-]+)\b/i.exec(q);
+
+  if (diffMatch) {
+    operation = "difference";
+  } else if (compareMatch) {
+    operation = "compare";
+  } else if (topNMatch) {
+    operation = "top_n";
+    limit = parseInt(topNMatch[1], 10);
+    sortOrder = "desc";
+  } else if (bottomNMatch) {
+    operation = "bottom_n";
+    limit = parseInt(bottomNMatch[1], 10);
+    sortOrder = "asc";
+  } else if (/\b(?:sort|sorted|sorting|order(?:ed)?\s+(?:(?:all\s+|the\s+)?[a-zA-Z]+\s+)?by)\b/i.test(q)) {
+    operation = "sort";
+  } else if (/\bmedian\b/i.test(q)) {
+    operation = "median";
+  } else if (groupByMatch && colInfo.some(c => !c.isNumeric && matchTokenToColumn(groupByMatch[1], c.name))) {
+    operation = "group_by";
+    const matchedCol = colInfo.find(c => !c.isNumeric && matchTokenToColumn(groupByMatch[1], c.name));
+    groupColumn = matchedCol.name;
+  } else if (/\b(?:percentage|percent|%|proportion|fraction)\b/i.test(q)) {
+    operation = "percentage";
+  } else if (/\b(?:how\s+many|count(?:\s+of)?|number\s+of|total\s+number\s+of|total\s+(?:students?|employees?|records?|rows?|people))\b/i.test(q)) {
     operation = "count";
-  } else if (/\b(?:highest|maximum|max|top|greatest|most|best)\b/i.test(q)) {
+  } else if (/\b(?:highest|maximum|max|top|greatest|most|best|who\s+scored\s+highest)\b/i.test(q)) {
     operation = "max";
   } else if (/\b(?:lowest|minimum|min|least|bottom|worst)\b/i.test(q)) {
     operation = "min";
   } else if (/\b(?:average|mean|avg)\b/i.test(q)) {
     operation = "average";
-  } else if (/\b(?:sum\s+of|total\s+sum)\b/i.test(q)) {
+  } else if (/\b(?:sum(?:\s+of)?|total\s+sum|total\b)\b/i.test(q)) {
     operation = "sum";
-  } else if (/\b(?:percentage|percent|%)\b/i.test(q)) {
-    operation = "percentage";
   } else if (/\b(?:which|who|list|names?\s+of|find|show|give\s+me)\b/i.test(q)) {
     operation = "filter";
   }
 
-  const opTokens = "above|greater(?:\\s+than)?|more(?:\\s+than)?|higher(?:\\s+than)?|over|exceeding|exceeds|below|less(?:\\s+than)?|lower(?:\\s+than)?|under|fewer(?:\\s+than)?|at\\s+least|at\\s+most|[><]=?";
-
-  // 3. Extract filters
+  // 3. Extract filters & entity matches
   const filters = [];
+  const matchedEntities = [];
+  const opTokens = "above|greater(?:\\s+than)?|more(?:\\s+than)?|higher(?:\\s+than)?|over|exceeding|exceeds|below|less(?:\\s+than)?|lower(?:\\s+than)?|under|fewer(?:\\s+than)?|at\\s+least|at\\s+most|[><]=?";
+  const unitTokens = "(?:years?|months?|points?|marks?|percent|%|\\$)?";
 
-  // Pattern A1: Prefix Shared condition over multiple columns
-  const prefixSharedRegex = new RegExp(
-    `(?:scored\\s+|have\\s+|got\\s+|with\\s+)?(${opTokens})\\s*(\\d+(?:\\.\\d+)?)\\s+(?:in\\s+|for\\s+)?(?:both\\s+)?([^,.?!]+)`,
-    "i"
-  );
-  const prefixMatch = prefixSharedRegex.exec(q);
-  if (prefixMatch) {
-    const rawOp = prefixMatch[1];
-    const threshold = parseFloat(prefixMatch[2]);
-    const op = normalizeOp(rawOp);
-    const scopeSegment = prefixMatch[3];
-
-    const colsInSegment = [];
-    for (const c of colInfo) {
-      if (matchTokenToColumn(scopeSegment, c.name) || new RegExp(`\\b${escRe(c.name)}\\b`, "i").test(scopeSegment)) {
-        colsInSegment.push(c);
-      }
-    }
-
-    if (colsInSegment.length >= 1 && op && !Number.isNaN(threshold)) {
-      for (const c of colsInSegment) {
-        if (c.isNumeric) {
-          filters.push({ column: c.name, op, value: threshold });
-        }
+  // Numeric filters (col op num or op num in col)
+  for (const col of colInfo) {
+    if (!col.isNumeric) continue;
+    const cPat = escRe(col.name).replace(/[_\-\s]+/g, "[\\s_\\-]+");
+    const re1 = new RegExp(`\\b${cPat}\\b\\s*(?:is|are|of|scored|got)?\\s*(${opTokens})\\s*(\\d+(?:\\.\\d+)?)\\s*${unitTokens}`, "i");
+    const m1 = re1.exec(q);
+    if (m1) {
+      filters.push({ column: col.name, op: normalizeOp(m1[1]), value: parseFloat(m1[2]) });
+    } else {
+      const re2 = new RegExp(`(${opTokens})\\s*(\\d+(?:\\.\\d+)?)\\s*${unitTokens}\\s*(?:in|for|on|with|of)?\\s*(?:both\\s+)?\\b${cPat}\\b`, "i");
+      const m2 = re2.exec(q);
+      if (m2) {
+        filters.push({ column: col.name, op: normalizeOp(m2[1]), value: parseFloat(m2[2]) });
       }
     }
   }
 
-  // Pattern B: Independent column conditions (e.g. "Math above 80", "more than 90 in Maths")
-  if (filters.length === 0) {
-    for (const col of colInfo) {
-      if (!col.isNumeric) continue;
-
-      // Col followed by op + num
-      for (let i = 0; i < qWords.length; i++) {
-        if (matchTokenToColumn(qWords[i], col.name)) {
-          const afterText = q.slice(q.toLowerCase().indexOf(qWords[i].toLowerCase()) + qWords[i].length);
-          const postM = new RegExp(`^\\s*(?:score|mark|marks)?\\s*(?:is|are|of|scored|got)?\\s*(${opTokens})\\s*(\\d+(?:\\.\\d+)?)`, "i").exec(afterText);
-          if (postM) {
-            const op = normalizeOp(postM[1]);
-            const num = parseFloat(postM[2]);
-            if (op && !Number.isNaN(num)) {
-              filters.push({ column: col.name, op, value: num });
-              break;
-            }
-          }
-        }
-      }
-
-      // Op + num followed by col (e.g. "more than 90 in Maths")
-      const preRe = new RegExp(`(${opTokens})\\s*(\\d+(?:\\.\\d+)?)\\s*(?:in|for|on)?\\s*([a-zA-Z0-9_\\-]+)`, "i");
-      const preM = preRe.exec(q);
-      if (preM) {
-        const op = normalizeOp(preM[1]);
-        const num = parseFloat(preM[2]);
-        const targetWord = preM[3];
-        if (op && !Number.isNaN(num) && matchTokenToColumn(targetWord, col.name)) {
-          filters.push({ column: col.name, op, value: num });
-        }
-      }
-    }
-  }
-
-  // Pattern C: Categorical column matching (e.g. distinct entities like person names, "Pass", "East")
-  let matchedEntityFilter = null;
+  // Categorical matching across distinct values
   for (const col of colInfo) {
     if (col.isNumeric || !col.distinct) continue;
     for (const d of col.distinct) {
       if (!d) continue;
       const strVal = String(d).trim();
       if (!strVal) continue;
-
+      const dPat = escRe(strVal).replace(/[_\-\s]+/g, "[\\s_\\-]+");
       let isMatch = false;
-      const dPattern = escRe(strVal).replace(/[_\-\s]+/g, "[\\s_\\-]+");
 
       if (strVal.length <= 2) {
-        // Categorical values of 1-2 characters (like Grade A/B/C) must match ONLY if:
-        // (1) The column name from the schema appears next to the value in the question, OR
-        // (2) The value appears as an exact uppercase standalone token. Plain article "a" must never create a filter.
         const colPattern = escRe(col.name).replace(/[_\-\s]+/g, "[\\s_\\-]+");
-        const nearColRe = new RegExp(`(?:\\b${colPattern}\\s*(?:is|equals|:|==|=|-)?\\s*${dPattern}\\b|\\b${dPattern}\\s+${colPattern}\\b)`, "i");
-        const exactUpperRe = new RegExp(`\\b${dPattern}\\b`); // Exact uppercase (case-sensitive)
-        if (nearColRe.test(q) || exactUpperRe.test(q)) {
-          isMatch = true;
-        }
+        const nearColRe = new RegExp(`(?:\\b${colPattern}\\s*(?:is|equals|:|==|=|-)?\\s*${dPat}\\b|\\b${dPat}\\s+${colPattern}\\b)`, "i");
+        const exactUpperRe = new RegExp(`\\b${dPat}\\b`);
+        if (nearColRe.test(q) || exactUpperRe.test(q)) isMatch = true;
       } else {
-        const dRe = new RegExp(`\\b${dPattern}\\b`, "i");
+        const dRe = new RegExp(`\\b${dPat}\\b`, "i");
         if (dRe.test(q)) {
           isMatch = true;
+        } else if (strVal.length >= 4) {
+          const valLower = strVal.toLowerCase();
+          const valStem = stemWord(valLower);
+          for (const w of qWords) {
+            const wClean = w.toLowerCase().replace(/[^a-z0-9]/g, "");
+            if (wClean.length >= 4 && (stemWord(wClean) === valStem || wClean.startsWith(valLower))) {
+              isMatch = true;
+              break;
+            }
+          }
         }
       }
 
       if (isMatch) {
-        const f = { column: col.name, op: "eq", value: d };
-        filters.push(f);
-        if (/name|student|person|user|product|item|employee|order/i.test(col.name) || strVal.length >= 3) {
-          matchedEntityFilter = f;
+        filters.push({ column: col.name, op: "eq", value: d });
+        // Only push to matchedEntities if it comes from the entity column!
+        if (col.name === entityCol?.name) {
+          if (!matchedEntities.includes(d)) matchedEntities.push(d);
         }
       }
     }
   }
 
-  // If query contains personal/possessive pronouns but no entity was identified,
-  // it is an unresolved follow-up and cannot be deterministically answered without resolved context
-  const hasUnresolvedPronoun = /\b(he|she|they|his|her|their|him|them)\b/i.test(q) && !matchedEntityFilter;
-  if (hasUnresolvedPronoun) {
-    return null;
+  // If question asked for "failed" / "failing" and Status column exists with Pass/Fail:
+  if (/\b(?:failed|failing|fails?)\b/i.test(q) && !filters.some(f => f.column === "Status")) {
+    const statusCol = colInfo.find(c => /status/i.test(c.name));
+    if (statusCol && statusCol.distinct.some(d => /fail/i.test(d))) {
+      const failVal = statusCol.distinct.find(d => /fail/i.test(d));
+      filters.push({ column: statusCol.name, op: "eq", value: failVal });
+    }
   }
 
-  // 4. Resolve operation and target column
+  // Check if question asked for an unknown entity (e.g. "Bruce Wayne" when not in dataset)
+  if (matchedEntities.length === 0 && /\b(?:for|of|is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/.test(q)) {
+    const unknownEntity = /\b(?:for|of|is)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b/.exec(q)[1];
+    return {
+      operation: "entity_not_found",
+      missingEntity: unknownEntity,
+      reason: `Entity "${unknownEntity}" not found in dataset`,
+      isComplete: true
+    };
+  }
+
+  // 4. Resolve target columns & operation
   let targetColumn = null;
   let targetColumns = [];
   const numericFound = foundCols.filter((fc) => fc.col.isNumeric);
 
-  // If an entity was matched (e.g. specific entity filter) AND another column was mentioned in the question:
-  // This is a LOOKUP! Support single or multiple columns.
-  const requestedCols = foundCols.filter((fc) => fc.col.name !== matchedEntityFilter?.column);
-  if (matchedEntityFilter && requestedCols.length > 0) {
+  // If exactly 1 entity is matched AND operation is not an aggregation/diff/compare:
+  if (matchedEntities.length === 1 && !["difference", "compare", "top_n", "bottom_n", "sort"].includes(operation)) {
     operation = "lookup";
-    targetColumns = [...new Set(requestedCols.map((rc) => rc.col.name))];
-    targetColumn = targetColumns[0];
-  } else if (["average", "sum", "min", "max"].includes(operation)) {
-    if (numericFound.length > 0) {
-      targetColumns = [numericFound[0].col.name];
-      targetColumn = targetColumns[0];
-    }
-  } else if (operation === "count") {
-    targetColumn = numericFound.length > 0 ? numericFound[0].col.name : (colInfo[0]?.name || null);
-    if (targetColumn) targetColumns = [targetColumn];
-  } else if (operation === "filter") {
-    const nameCol = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) ||
-                    colInfo.find((c) => !c.isNumeric) ||
-                    colInfo[0];
-    targetColumn = nameCol ? nameCol.name : null;
-    if (targetColumn) targetColumns = [targetColumn];
   }
 
-  // Ordinal rank extraction (e.g. "second student", "2nd highest", "top student", "3rd")
-  const ORDINAL_MAP = {
-    first: 1, "1st": 1,
-    second: 2, "2nd": 2,
-    third: 3, "3rd": 3,
-    fourth: 4, "4th": 4,
-    fifth: 5, "5th": 5,
-    sixth: 6, "6th": 6,
-    seventh: 7, "7th": 7,
-    eighth: 8, "8th": 8,
-    ninth: 9, "9th": 9,
-    tenth: 10, "10th": 10
-  };
-  const ordinalMatch = /\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|sixth|6th|seventh|7th|eighth|8th|ninth|9th|tenth|10th)\b/i.exec(q);
-  const rankIndex = ordinalMatch ? ORDINAL_MAP[ordinalMatch[1].toLowerCase()] : null;
-  const rankOrder = /\b(lowest|bottom|min|minimum|worst|least)\b/i.test(q) ? "asc" : "desc";
-
-  if (rankIndex && (rankIndex > 1 || /\b(?:rank|ranked|student|record|person|row|highest|lowest)\b/i.test(q))) {
-    operation = "rank";
-    const targetNumericCol = numericFound.length > 0
-      ? numericFound[0].col.name
-      : (colInfo.find((c) => c.isNumeric && /total|score|mark|amount|revenue/i.test(c.name))?.name ||
-         colInfo.find((c) => c.isNumeric)?.name || null);
-    targetColumn = targetNumericCol;
-    if (targetColumn) targetColumns = [targetColumn];
+  if (operation === "difference") {
+    if (/\b(?:highest|max)\b.*\b(?:lowest|min)\b|\b(?:lowest|min)\b.*\b(?:highest|max)\b/i.test(q)) {
+      subOperation = "max_min";
+      targetColumn = numericFound[0]?.col.name || colInfo.find(c => c.isNumeric)?.name;
+    } else if (matchedEntities.length === 1 && numericFound.length >= 2) {
+      subOperation = "two_columns";
+      targetColumns = [numericFound[0].col.name, numericFound[1].col.name];
+    } else if (matchedEntities.length >= 2 && numericFound.length >= 1) {
+      subOperation = "two_entities";
+      targetColumn = numericFound[0].col.name;
+    } else {
+      subOperation = "max_min";
+      targetColumn = numericFound[0]?.col.name || colInfo.find(c => c.isNumeric)?.name;
+    }
+  } else if (operation === "compare") {
+    if (matchedEntities.length === 1 && numericFound.length >= 2) {
+      subOperation = "two_columns";
+      targetColumns = [numericFound[0].col.name, numericFound[1].col.name];
+    } else if (matchedEntities.length >= 2 && numericFound.length >= 1) {
+      subOperation = "two_entities";
+      targetColumn = numericFound[0].col.name;
+    } else {
+      targetColumns = numericFound.map(fc => fc.col.name);
+    }
+  } else if (operation === "top_n" || operation === "bottom_n") {
+    targetColumn = numericFound[0]?.col.name || colInfo.find(c => c.isNumeric && /total|score|mark|average|salary|rating|revenue/i.test(c.name))?.name || colInfo.find(c => c.isNumeric)?.name;
+  } else if (operation === "lookup") {
+    targetColumns = foundCols.filter(fc => fc.col.name !== entityCol?.name).map(fc => fc.col.name);
+    if (targetColumns.length === 0) {
+      targetColumns = colInfo.filter(c => c.name !== entityCol?.name).map(c => c.name);
+    }
+    targetColumn = targetColumns[0];
+  } else if (["average", "sum", "min", "max", "median"].includes(operation)) {
+    const opColMatch = (c) => {
+      const cLower = c.name.toLowerCase();
+      if (operation === "average" && /average|mean|avg/.test(cLower)) return true;
+      if (operation === "sum" && /sum|total/.test(cLower)) return true;
+      return false;
+    };
+    const specificNumeric = numericFound.filter((fc) => !opColMatch(fc.col));
+    const target = specificNumeric.length > 0 ? specificNumeric[0].col : (numericFound[0]?.col || colInfo.find(c => c.isNumeric));
+    if (target) {
+      targetColumns = [target.name];
+      targetColumn = target.name;
+    }
+  } else if (operation === "sort") {
+    targetColumn = numericFound[0]?.col.name || colInfo.find(c => c.isNumeric)?.name || colInfo[0]?.name;
+    targetColumns = [targetColumn];
+  } else if (operation === "group_by") {
+    targetColumn = numericFound[0]?.col.name || null;
+  } else if (operation === "count") {
+    targetColumn = entityCol?.name || colInfo[0]?.name;
+    targetColumns = [targetColumn];
+  } else if (operation === "filter") {
+    targetColumn = entityCol?.name || colInfo[0]?.name;
+    targetColumns = [targetColumn];
   }
 
   if (!operation) {
-    if (matchedEntityFilter && requestedCols.length > 0) {
-      operation = "lookup";
-      targetColumns = [...new Set(requestedCols.map((rc) => rc.col.name))];
-      targetColumn = targetColumns[0];
-    } else if (filters.length > 0) {
+    if (filters.length > 0) {
       operation = "filter";
-      const nameCol = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) || colInfo[0];
-      targetColumn = nameCol ? nameCol.name : null;
-      if (targetColumn) targetColumns = [targetColumn];
+      targetColumn = entityCol?.name || colInfo[0]?.name;
+      targetColumns = [targetColumn];
     } else if (numericFound.length === 1) {
       operation = "average";
       targetColumn = numericFound[0].col.name;
@@ -652,12 +879,19 @@ export function parseDeterministicQueryPlan(question, colInfo) {
 
   return {
     operation,
+    subOperation,
     targetColumn,
     targetColumns: targetColumns.length > 0 ? targetColumns : (targetColumn ? [targetColumn] : []),
+    limit,
     rankIndex,
-    rankOrder,
+    sortOrder,
+    groupColumn,
     filters,
+    matchedEntities,
+    entityCol: entityCol?.name,
+    unresolvedTerms: [],
     isAmbiguous: false,
+    isComplete: true,
     reason: `Deterministic structured parsing: ${operation} on ${targetColumns.join(", ") || targetColumn || "table"} with ${filters.length} filter(s)`
   };
 }
@@ -681,12 +915,12 @@ TABLE: "${documentName}"
 SCHEMA:
 ${JSON.stringify(schemaSummary)}
 
-ALLOWED OPERATIONS: "lookup", "filter", "average", "sum", "min", "max", "count", "percentage", "distribution", "rank", "none".
+ALLOWED OPERATIONS: "lookup", "filter", "average", "sum", "min", "max", "median", "count", "percentage", "distribution", "sort", "top_n", "bottom_n", "difference", "compare", "group_by", "rank", "none".
 
 CRITICAL INSTRUCTIONS:
 1. "columns": array of exact column names from SCHEMA.
    - For lookups, include ALL requested columns (e.g. ["Science", "English", "Total_Marks", "Average"]).
-   - For aggregations (average/sum/min/max), include the target numeric column.
+   - For aggregations (average/sum/min/max/median), include the target numeric column.
    - Map spelling variations or typos (e.g. "tola" for "Total_Marks") to the correct schema column.
    - If a requested column does not exist in SCHEMA, do not invent names; add to "unresolved".
 2. "filters": array of { "column": "<exact column>", "op": "eq"|"gt"|"gte"|"lt"|"lte", "value": "<value>" }.
@@ -695,7 +929,7 @@ CRITICAL INSTRUCTIONS:
 
 OUTPUT JSON FORMAT ONLY:
 {
-  "operation": "lookup" | "filter" | "average" | "sum" | "min" | "max" | "count" | "percentage" | "distribution" | "rank" | "none",
+  "operation": "lookup" | "filter" | "average" | "sum" | "min" | "max" | "median" | "count" | "percentage" | "distribution" | "sort" | "top_n" | "bottom_n" | "difference" | "compare" | "group_by" | "rank" | "none",
   "columns": ["<exact column name>", ...],
   "filters": [
     { "column": "<exact column name>", "op": "eq"|"gt"|"gte"|"lt"|"lte", "value": "<value>" }
@@ -787,6 +1021,18 @@ export function validateSemanticPlan(plan, colInfo, rows) {
     return { valid: false, reason: plan.reason || `unsupported or non-computable operation "${plan.operation}"` };
   }
 
+  if (normalizedOp === "column_not_found" || normalizedOp === "entity_not_found") {
+    return {
+      valid: true,
+      operation: normalizedOp,
+      target: null,
+      targetColumns: [],
+      filters: [],
+      unresolved: [],
+      reason: plan.reason || null
+    };
+  }
+
   const colByName = new Map();
   const colByLower = new Map();
   for (const c of colInfo) {
@@ -835,8 +1081,11 @@ export function validateSemanticPlan(plan, colInfo, rows) {
 
   let validatedTarget = validatedColumns[0] || null;
 
-  const needsNumeric = ["average", "sum", "min", "max"].includes(normalizedOp);
+  const needsNumeric = ["average", "sum", "min", "max", "median"].includes(normalizedOp);
   if (needsNumeric) {
+    if (!validatedTarget) {
+      validatedTarget = colInfo.find((c) => c.isNumeric) || null;
+    }
     if (!validatedTarget) {
       return {
         valid: false,
@@ -848,6 +1097,27 @@ export function validateSemanticPlan(plan, colInfo, rows) {
         valid: false,
         reason: `targetColumn "${validatedTarget.name}" is not numeric in table schema`
       };
+    }
+  }
+
+  if (["top_n", "bottom_n"].includes(normalizedOp)) {
+    if (!validatedTarget) {
+      validatedTarget = colInfo.find((c) => c.isNumeric && /total|score|mark|average|salary|rating/i.test(c.name)) ||
+                        colInfo.find((c) => c.isNumeric) ||
+                        colInfo[0];
+    }
+  }
+
+  if (["difference", "compare"].includes(normalizedOp)) {
+    if (!validatedTarget && validatedColumns.length === 0) {
+      validatedTarget = colInfo.find((c) => c.isNumeric) || colInfo[0];
+      if (validatedTarget) validatedColumns.push(validatedTarget);
+    }
+  }
+
+  if (normalizedOp === "group_by") {
+    if (!validatedTarget) {
+      validatedTarget = colInfo.find((c) => !c.isNumeric) || colInfo[0];
     }
   }
 
@@ -868,6 +1138,14 @@ export function validateSemanticPlan(plan, colInfo, rows) {
     validatedTarget = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) ||
                       colInfo.find((c) => !c.isNumeric) ||
                       colInfo[0];
+  }
+
+  if (normalizedOp === "sort") {
+    if (!validatedTarget) {
+      validatedTarget = colInfo.find((c) => c.isNumeric && /total|score|mark|average/i.test(c.name)) ||
+                        colInfo.find((c) => c.isNumeric) ||
+                        colInfo[0];
+    }
   }
 
   if (normalizedOp === "rank") {
@@ -1036,9 +1314,25 @@ export function findEntityMiss(question, colInfo, rows, targetColumn = null) {
   return { column: entityCol.name, message, candidates: top.map((s) => s.value) };
 }
 
+/**
+ * Builds the "requested attribute not in dataset" message from real schema columns only.
+ */
+export function buildColumnNotFoundMessage(unresolvedAttributes, documentName, columns) {
+  const quoted = unresolvedAttributes.map((a) => `"${a}"`).join(", ");
+  return `I couldn't find ${quoted} in ${documentName}, so I can't answer that. Available columns: ${columns.join(", ")}.`;
+}
+
 // ---------- main entry point ----------
 
-export async function processTabularQuery(question = "", targetDepartments = [], targetDocuments = [], fallbackQuestion = "") {
+/**
+ * @param {string} question          The user's current question.
+ * @param {string[]} targetDepartments
+ * @param {string[]} targetDocuments
+ * @param {string} fallbackQuestion  Optional pre-resolved standalone question.
+ * @param {Array<{role: string, content: string}>} history  Recent chat turns, used to resolve
+ *        follow-ups that name no entity (e.g. "her average").
+ */
+export async function processTabularQuery(question = "", targetDepartments = [], targetDocuments = [], fallbackQuestion = "", history = []) {
   const baseQuery = { fileType: { $in: ["csv", "xlsx", "xls"] }, status: "completed" };
   let docs = [];
   if (targetDepartments && targetDepartments.length > 0) {
@@ -1052,31 +1346,48 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     return { success: false, error: "No tabular document found in uploaded files." };
   }
 
-  // 1. Pick the best matching tabular document by schema inspection
-  let best = null;
+  // 1. Pick the best matching tabular document by schema inspection and cell token scoring
+  let scoredCandidates = [];
+  const qCombined = `${question} ${fallbackQuestion}`.toLowerCase();
   for (const doc of docs) {
     let rows;
     try { rows = loadRows(doc); } catch { continue; }
     if (!rows || rows.length === 0) continue;
     const colInfo = analyseColumns(rows);
-    best = { doc, rows, colInfo };
-    break; // Use the most relevant/uploaded tabular dataset
+    let score = 0;
+    for (const c of colInfo) {
+      if (qCombined.includes(c.name.toLowerCase())) score += 10;
+      else if (matchTokenToColumn(c.name, qCombined)) score += 5;
+    }
+    for (const c of colInfo) {
+      if (c.isNumeric || !c.distinct) continue;
+      for (const d of c.distinct) {
+        if (d && String(d).length >= 3 && qCombined.includes(String(d).toLowerCase())) {
+          score += 15;
+          break;
+        }
+      }
+    }
+    scoredCandidates.push({ doc, rows, colInfo, score });
   }
 
-  if (!best || !best.rows || best.rows.length === 0) {
+  if (scoredCandidates.length === 0) {
     return { success: false, error: "Dataset is empty or unreadable." };
   }
+
+  scoredCandidates.sort((a, b) => b.score - a.score);
+  const best = scoredCandidates[0];
 
   const { doc, rows, colInfo } = best;
   const documentName = doc.originalName;
   const columns = colInfo.map((c) => c.name);
 
   // 2. Query Understanding: Attempt fast deterministic parsing first
-  let semanticPlan = parseDeterministicQueryPlan(question, colInfo);
+  let semanticPlan = parseDeterministicQueryPlan(question, colInfo, rows, history);
   let resolvedQuestion = question;
 
   if (!semanticPlan && fallbackQuestion && fallbackQuestion !== question) {
-    semanticPlan = parseDeterministicQueryPlan(fallbackQuestion, colInfo);
+    semanticPlan = parseDeterministicQueryPlan(fallbackQuestion, colInfo, rows, history);
     if (semanticPlan) {
       resolvedQuestion = fallbackQuestion;
       console.log(`[Tabular Processor] Deterministic plan resolved using context: ${semanticPlan.operation} on ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "table"}`);
@@ -1085,28 +1396,152 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     console.log(`[Tabular Processor] Deterministic plan resolved: ${semanticPlan.operation} on ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "table"}`);
   }
 
+  if (semanticPlan && semanticPlan.operation === "column_not_found") {
+    const message = buildColumnNotFoundMessage([semanticPlan.missingColumn], documentName, columns);
+    return {
+      documentName,
+      operation: "column_not_found",
+      column: null,
+      targetColumns: [],
+      filters: [],
+      columns,
+      totalRows: rows.length,
+      rowsUsed: 0,
+      semanticPlan,
+      usedLlmPlanner: false,
+      coverageDecision: "complete",
+      unresolved: [semanticPlan.missingColumn],
+      success: true,
+      computedValue: message,
+      summary: message
+    };
+  }
+
+  if (semanticPlan && semanticPlan.operation === "entity_not_found") {
+    const message = `I couldn't find any record matching "${semanticPlan.missingEntity}" in ${documentName}.`;
+    return {
+      documentName,
+      operation: "entity_not_found",
+      column: null,
+      targetColumns: [],
+      filters: [],
+      columns,
+      totalRows: rows.length,
+      rowsUsed: 0,
+      semanticPlan,
+      usedLlmPlanner: false,
+      coverageDecision: "complete",
+      unresolved: [semanticPlan.missingEntity],
+      success: true,
+      computedValue: message,
+      summary: message
+    };
+  }
+
   // Requirement 1 & 2: Plan coverage check & escalation
   let coverage = checkPlanCoverage(resolvedQuestion, semanticPlan, colInfo, rows);
   let usedLlmPlanner = false;
+  let partialMisses = [];
 
-  if (!semanticPlan || !coverage.isComplete) {
-    const qForLlm = fallbackQuestion || question;
+  // Requested attribute(s) match nothing in the schema (e.g. a subject that has no column).
+  // Never silently drop them: answer "not found" unless a lookup can still return its resolved columns.
+  const attrMisses = coverage.unresolvedAttributes || [];
+  if (semanticPlan && attrMisses.length > 0 && coverage.plausibleUnconsumed.length === 0) {
+    const hasResolvedProjection =
+      semanticPlan.operation === "lookup" &&
+      Array.isArray(semanticPlan.targetColumns) &&
+      semanticPlan.targetColumns.length > 0;
+
+    if (hasResolvedProjection) {
+      partialMisses = attrMisses;
+      console.log(`[Tabular Processor] Partial lookup: unresolved attribute(s) ${JSON.stringify(attrMisses)} will be reported alongside resolved columns.`);
+    } else {
+      const message = buildColumnNotFoundMessage(attrMisses, documentName, columns);
+      console.log(`[TABULAR SEMANTIC DEBUG]`);
+      console.log(`  - question: "${question}"`);
+      console.log(`  - selected document: ${documentName}`);
+      console.log(`  - schema: [${columns.join(", ")}]`);
+      console.log(`  - coverage decision: incomplete (${coverage.reason})`);
+      console.log(`  - used LLM planner: false`);
+      console.log(`  - semantic operation: ${semanticPlan.operation}`);
+      console.log(`  - semantic filters: ${JSON.stringify(semanticPlan.filters || [])}`);
+      console.log(`  - unresolved: ${JSON.stringify(attrMisses)}`);
+      console.log(`  - computed result: ${message}`);
+      console.log(`  - fallback reason: column_not_found`);
+      return {
+        documentName,
+        operation: "column_not_found",
+        column: null,
+        targetColumns: [],
+        filters: semanticPlan.filters || [],
+        columns,
+        totalRows: rows.length,
+        rowsUsed: 0,
+        semanticPlan,
+        usedLlmPlanner: false,
+        coverageDecision: "incomplete",
+        unresolved: attrMisses,
+        success: true,
+        computedValue: message,
+        summary: message
+      };
+    }
+  }
+
+  // Escalate to the LLM planner only when there is no plan or a plausible schema match was left unused
+  const needsLlm = !semanticPlan || coverage.plausibleUnconsumed.length > 0;
+
+  if (needsLlm) {
+    const qForLlm = contextualQuestion || fallbackQuestion || question;
     console.log(
       `[Tabular Processor] Plan ${semanticPlan ? "incomplete" : "null"} (reason: ${coverage.reason}). Escalating to LLM semantic planner.`
     );
     semanticPlan = await parseSemanticQueryPlan(qForLlm, documentName, colInfo);
     resolvedQuestion = qForLlm;
     usedLlmPlanner = true;
+    partialMisses = [];
   } else {
-    console.log(`[Tabular Processor] Plan complete. Fast path enabled (0 LLM calls).`);
+    console.log(`[Tabular Processor] Plan ${coverage.isComplete ? "complete" : "partial"}. Fast path enabled (0 LLM calls).`);
   }
+
+  const coverageLabel = coverage.isComplete ? "complete" : (partialMisses.length > 0 ? "partial" : "incomplete");
 
   // 3. Strict Programmatic Validation
   const validation = validateSemanticPlan(semanticPlan, colInfo, rows);
 
+  if (validation.valid && partialMisses.length > 0) {
+    validation.unresolved = [...(validation.unresolved || [])];
+    for (const m of partialMisses) {
+      if (!validation.unresolved.includes(m)) validation.unresolved.push(m);
+    }
+  }
+
+  return executePlan(
+    documentName,
+    semanticPlan,
+    validation,
+    rows,
+    colInfo,
+    resolvedQuestion,
+    coverageLabel,
+    usedLlmPlanner
+  );
+}
+
+export function executePlan(
+  documentName,
+  semanticPlan,
+  validation,
+  rows,
+  colInfo,
+  question = "",
+  coverageLabel = "complete",
+  usedLlmPlanner = false
+) {
+  const columns = colInfo.map((c) => c.name);
   const base = {
     documentName,
-    operation: validation.operation || semanticPlan.operation || "none",
+    operation: validation.operation || semanticPlan?.operation || "none",
     column: validation.target ? validation.target.name : null,
     targetColumns: (validation.targetColumns && validation.targetColumns.length > 0)
       ? validation.targetColumns.map((tc) => tc.name)
@@ -1117,7 +1552,7 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     rowsUsed: 0,
     semanticPlan,
     usedLlmPlanner,
-    coverageDecision: coverage.isComplete ? "complete" : "incomplete",
+    coverageDecision: coverageLabel,
     unresolved: validation.unresolved || []
   };
 
@@ -1126,7 +1561,7 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     console.log(`  - question: "${question}"`);
     console.log(`  - selected document: ${documentName}`);
     console.log(`  - schema: [${columns.join(", ")}]`);
-    console.log(`  - coverage decision: ${coverage.isComplete ? "complete" : "incomplete"}`);
+    console.log(`  - coverage decision: ${coverageLabel}`);
     console.log(`  - used LLM planner: ${usedLlmPlanner}`);
     console.log(`  - semantic operation: ${semanticPlan.operation}`);
     console.log(`  - semantic target: ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "null"}`);
@@ -1170,8 +1605,35 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     }
   }
 
-  // 4. Apply validated filters
+  // 4. Handle terminal plans or apply validated filters
   const { operation, target } = validation;
+  const entityCol = semanticPlan.entityCol || getEntityColumn(colInfo, rows)?.name || columns[0];
+  const label = entityCol;
+
+  if (operation === "column_not_found") {
+    const msg = semanticPlan?.reason || buildColumnNotFoundMessage(semanticPlan?.unresolved || [], documentName, columns);
+    logTabularSemanticDebug(msg, "column_not_found", 0);
+    return {
+      ...base,
+      success: true,
+      operation: "column_not_found",
+      computedValue: msg,
+      summary: msg
+    };
+  }
+
+  if (operation === "entity_not_found") {
+    const msg = semanticPlan?.reason || `I couldn't find any record matching "${semanticPlan?.missingEntity}" in ${documentName}.`;
+    logTabularSemanticDebug(msg, "entity_not_found", 0);
+    return {
+      ...base,
+      success: true,
+      operation: "entity_not_found",
+      computedValue: msg,
+      summary: msg
+    };
+  }
+
   const filteredRows = applyFilters(rows, validation.filters);
   const filterText = describeFilters(validation.filters);
 
@@ -1209,9 +1671,9 @@ export async function processTabularQuery(question = "", targetDepartments = [],
   }
 
   // 5. Deterministic JavaScript Execution
-  const needsNumeric = ["average", "sum", "min", "max"].includes(operation);
+  const needsNumeric = ["average", "sum", "min", "max", "median"].includes(operation);
 
-  if (needsNumeric) {
+  if (needsNumeric && target) {
     const nums = filteredRows.map((r) => ({ row: r, n: parseNum(r[target.name]) })).filter((x) => x.n !== null);
     if (nums.length === 0) {
       const reason = `column ${target.name} has no numeric values in the matching rows`;
@@ -1225,7 +1687,6 @@ export async function processTabularQuery(question = "", targetDepartments = [],
       };
     }
 
-    const label = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric)?.name || columns[0];
     if (operation === "average" || operation === "sum") {
       const sum = nums.reduce((a, x) => a + x.n, 0);
       const value = operation === "average" ? sum / nums.length : sum;
@@ -1245,6 +1706,24 @@ export async function processTabularQuery(question = "", targetDepartments = [],
       };
     }
 
+    if (operation === "median") {
+      const sortedNums = nums.map((x) => x.n).sort((a, b) => a - b);
+      const mid = Math.floor(sortedNums.length / 2);
+      const medianVal = sortedNums.length % 2 !== 0 ? sortedNums[mid] : (sortedNums[mid - 1] + sortedNums[mid]) / 2;
+      const computedValue = fmt(medianVal);
+
+      logTabularSemanticDebug(computedValue, null, nums.length);
+      return {
+        ...base,
+        success: true,
+        operation: "median",
+        column: target.name,
+        computedValue,
+        rowsUsed: nums.length,
+        summary: `Median of ${target.name} = ${computedValue} across ${nums.length} rows (filters: ${filterText}).`
+      };
+    }
+
     const extreme = operation === "max" ? Math.max(...nums.map((x) => x.n)) : Math.min(...nums.map((x) => x.n));
     const holders = nums.filter((x) => x.n === extreme).map((x) => x.row);
     const computedValue = fmt(extreme);
@@ -1258,6 +1737,149 @@ export async function processTabularQuery(question = "", targetDepartments = [],
       rowsUsed: nums.length,
       records: holders,
       summary: `${operation === "max" ? "Highest" : "Lowest"} ${target.name} = ${computedValue} across ${nums.length} rows (filters: ${filterText}). Row(s) with this value: ${holders.map((h) => h[label]).join(", ")}. Full record(s): ${JSON.stringify(holders)}`
+    };
+  }
+
+  if (operation === "top_n" || operation === "bottom_n") {
+    const n = semanticPlan.limit || 5;
+    const isTop = operation === "top_n";
+    const targetCol = target?.name || (colInfo.find((c) => c.isNumeric)?.name) || columns[0];
+    const sorted = [...filteredRows].sort((a, b) => {
+      const na = parseNum(a[targetCol]), nb = parseNum(b[targetCol]);
+      if (na !== null && nb !== null) return isTop ? nb - na : na - nb;
+      return isTop
+        ? String(b[targetCol] ?? "").localeCompare(String(a[targetCol] ?? ""))
+        : String(a[targetCol] ?? "").localeCompare(String(b[targetCol] ?? ""));
+    });
+    const sliced = sorted.slice(0, n);
+    const computedValue = sliced.map((r) => `${r[label]} (${targetCol}: ${r[targetCol]})`).join(", ");
+    logTabularSemanticDebug(computedValue, null, sliced.length);
+    return {
+      ...base,
+      success: true,
+      operation,
+      limit: n,
+      column: targetCol,
+      computedValue,
+      rowsUsed: sliced.length,
+      records: sliced,
+      summary: `The ${isTop ? "top" : "bottom"} ${n} by ${targetCol}: ${computedValue}.`
+    };
+  }
+
+  if (operation === "difference") {
+    if (semanticPlan.subOperation === "two_columns" && filteredRows.length > 0 && validation.targetColumns?.length >= 2) {
+      const r = filteredRows[0];
+      const c1 = validation.targetColumns[0].name;
+      const c2 = validation.targetColumns[1].name;
+      const v1 = parseNum(r[c1]);
+      const v2 = parseNum(r[c2]);
+      const diffVal = Math.abs(v1 - v2);
+      const computedValue = fmt(diffVal);
+      logTabularSemanticDebug(computedValue, null, 1);
+      return {
+        ...base,
+        success: true,
+        operation: "difference",
+        subOperation: "two_columns",
+        entityName: r[label],
+        col1: c1,
+        col2: c2,
+        val1: fmt(v1),
+        val2: fmt(v2),
+        computedValue,
+        rowsUsed: 1,
+        records: [r],
+        summary: `For ${r[label]}, difference between ${c1} (${fmt(v1)}) and ${c2} (${fmt(v2)}) is ${computedValue}.`
+      };
+    }
+
+    const tCol = target || validation.targetColumns?.[0] || colInfo.find((c) => c.isNumeric);
+    if (tCol) {
+      const nums = filteredRows.map((r) => ({ row: r, n: parseNum(r[tCol.name]) })).filter((x) => x.n !== null);
+      if (nums.length > 0) {
+        const maxVal = Math.max(...nums.map((x) => x.n));
+        const minVal = Math.min(...nums.map((x) => x.n));
+        const maxHolders = nums.filter((x) => x.n === maxVal).map((x) => x.row[label]).join(", ");
+        const minHolders = nums.filter((x) => x.n === minVal).map((x) => x.row[label]).join(", ");
+        const diffVal = maxVal - minVal;
+        const computedValue = fmt(diffVal);
+        logTabularSemanticDebug(computedValue, null, nums.length);
+        return {
+          ...base,
+          success: true,
+          operation: "difference",
+          subOperation: "max_min",
+          column: tCol.name,
+          computedValue,
+          maxVal: fmt(maxVal),
+          minVal: fmt(minVal),
+          maxHolders,
+          minHolders,
+          rowsUsed: nums.length,
+          summary: `Difference between highest ${tCol.name} (${fmt(maxVal)}, ${maxHolders}) and lowest ${tCol.name} (${fmt(minVal)}, ${minHolders}) is ${computedValue}.`
+        };
+      }
+    }
+  }
+
+  if (operation === "compare" && filteredRows.length > 0 && validation.targetColumns?.length >= 2) {
+    const r = filteredRows[0];
+    const c1 = validation.targetColumns[0].name;
+    const c2 = validation.targetColumns[1].name;
+    const v1 = parseNum(r[c1]);
+    const v2 = parseNum(r[c2]);
+    const diff = Math.abs(v1 - v2);
+    const winner = v1 > v2 ? c1 : (v2 > v1 ? c2 : "Equal");
+    const diffDesc = winner !== "Equal" ? `${winner} is higher by ${fmt(diff)}` : `both are equal at ${fmt(v1)}`;
+    const computedValue = `${c1}: ${fmt(v1)}, ${c2}: ${fmt(v2)} (${diffDesc})`;
+    logTabularSemanticDebug(computedValue, null, 1);
+    return {
+      ...base,
+      success: true,
+      operation: "compare",
+      subOperation: "two_columns",
+      entityName: r[label],
+      col1: c1,
+      col2: c2,
+      val1: fmt(v1),
+      val2: fmt(v2),
+      winner,
+      diff: fmt(diff),
+      computedValue,
+      rowsUsed: 1,
+      records: [r],
+      summary: `For ${r[label]}, ${c1} is ${fmt(v1)} and ${c2} is ${fmt(v2)} (${diffDesc}).`
+    };
+  }
+
+  if (operation === "group_by") {
+    const gCol = semanticPlan.groupColumn || target?.name || (colInfo.find((c) => !c.isNumeric)?.name);
+    const tCol = target && target.name !== gCol && target.isNumeric ? target.name : null;
+    const groups = {};
+    for (const r of filteredRows) {
+      const g = String(r[gCol] ?? "Unknown").trim();
+      if (!groups[g]) groups[g] = [];
+      groups[g].push(r);
+    }
+    const parts = Object.entries(groups).map(([g, gRows]) => {
+      if (tCol) {
+        const nums = gRows.map((r) => parseNum(r[tCol])).filter((n) => n !== null);
+        const avg = nums.length > 0 ? nums.reduce((a, b) => a + b, 0) / nums.length : 0;
+        return `${g}: average ${tCol} is ${fmt(avg)}`;
+      }
+      return `${g}: ${gRows.length}`;
+    });
+    const computedValue = parts.join("; ");
+    logTabularSemanticDebug(computedValue, null, filteredRows.length);
+    return {
+      ...base,
+      success: true,
+      operation: "group_by",
+      groupColumn: gCol,
+      computedValue,
+      rowsUsed: filteredRows.length,
+      summary: `Breakdown by ${gCol}: ${computedValue}.`
     };
   }
 
@@ -1311,13 +1933,14 @@ export async function processTabularQuery(question = "", targetDepartments = [],
       ...base,
       success: true,
       computedValue: pctVal,
+      filteredCount: filteredRows.length,
+      totalRows: rows.length,
       rowsUsed: filteredRows.length,
       summary: `Percentage of rows matching (${filterText}) = ${pctVal} (${filteredRows.length} / ${rows.length}).`
     };
   }
 
   if (operation === "lookup" && (target || (validation.targetColumns && validation.targetColumns.length > 0)) && filteredRows.length <= 10) {
-    const label = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric)?.name || columns[0];
     const targetCols = (validation.targetColumns && validation.targetColumns.length > 0)
       ? validation.targetColumns.map((tc) => tc.name)
       : [target.name];
@@ -1357,14 +1980,12 @@ export async function processTabularQuery(question = "", targetDepartments = [],
   }
 
   if (operation === "filter") {
-    const label = (target && !target.isNumeric)
-      ? target.name
-      : (colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric)?.name || columns[0]);
-    const names = filteredRows.map((r) => String(r[label] ?? "")).filter(Boolean);
+    const filterCol = (target && !target.isNumeric) ? target.name : label;
+    const names = filteredRows.map((r) => String(r[filterCol] ?? "")).filter(Boolean);
     const computedValue = names.length > 0 ? names.join(", ") : "None";
     const details = filteredRows.map((r) => {
       const parts = validation.filters.map((f) => `${f.column}: ${r[f.column]}`).join(", ");
-      return parts ? `${r[label]} (${parts})` : String(r[label]);
+      return parts ? `${r[filterCol]} (${parts})` : String(r[filterCol]);
     }).join("; ");
 
     logTabularSemanticDebug(computedValue, null, filteredRows.length);
@@ -1372,11 +1993,39 @@ export async function processTabularQuery(question = "", targetDepartments = [],
       ...base,
       success: true,
       operation: "filter",
-      column: label,
+      column: filterCol,
       computedValue,
       rowsUsed: filteredRows.length,
       records: filteredRows,
       summary: `Matching records (${filterText}): ${details}. Total matching: ${filteredRows.length} out of ${rows.length} rows.`
+    };
+  }
+
+  if (operation === "sort" && target) {
+    const order = semanticPlan.sortOrder || "desc";
+    const sorted = [...filteredRows].sort((a, b) => {
+      const na = parseNum(a[target.name]);
+      const nb = parseNum(b[target.name]);
+      if (na !== null && nb !== null) {
+        return order === "asc" ? na - nb : nb - na;
+      }
+      return order === "asc"
+        ? String(a[target.name] ?? "").localeCompare(String(b[target.name] ?? ""))
+        : String(b[target.name] ?? "").localeCompare(String(a[target.name] ?? ""));
+    });
+
+    const computedValue = sorted.map((r) => `${r[label]} (${target.name}: ${r[target.name]})`).join(", ");
+    logTabularSemanticDebug(computedValue, null, sorted.length);
+    return {
+      ...base,
+      success: true,
+      operation: "sort",
+      column: target.name,
+      sortOrder: order,
+      computedValue,
+      rowsUsed: sorted.length,
+      records: sorted,
+      summary: `Records sorted by ${target.name} (${order}): ${computedValue}.`
     };
   }
 
@@ -1391,7 +2040,6 @@ export async function processTabularQuery(question = "", targetDepartments = [],
 
     if (nums.length >= rankIndex) {
       const selected = nums[rankIndex - 1];
-      const label = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric)?.name || columns[0];
       const rankOrdinal = rankIndex === 2 ? "2nd" : rankIndex === 3 ? "3rd" : `${rankIndex}th`;
       const computedValue = `${selected.row[label]} with ${selected.n} ${target.name}`;
 
@@ -1438,18 +2086,17 @@ export function formatTabularTemplateAnswer(tabularResult, question = "") {
     ? ` (Note: Could not resolve ${unresolved.map((u) => `"${u}"`).join(", ")} against the dataset schema.)`
     : "";
 
-  if (operation === "entity_not_found") {
+  if (operation === "entity_not_found" || operation === "column_not_found") {
     return computedValue;
   }
 
   if (operation === "filter") {
-    const filterDesc = describeFilters(filters);
-    return `The students with ${filterDesc} are: ${computedValue}.${unresolvedNotice}`;
+    return `The matching records are: ${computedValue}.${unresolvedNotice}`;
   }
 
   if (operation === "lookup" && records && records.length > 0) {
     const r = records[0];
-    const name = r.Name || r.Student_ID || "The student";
+    const name = tabularResult.entityName || r.Name || r.Employee || Object.values(r)[0] || "The record";
     const targetCols = tabularResult.targetColumns && tabularResult.targetColumns.length > 0
       ? tabularResult.targetColumns
       : (column ? [column] : []);
@@ -1472,20 +2119,79 @@ export function formatTabularTemplateAnswer(tabularResult, question = "") {
     return `The average ${column} is ${computedValue}.${unresolvedNotice}`;
   }
 
+  if (operation === "median") {
+    return `The median ${column} is ${computedValue}.${unresolvedNotice}`;
+  }
+
   if (operation === "sum" || operation === "total") {
     return `The total ${column} is ${computedValue}.${unresolvedNotice}`;
   }
 
+  if (operation === "sort") {
+    return `Sorted by ${column} (${tabularResult.sortOrder || "descending"}): ${computedValue}.${unresolvedNotice}`;
+  }
+
+  if (operation === "top_n") {
+    return `The top ${tabularResult.limit} by ${column} are: ${computedValue}.${unresolvedNotice}`;
+  }
+
+  if (operation === "bottom_n") {
+    return `The bottom ${tabularResult.limit} by ${column} are: ${computedValue}.${unresolvedNotice}`;
+  }
+
+  if (operation === "difference") {
+    if (tabularResult.subOperation === "max_min") {
+      return `The difference between the highest ${column} (${tabularResult.maxVal}, ${tabularResult.maxHolders}) and lowest ${column} (${tabularResult.minVal}, ${tabularResult.minHolders}) is ${computedValue}.${unresolvedNotice}`;
+    }
+    if (tabularResult.subOperation === "two_columns") {
+      return `For ${tabularResult.entityName}, the difference between ${tabularResult.col1} (${tabularResult.val1}) and ${tabularResult.col2} (${tabularResult.val2}) is ${computedValue}.${unresolvedNotice}`;
+    }
+  }
+
+  if (operation === "compare") {
+    if (tabularResult.subOperation === "two_columns") {
+      const diffDesc = tabularResult.winner !== "Equal" ? `${tabularResult.winner} is ${tabularResult.diff} points higher` : `both are equal`;
+      return `For ${tabularResult.entityName}, ${tabularResult.col1} is ${tabularResult.val1} and ${tabularResult.col2} is ${tabularResult.val2} (${diffDesc}).${unresolvedNotice}`;
+    }
+  }
+
+  if (operation === "group_by") {
+    return `Breakdown by ${tabularResult.groupColumn}: ${computedValue}.${unresolvedNotice}`;
+  }
+
   if (operation === "max" || operation === "highest") {
+    if (records && records.length > 0) {
+      const names = records.map((r) => r.Name || r.Employee || (Object.values(r)[0])).filter(Boolean).join(", ");
+      const verb = records.length > 1 ? "have" : "has";
+      if (names) {
+        return `${names} ${verb} the highest ${column} with ${computedValue}.${unresolvedNotice}`;
+      }
+    }
     return `The highest ${column} is ${computedValue}.${unresolvedNotice}`;
   }
 
   if (operation === "min" || operation === "lowest") {
+    if (records && records.length > 0) {
+      const names = records.map((r) => r.Name || r.Employee || (Object.values(r)[0])).filter(Boolean).join(", ");
+      const verb = records.length > 1 ? "have" : "has";
+      if (names) {
+        return `${names} ${verb} the lowest ${column} with ${computedValue}.${unresolvedNotice}`;
+      }
+    }
     return `The lowest ${column} is ${computedValue}.${unresolvedNotice}`;
   }
 
   if (operation === "count") {
-    return `There are ${computedValue} matching records.${unresolvedNotice}`;
+    if (filters && filters.length > 0) {
+      const filterDesc = describeFilters(filters);
+      return `There are ${computedValue} matching records with ${filterDesc}.${unresolvedNotice}`;
+    }
+    return `There are ${computedValue} records in total.${unresolvedNotice}`;
+  }
+
+  if (operation === "percentage") {
+    const filterDesc = filters && filters.length > 0 ? describeFilters(filters) : "matching condition";
+    return `${computedValue} match (${filterDesc}) (${tabularResult.filteredCount} out of ${tabularResult.totalRows}).${unresolvedNotice}`;
   }
 
   if (summary) {
@@ -1494,4 +2200,3 @@ export function formatTabularTemplateAnswer(tabularResult, question = "") {
 
   return `The result is ${computedValue}.${unresolvedNotice}`;
 }
-

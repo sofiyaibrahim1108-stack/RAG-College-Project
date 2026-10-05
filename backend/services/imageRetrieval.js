@@ -1,6 +1,8 @@
+import path from "path";
 import { ImageModel } from "../models/Image.js";
 import { DocumentChunk } from "../models/DocumentChunk.js";
 import { cosineSimilarity } from "../utils/similarity.js";
+import { isImageUseful } from "../utils/imageQuality.js";
 import { RAG_CONFIG } from "../config/rag.js";
 
 /**
@@ -42,6 +44,7 @@ export async function retrieveRelevantImages(
   if (filterMeta.documentName) {
     mongoQuery.documentName = filterMeta.documentName;
   }
+  mongoQuery.isUseless = { $ne: true };
 
   let candidates = await ImageModel.find(mongoQuery)
     .select("imageId documentId documentName pageNumber filename imagePath department embedding caption description ocrText")
@@ -203,23 +206,43 @@ export async function resolveMultimodalAttachments({
       .split(/\s+/)
       .filter((w) => w.length >= 3 && !NOVELTY_STOP_WORDS.has(w));
 
+  const survivingDocs = new Set((survivingSources || []).map((s) => s.documentName));
+
   // Attach images strictly via surviving image-derived chunks (Task 2a & 2b)
   for (const chunk of retrievedChunks || []) {
     if (!chunk.imageRef || !chunk.imageRef.filename) continue;
-    if (chunk.sourceType !== "image_chunk") continue;
 
     // Task 2a: If the question names a page (page filter), attach only the image(s) of that page.
     if (isExplicitPageRequest) {
+      if (survivingDocs.size > 0 && !survivingDocs.has(chunk.documentName)) {
+        continue;
+      }
       if (chunk.pageNumber !== targetPage && chunk.imageRef?.pageNumber !== targetPage) {
         continue;
       }
     } else {
-      // Task 2b: Otherwise attach only images whose own image_chunk supported the final answer.
-      // Do not attach images of other sections just because they ranked in the pool.
+      // Task 2b: Otherwise attach only images whose own image-capable chunk supported the final answer.
+      // Do not attach images of other sections or text-only pages just because they ranked in the pool.
       const pageKey = `${chunk.documentName}_p${chunk.pageNumber || 1}`;
       if (!survivingPages.has(pageKey)) {
         console.log(
           `[Multimodal] Image dropped: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: page_not_in_surviving_sources)`
+        );
+        continue;
+      }
+
+      const isGroundedImageChunk = (survivingSources || []).some(
+        (s) =>
+          s.documentName === chunk.documentName &&
+          s.pageNumber === chunk.pageNumber &&
+          (s.imageRef?.filename === chunk.imageRef.filename ||
+            s.sourceType === "image_chunk" ||
+            Boolean(s.imageRef?.filename))
+      );
+
+      if (!isGroundedImageChunk) {
+        console.log(
+          `[Multimodal] Image dropped: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: image_chunk_not_in_grounded_sources)`
         );
         continue;
       }
@@ -243,13 +266,12 @@ export async function resolveMultimodalAttachments({
       }
     }
 
-    // Novelty check (Requirement 4b):
-    // Compute share of image OCR/caption tokens that do not appear in normal text chunks of the same page.
-    // Below RAG_CONFIG.minImageNoveltyRatio, the image is a duplicate page render and is not attached.
-    // Explicit page requests are exempt.
+    // Novelty check: Must not drop genuine slide or page renders that supported the answer.
+    // If an image-capable chunk survived grounding or explicit page request, it is genuine visual evidence.
+    // Auxiliary images lacking visual distinction from surrounding text are checked against minImageNoveltyRatio.
     if (!isExplicitPageRequest) {
       let pageNormalText = (retrievedChunks || [])
-        .filter((c) => c.documentId === chunk.documentId && c.pageNumber === chunk.pageNumber && c.sourceType !== "image_chunk" && !c.imageRef)
+        .filter((c) => c.documentId === chunk.documentId && c.pageNumber === chunk.pageNumber && c.sourceType !== "image_chunk" && !c.imageRef?.filename)
         .map((c) => c.content || "")
         .join(" ");
 
@@ -258,17 +280,19 @@ export async function resolveMultimodalAttachments({
           const dbChunks = await DocumentChunk.find({
             documentId: chunk.documentId,
             pageNumber: chunk.pageNumber,
-            sourceType: { $ne: "image_chunk" }
+            sourceType: { $ne: "image_chunk" },
+            "imageRef.filename": null
           }).select("content").lean();
           pageNormalText = dbChunks.map((c) => c.content || "").join(" ");
         } catch {}
       }
 
       const pageTokens = new Set(tokenize(pageNormalText));
-      const imageText = `${chunk.imageRef.caption || ""} ${chunk.content || ""}`;
+      const imageText = `${chunk.imageRef.caption || ""} ${chunk.imageRef.ocrText || ""}`;
       const imageTokens = tokenize(imageText);
 
-      if (imageTokens.length > 0 && pageTokens.size > 0) {
+      // Only drop if image has no caption/OCR of its own and page normal text completely covers it
+      if (imageTokens.length > 0 && pageTokens.size > 0 && !chunk.imageRef.caption && !chunk.imageRef.ocrText) {
         const novelTokens = imageTokens.filter((t) => !pageTokens.has(t));
         const noveltyRatio = novelTokens.length / imageTokens.length;
         const minNovelty = RAG_CONFIG.minImageNoveltyRatio !== undefined ? RAG_CONFIG.minImageNoveltyRatio : 0.15;
@@ -291,6 +315,23 @@ export async function resolveMultimodalAttachments({
         documentId: chunk.imageRef.documentId,
         filename: chunk.imageRef.filename
       }).lean();
+
+      if (dbImg?.isUseless) {
+        console.log(
+          `[Multimodal] Image dropped at attach: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: useless_image_flagged)`
+        );
+        continue;
+      }
+
+      // Re-verify image utility check at attach time
+      const resolvedPath = dbImg?.imagePath || chunk.sourcePath || path.join("uploads", "images", String(chunk.imageRef.documentId), chunk.imageRef.filename);
+      const quality = await isImageUseful(resolvedPath);
+      if (!quality.useful) {
+        console.log(
+          `[Multimodal] Image dropped at attach: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: useless_${quality.reason}, pixels=${quality.pixels}, variance=${quality.variance?.toFixed(1)})`
+        );
+        continue;
+      }
 
       const survivingChunkDesc = `chunk [p.${chunk.pageNumber} idx.${chunk.chunkIndex ?? 0}] (${chunk.sourceType || "image_chunk"})`;
 

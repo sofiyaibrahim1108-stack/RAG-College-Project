@@ -28,7 +28,10 @@ const ImageSchema = new mongoose.Schema(
     },
     caption: { type: String, default: "" },
     description: { type: String, default: "" },
-    ocrText: { type: String, default: "" }
+    ocrText: { type: String, default: "" },
+    isUseless: { type: Boolean, default: false, index: true },
+    pixels: { type: Number, default: null },
+    variance: { type: Number, default: null }
   },
   { timestamps: true }
 );

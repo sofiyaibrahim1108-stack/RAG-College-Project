@@ -22,6 +22,7 @@ import {
 } from "../utils/citations.js";
 import { RAG_CONFIG } from "../config/rag.js";
 import { rewriteRetry } from "../services/rewriteRetry.js";
+import { verifyAnswerSupport } from "../services/hallucinationGuard.js";
 
 
 /**
@@ -236,6 +237,11 @@ export async function askQuestionStream(req, res) {
       ...(routeResult.departments || [])
     ];
 
+    // FIX: declared BEFORE step 4. Step 4 reads/assigns textChunks; declaring it later
+    // threw a ReferenceError (temporal dead zone) that the catch below silently swallowed.
+    let textChunks = [];
+    let sources = [];
+
 
     // ==========================================================
     // 4. NORMAL TABULAR ROUTE
@@ -252,9 +258,13 @@ export async function askQuestionStream(req, res) {
       });
 
       try {
+        // FIX: pass recent history so follow-ups like "her average" can be resolved
         tabularResult = await processTabularQuery(
           originalQuestion,
-          routeResult.departments
+          routeResult.departments,
+          [],
+          "",
+          history
         );
 
         if (
@@ -266,7 +276,10 @@ export async function askQuestionStream(req, res) {
         ) {
           tabularResult = await processTabularQuery(
             effectiveQuestion,
-            routeResult.departments
+            routeResult.departments,
+            [],
+            "",
+            history
           );
         }
 
@@ -335,9 +348,6 @@ export async function askQuestionStream(req, res) {
     const isStrictVisual =
   effectiveQueryType === "visual_qa" &&
   /\b(screenshot|describe\s+only\s+the\s+visual|visual\s+elements|do\s+not\s+use\s+surrounding\s+text)\b/i.test(effectiveQuestion);
-
-    let textChunks = [];
-    let sources = [];
 
 
     const hasAuthoritativeTabular = tabularResult && tabularResult.success && tabularResult.computedValue !== null;
@@ -461,10 +471,14 @@ export async function askQuestionStream(req, res) {
            * Passing [] lets the tabular processor locate
            * the actual table dataset.
            */
+          // FIX: pass recent history here as well
           tabularResult =
             await processTabularQuery(
               question,
-              []
+              [],
+              [],
+              "",
+              history
             );
 
 
@@ -611,6 +625,10 @@ export async function askQuestionStream(req, res) {
         question
       );
 
+    // Chunks and sources must come only from chunks that survived the relative cutoff
+    textChunks = context.textChunks || [];
+    sources = formatSources(textChunks);
+
     timings.contextBuilder =
       Date.now() - tCtx;
 
@@ -747,8 +765,10 @@ export async function askQuestionStream(req, res) {
     }
 
 
+    let answerWasGenerated = false;
+
     // ==========================================================
-    // 9. EVIDENCE REJECTED
+    // 9. EVIDENCE REJECTED BEFORE GENERATION
     // ==========================================================
 
     if (!gate.supported) {
@@ -763,27 +783,77 @@ export async function askQuestionStream(req, res) {
         gate.reason;
 
       effectiveDepartments = [];
+      timings.llm = 0;
+      finalSources = [];
+      finalImageCitations = [];
+
+      // Rewrite retry: run ONLY when retrieval or evidence was insufficient before any answer was generated
+      if (
+        !hasAuthoritativeTabular &&
+        !isStrictVisual &&
+        effectiveQueryType !== "out_of_scope"
+      ) {
+        sendEvent("status", { message: "Rephrasing your question..." });
+        const tRetry = Date.now();
+        const retry = await rewriteRetry({
+          originalQuestion,
+          history,
+          chunks: textChunks,
+          contextPrompt: context.contextPrompt,
+          topSimilarity: evidenceMeta.topSimilarity,
+          gateSupported: gate.supported,
+          generate: (q, ctx, meta) =>
+            streamAnswer(q, ctx, history, null, effectiveQueryType, meta, {})
+        });
+        timings.retry = Date.now() - tRetry;
+
+        if (retry) {
+          const retryGuard = await verifyAnswerSupport({
+            answer: retry.answer,
+            contextChunks: retry.chunks
+          });
+
+          if (!retryGuard.accepted) {
+            fullAnswer = retryGuard.answer;
+            fallbackReason = retryGuard.fallbackReason || "unsupported_hallucination";
+            finalSources = [];
+            finalImageCitations = [];
+            effectiveDepartments = [];
+          } else {
+            fullAnswer = retryGuard.answer;
+            fallbackReason = null;
+            finalSources = retryGuard.sources;
+            finalImageCitations = await resolveMultimodalAttachments({
+              survivingSources: finalSources,
+              retrievedChunks: retryGuard.matchingChunks,
+              maxImages: RAG_CONFIG.topKImages,
+              isFallback: false,
+              question: originalQuestion,
+              finalAnswer: fullAnswer
+            });
+            effectiveDepartments = [
+              ...new Set(
+                (finalSources || []).map((s) => s.department).filter(Boolean)
+              )
+            ];
+          }
+          timings.llm = (timings.llm || 0) + timings.retry;
+        }
+      }
 
       sendEvent("token", {
         token: fullAnswer
       });
-
-      timings.llm = 0;
-
-      finalSources = [];
-
-      finalImageCitations = [];
     }
 
 
     // ==========================================================
-    // 10. LLM STREAM
+    // 10. GENERATION & VERIFICATION (BUFFERED STREAM)
     // ==========================================================
 
     else {
       sendEvent("status", {
-        message:
-          "Generating grounded response..."
+        message: "Checking answer against documents..."
       });
 
       const tLLM = Date.now();
@@ -802,24 +872,24 @@ export async function askQuestionStream(req, res) {
 
       if (tool) {
         const templateAnswer = formatTabularTemplateAnswer(tool, effectiveQuestion);
-        const grounding = verifyAnswerGrounding(templateAnswer, tool.summary || context.contextPrompt, effectiveQuestion);
+        const grounding = verifyAnswerGrounding(templateAnswer, context.contextPrompt || tool.summary, effectiveQuestion);
         if (grounding.valid) {
           timings.llm = 0;
           fullAnswer = templateAnswer;
-          sendEvent("token", { token: fullAnswer });
         }
       }
 
       if (!fullAnswer) {
+        answerWasGenerated = true;
+        const bufferedTokens = [];
+
         fullAnswer =
           await streamAnswer(
             effectiveQuestion,
             context.contextPrompt,
             history,
             (token) => {
-              sendEvent("token", {
-                token
-              });
+              bufferedTokens.push(token);
             },
             effectiveQueryType,
             evidenceMeta,
@@ -832,7 +902,7 @@ export async function askQuestionStream(req, res) {
 
 
       // ========================================================
-      // LLM FALLBACK
+      // GROUNDING & HALLUCINATION CHECKS
       // ========================================================
 
       if (isFallbackAnswer(fullAnswer)) {
@@ -844,12 +914,12 @@ export async function askQuestionStream(req, res) {
           "insufficient_evidence";
 
         finalSources = [];
-
         finalImageCitations = [];
-
         effectiveDepartments = [];
-      }
 
+        // If rejected, send only the fallback
+        sendEvent("token", { token: fullAnswer });
+      }
 
       // ========================================================
       // TABULAR SOURCES
@@ -865,18 +935,12 @@ export async function askQuestionStream(req, res) {
           ? [matchingCsv.department]
           : (routeResult.departments && routeResult.departments.length > 0 ? routeResult.departments : ["Student information"]);
 
-        /*
-         * Only cite the actual dataset used by the
-         * deterministic tabular processor.
-         */
-
         const fromDataset =
           (sources || []).filter(
             (s) =>
               s.documentName ===
               tool.documentName
           );
-
 
         finalSources =
           fromDataset.length > 0
@@ -895,92 +959,52 @@ export async function askQuestionStream(req, res) {
                 }
               ];
 
-
         finalImageCitations = [];
+        sendEvent("token", { token: fullAnswer });
       }
 
-
       // ========================================================
-      // NORMAL DOCUMENT SOURCES WITH SHARED MULTIMODAL ATTACHMENT
+      // NORMAL DOCUMENT SOURCES WITH SHARED HALLUCINATION GUARD
       // ========================================================
 
       else {
-        finalSources =
-          filterSupportingSources(
-            sources,
-            fullAnswer,
-            textChunks,
-            question
-          );
-
-        finalImageCitations = await resolveMultimodalAttachments({
-          survivingSources: finalSources,
-          retrievedChunks: textChunks,
-          maxImages: RAG_CONFIG.topKImages,
-          isFallback: false,
-          question: originalQuestion,
-          finalAnswer: fullAnswer
+        const guard = await verifyAnswerSupport({
+          answer: fullAnswer,
+          contextChunks: textChunks
         });
 
-        const sourceDepts = [...new Set((finalSources || []).map((s) => s.department).filter(Boolean))];
-        const chunkDepts = [...new Set((textChunks || []).map((c) => c.department).filter(Boolean))];
+        if (!guard.accepted) {
+          fullAnswer = guard.answer;
+          fallbackReason = guard.fallbackReason || "unsupported_hallucination";
+          finalSources = [];
+          finalImageCitations = [];
+          effectiveDepartments = [];
 
-        if (routeResult.departments && routeResult.departments.length > 0) {
-          effectiveDepartments = routeResult.departments;
+          // If rejected, send only the fallback
+          sendEvent("token", { token: fullAnswer });
         } else {
-          effectiveDepartments = sourceDepts.length > 0 ? sourceDepts : chunkDepts;
+          // Only if accepted, send text to the UI
+          sendEvent("token", { token: fullAnswer });
+
+          finalSources = guard.sources;
+          finalImageCitations = await resolveMultimodalAttachments({
+            survivingSources: finalSources,
+            retrievedChunks: guard.matchingChunks,
+            maxImages: RAG_CONFIG.topKImages,
+            isFallback: false,
+            question: originalQuestion,
+            finalAnswer: fullAnswer
+          });
+
+          const sourceDepts = [...new Set((finalSources || []).map((s) => s.department).filter(Boolean))];
+          const chunkDepts = [...new Set((guard.matchingChunks || []).map((c) => c.department).filter(Boolean))];
+
+          if (routeResult.departments && routeResult.departments.length > 0) {
+            effectiveDepartments = routeResult.departments;
+          } else {
+            effectiveDepartments = sourceDepts.length > 0 ? sourceDepts : chunkDepts;
+          }
         }
-      }
-    }
-
-
-    // ==========================================================
-    // 10B. REWRITE-ON-FAILURE (single retry, only after the first attempt failed)
-    // ==========================================================
-
-    if (
-      isFallbackAnswer(fullAnswer) &&
-      !hasAuthoritativeTabular &&
-      !isStrictVisual &&
-      effectiveQueryType !== "out_of_scope"
-    ) {
-      sendEvent("status", { message: "Rephrasing your question..." });
-      const tRetry = Date.now();
-      const retry = await rewriteRetry({
-        originalQuestion,
-        history,
-        chunks: textChunks,
-        contextPrompt: context.contextPrompt,
-        topSimilarity: evidenceMeta.topSimilarity,
-        gateSupported: gate.supported,
-        generate: (q, ctx, meta) =>
-          streamAnswer(q, ctx, history, null, effectiveQueryType, meta, {})
-      });
-      timings.retry = Date.now() - tRetry;
-
-      if (retry) {
-        fullAnswer = retry.answer;
-        fallbackReason = null;
-        finalSources = filterSupportingSources(
-          retry.sources,
-          fullAnswer,
-          retry.chunks,
-          originalQuestion
-        );
-        finalImageCitations = await resolveMultimodalAttachments({
-          survivingSources: finalSources,
-          retrievedChunks: retry.chunks,
-          maxImages: RAG_CONFIG.topKImages,
-          isFallback: false,
-          question: originalQuestion,
-          finalAnswer: fullAnswer
-        });
-        effectiveDepartments = [
-          ...new Set(
-            (finalSources || []).map((s) => s.department).filter(Boolean)
-          )
-        ];
-        timings.llm = (timings.llm || 0) + timings.retry;
       }
     }
 

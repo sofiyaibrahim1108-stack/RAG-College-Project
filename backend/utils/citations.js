@@ -13,6 +13,7 @@ export function formatSources(textChunks = []) {
       seen.set(key, {
         documentId: chunk.documentId,
         documentName: chunk.documentName,
+        department: chunk.department,
         pageNumber: chunk.pageNumber || 1,
         chunkIndex: chunk.chunkIndex,
         sourceType: chunk.sourceType || "text",

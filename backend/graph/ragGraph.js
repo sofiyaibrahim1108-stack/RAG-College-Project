@@ -13,6 +13,7 @@ import { generateAnswerDetailed, FALLBACK_MESSAGE, isFallbackAnswer, checkEviden
 import { formatSources, formatImageCitations } from "../utils/citations.js";
 import { RAG_CONFIG } from "../config/rag.js";
 import { rewriteRetry } from "../services/rewriteRetry.js";
+import { verifyAnswerSupport } from "../services/hallucinationGuard.js";
 
 /**
  * 1. Node: loadConversationHistory
@@ -107,7 +108,7 @@ async function tabularNode(state) {
     // fallbackQuestion allows resolving from the rewritten standalone query without LLM planning.
     const originalQ = state.originalQuestion || state.question;
     const fallbackQ = state.question !== originalQ ? state.question : "";
-    const result = await processTabularQuery(originalQ, state.routedDepartments, [], fallbackQ);
+    const result = await processTabularQuery(originalQ, state.routedDepartments, [], fallbackQ, state.conversationHistory || []);
     const duration = Date.now() - t0;
     console.log(`[Timing] Tabular Tool: ${duration} ms`);
 
@@ -316,8 +317,11 @@ async function contextBuilderNode(state) {
   const duration = Date.now() - t0;
   console.log(`[ContextBuilder] ${duration}ms`);
 
+  const survivingChunks = context.textChunks || [];
   return {
     contextPrompt: context.contextPrompt,
+    retrievedChunks: survivingChunks,
+    sources: formatSources(survivingChunks),
     timings: { contextBuilder: duration }
   };
 }
@@ -362,7 +366,7 @@ async function generateAnswerNode(state) {
   const tool = state.tabularResult;
   if (tool && tool.success && tool.computedValue !== null && tool.operation !== "preview") {
     const templateAnswer = formatTabularTemplateAnswer(tool, state.question);
-    const grounding = verifyAnswerGrounding(templateAnswer, tool.summary || state.contextPrompt, state.question);
+    const grounding = verifyAnswerGrounding(templateAnswer, state.contextPrompt || tool.summary, state.question);
     if (grounding.valid) {
       console.log(`[Generation] 0ms (deterministic tabular template, 0 LLM calls)`);
       const fromDataset = (state.sources || []).filter((s) => s.documentName === tool.documentName);
@@ -389,6 +393,8 @@ async function generateAnswerNode(state) {
     const tGen = Date.now();
     let answer = FALLBACK_MESSAGE;
     let reason = gate.reason;
+    let answerWasGenerated = false;
+
     if (!gateRejected) {
       ({ answer, reason } = await generateAnswerDetailed(
         state.question,
@@ -397,6 +403,7 @@ async function generateAnswerNode(state) {
         state.queryType,
         evidenceMeta
       ));
+      answerWasGenerated = true;
     }
     let genDuration = Date.now() - tGen;
     console.log(`[Generation] ${genDuration}ms${reason ? ` (withheld: ${reason})` : ""}`);
@@ -405,9 +412,27 @@ async function generateAnswerNode(state) {
     let retryDuration = 0;
     let usedChunks = state.retrievedChunks;
     let usedSources = state.sources;
+    let guardMatchingChunks = usedChunks;
 
-    // Rewrite only after the first attempt failed (fallback with strong evidence, or follow-up with history).
-    if (isMissing && state.queryType !== "out_of_scope") {
+    if (!isMissing) {
+      const guard = await verifyAnswerSupport({
+        answer,
+        contextChunks: usedChunks
+      });
+
+      if (!guard.accepted) {
+        isMissing = true;
+        reason = guard.fallbackReason || "unsupported_hallucination";
+        answer = guard.answer;
+      } else {
+        usedSources = guard.sources;
+        usedChunks = guard.matchingChunks;
+        guardMatchingChunks = guard.matchingChunks;
+      }
+    }
+
+    // Rewrite retry: run ONLY when retrieval or evidence was insufficient before any answer was generated
+    if (isMissing && !answerWasGenerated && state.queryType !== "out_of_scope") {
       const tRetry = Date.now();
       const retry = await rewriteRetry({
         originalQuestion: state.originalQuestion || state.question,
@@ -424,10 +449,22 @@ async function generateAnswerNode(state) {
       });
       retryDuration = Date.now() - tRetry;
       if (retry) {
-        answer = retry.answer;
-        usedChunks = retry.chunks;
-        usedSources = retry.sources;
-        isMissing = false;
+        const retryGuard = await verifyAnswerSupport({
+          answer: retry.answer,
+          contextChunks: retry.chunks
+        });
+
+        if (!retryGuard.accepted) {
+          answer = retryGuard.answer;
+          reason = retryGuard.fallbackReason || "unsupported_hallucination";
+          isMissing = true;
+        } else {
+          answer = retryGuard.answer;
+          usedChunks = retryGuard.matchingChunks;
+          usedSources = retryGuard.sources;
+          guardMatchingChunks = retryGuard.matchingChunks;
+          isMissing = false;
+        }
         console.log(`[Generation Retry] ${retryDuration}ms`);
       }
     }
@@ -436,7 +473,7 @@ async function generateAnswerNode(state) {
     const fallbackReason = isMissing ? (reason || "insufficient_evidence") : null;
 
     const tGrounding = Date.now();
-    let finalSources = isMissing ? [] : filterSupportingSources(usedSources, finalAnswer, usedChunks, state.question);
+    let finalSources = isMissing ? [] : usedSources;
     const groundingDuration = Date.now() - tGrounding;
     console.log(`[Grounding] ${groundingDuration}ms`);
 
@@ -447,22 +484,22 @@ async function generateAnswerNode(state) {
       // Document QA with shared Multimodal image attachment
       finalImageCitations = await resolveMultimodalAttachments({
         survivingSources: finalSources,
-        retrievedChunks: usedChunks,
+        retrievedChunks: guardMatchingChunks,
         maxImages: RAG_CONFIG.topKImages,
         isFallback: isMissing,
         question: state.originalQuestion || state.question,
         finalAnswer
       });
 
-        const sourceDepts = [...new Set((finalSources || []).map((s) => s.department).filter(Boolean))];
-        const chunkDepts = [...new Set((state.retrievedChunks || []).map((c) => c.department).filter(Boolean))];
+      const sourceDepts = [...new Set((finalSources || []).map((s) => s.department).filter(Boolean))];
+      const chunkDepts = [...new Set((state.retrievedChunks || []).map((c) => c.department).filter(Boolean))];
 
-        if (state.routedDepartments && state.routedDepartments.length > 0) {
-          effectiveDepartments = state.routedDepartments;
-        } else {
-          effectiveDepartments = sourceDepts.length > 0 ? sourceDepts : chunkDepts;
-        }
+      if (state.routedDepartments && state.routedDepartments.length > 0) {
+        effectiveDepartments = state.routedDepartments;
+      } else {
+        effectiveDepartments = sourceDepts.length > 0 ? sourceDepts : chunkDepts;
       }
+    }
 
     console.log(`[Stage Timings] retrieval: ${state.timings?.textRetrieval || 0}ms | generation: ${genDuration}ms | retry: ${retryDuration}ms | grounding: ${groundingDuration}ms`);
 

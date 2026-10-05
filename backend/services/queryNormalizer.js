@@ -1,5 +1,6 @@
 import axios from "axios";
 import { ENV } from "../config/env.js";
+import { RAG_CONFIG } from "../config/rag.js";
 
 /**
  * General query normalization service.
@@ -64,7 +65,7 @@ CRITICAL: Do NOT answer the question or make assertions. Output ONLY the standal
         },
         keep_alive: "30m"
       },
-      { timeout: 15000 }
+      { timeout: RAG_CONFIG.queryRewriteTimeoutMs ?? 5000 }
     );
 
     const rewritten = (res.data?.message?.content || "").trim().replace(/^["']|["']$/g, "");

@@ -45,17 +45,45 @@ export function buildRAGContext(textChunks = [], images = [], tabularResult = nu
     textChunks = (textChunks || []).filter((c) => c.documentName !== tabularResult.documentName);
   }
 
-  // Task 1c: Reduce prompt size: send only the chunks that support the answer after ranking
-  // (not every retained text chunk plus image chunk).
+  // Task 1c & Requirement 4: Select supporting chunks without dropping higher-ranked chunks
   const maxTotal = RAG_CONFIG.maxContextChunks || 3;
   const maxImage = RAG_CONFIG.maxContextImageChunks || 1;
-  const topImageChunks = (textChunks || []).filter((c) => c.sourceType === "image_chunk" || c.imageRef).slice(0, maxImage);
-  const topTextChunks = (textChunks || []).filter((c) => c.sourceType !== "image_chunk" && !c.imageRef).slice(0, Math.max(1, maxTotal - topImageChunks.length));
-  const supportingChunks = [...topTextChunks, ...topImageChunks].sort((a, b) => {
+
+  // Sort all retrieved chunks by relevance score first
+  const sortedChunks = [...(textChunks || [])].sort((a, b) => {
     if (a._isPageMatch && !b._isPageMatch) return -1;
     if (!a._isPageMatch && b._isPageMatch) return 1;
     return (b.rankingScore || b.similarity || 0) - (a.rankingScore || a.similarity || 0);
   });
+
+  const topScore = sortedChunks.length > 0
+    ? (sortedChunks[0].rankingScore ?? sortedChunks[0].similarity ?? 0)
+    : 0;
+  const scoreRatio = RAG_CONFIG.contextMinScoreRatio ?? 0.6;
+  const minCutoff = topScore * scoreRatio;
+
+  // Drop any chunk whose rankingScore is below top_score * ratio. Do not pad to maxContextChunks.
+  const eligibleChunks = sortedChunks.filter((chunk) => {
+    if (chunk._isPageMatch) return true;
+    const score = chunk.rankingScore ?? chunk.similarity ?? 0;
+    return score >= minCutoff;
+  });
+
+  // Select up to maxTotal chunks: the image slot cap must not drop a higher-ranked chunk
+  const supportingChunks = [];
+  let imageCount = 0;
+  for (const chunk of eligibleChunks) {
+    if (supportingChunks.length >= maxTotal) break;
+    const isImage = chunk.sourceType === "image_chunk" || Boolean(chunk.imageRef?.filename);
+    if (isImage) {
+      if (imageCount < maxImage || supportingChunks.length < maxTotal) {
+        supportingChunks.push(chunk);
+        imageCount++;
+      }
+    } else {
+      supportingChunks.push(chunk);
+    }
+  }
   const hasTextAfterTool = supportingChunks.length > 0;
 
   // Determine if this is a strict visual QA question focused on a screenshot or visual elements
@@ -66,6 +94,7 @@ export function buildRAGContext(textChunks = [], images = [], tabularResult = nu
 
   // 2. Document Excerpts Section (omitted for strict visual QA to prevent surrounding text leakage)
   const seenContents = new Set();
+  const keptExcerpts = [];
   if (hasTextAfterTool && !isStrictVisualQA) {
     contextSections.push("=== DOCUMENT EXCERPTS ===");
     let sourceIndex = 1;
@@ -73,8 +102,19 @@ export function buildRAGContext(textChunks = [], images = [], tabularResult = nu
     supportingChunks.forEach((chunk) => {
       const cleanContent = (chunk.content || "").trim();
       if (!cleanContent) return;
-      if (seenContents.has(cleanContent)) return;
+      if (seenContents.has(cleanContent)) {
+        // Merged or deduped chunks must keep imageRef
+        const existing = keptExcerpts.find((c) => (c.content || "").trim() === cleanContent);
+        if (existing && chunk.imageRef?.filename && !existing.imageRef?.filename) {
+          existing.imageRef = chunk.imageRef;
+          if (chunk.sourceType === "image_chunk") {
+            existing.sourceType = "image_chunk";
+          }
+        }
+        return;
+      }
       seenContents.add(cleanContent);
+      keptExcerpts.push(chunk);
 
       const pageStr = chunk.pageNumber ? `Page ${chunk.pageNumber}` : "Page 1";
       contextSections.push(
@@ -133,8 +173,9 @@ The user's question covers multiple separate questions/topics. Address EACH ques
 
   return {
     contextPrompt,
-    textChunks: textChunks || [],
+    textChunks: keptExcerpts,
     images: images || [],
-    tabularResult
+    tabularResult,
+    supportingChunks: keptExcerpts
   };
 }

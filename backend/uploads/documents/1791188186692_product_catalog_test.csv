@@ -1,0 +1,13 @@
+Product_ID,Product_Name,Category,Price_INR,Customer_Rating,Units_Sold
+P001,Aurora,Electronics,45999,4.7,128
+P002,Breeze,Home,12999,4.2,256
+P003,Cedar,Furniture,28999,4.8,74
+P004,Delta,Electronics,67999,4.5,93
+P005,Ember,Kitchen,8499,4.1,312
+P006,Flora,Beauty,2199,4.6,487
+P007,Glacier,Sports,7599,3.9,205
+P008,Harbor,Home,18499,4.4,166
+P009,Iris,Books,899,4.9,531
+P010,Juniper,Sports,5999,4.3,278
+P011,Lumen,Electronics,38999,4.6,119
+P012,Meadow,Kitchen,6499,4.0,354

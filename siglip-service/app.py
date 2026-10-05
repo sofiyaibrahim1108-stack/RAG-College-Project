@@ -3,6 +3,8 @@ import os
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+import numpy as np
 from services.siglip_service import siglip_service
 
 app = FastAPI(
@@ -73,6 +75,28 @@ async def embed_image(request: Request):
             "embedding": embedding,
             "dimensions": len(embedding)
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/image/quality")
+async def check_image_quality(request: Request):
+    try:
+        body = await request.json()
+        image_path = body.get("image_path")
+        if not image_path or not os.path.exists(image_path):
+            raise HTTPException(status_code=404, detail=f"Image not found at {image_path}")
+        with Image.open(image_path) as im:
+            pixels = im.width * im.height
+            arr = np.array(im.convert("L"))
+            var = float(np.var(arr))
+            return {
+                "width": im.width,
+                "height": im.height,
+                "pixels": pixels,
+                "variance": var
+            }
     except HTTPException:
         raise
     except Exception as e:

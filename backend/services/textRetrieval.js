@@ -80,13 +80,20 @@ export function computeLexicalScore(queryTerms, rawQuestion, content, scopeToken
   const contentTerms = queryTerms.filter((t) => !scopeTokens.has(t));
   const activeTerms = contentTerms.length > 0 ? contentTerms : queryTerms;
 
+  const contentWords = new Set(
+    contentLower
+      .replace(/[^a-z0-9_\-\s]/g, " ")
+      .split(/\s+/)
+      .filter(Boolean)
+  );
+
   let termMatches = 0;
   for (const term of activeTerms) {
-    if (contentLower.includes(term)) {
+    if (contentWords.has(term)) {
       termMatches++;
     } else {
       const subwords = term.split(/[-_]/).filter((s) => s.length >= 3);
-      if (subwords.length > 1 && subwords.some((s) => contentLower.includes(s))) {
+      if (subwords.length > 1 && subwords.some((s) => contentWords.has(s))) {
         termMatches += 0.7;
       }
     }
@@ -314,9 +321,10 @@ export async function retrieveRelevantTextChunks(
     if (filterMeta.documentName) {
       mongoQuery.documentName = filterMeta.documentName;
     }
+    mongoQuery.isUseless = { $ne: true };
 
     candidates = await DocumentChunk.find(mongoQuery)
-      .select("documentId documentName pageNumber chunkIndex content department sourceType imageRef embedding")
+      .select("documentId documentName pageNumber chunkIndex content department sourceType imageRef embedding isUseless")
       .lean();
   }
 
@@ -366,15 +374,23 @@ export async function retrieveRelevantTextChunks(
 
   // 5. Score and filter candidates
   const scoredCandidates = [];
-  const seenPrefixes = new Set();
+  const candidateByKey = new Map();
 
   for (const chunk of candidates) {
     if (!chunk.embedding || chunk.embedding.length === 0) continue;
 
-    // Deduplication by content snippet
+    // Deduplication by content snippet: merged or deduped chunks must keep imageRef
     const dedupeKey = `${chunk.documentId}_${chunk.pageNumber}_${(chunk.content || "").slice(0, 100)}`;
-    if (seenPrefixes.has(dedupeKey)) continue;
-    seenPrefixes.add(dedupeKey);
+    const existing = candidateByKey.get(dedupeKey);
+    if (existing) {
+      if (chunk.imageRef?.filename && !existing.imageRef?.filename) {
+        existing.imageRef = chunk.imageRef;
+        if (chunk.sourceType === "image_chunk") {
+          existing.sourceType = "image_chunk";
+        }
+      }
+      continue;
+    }
 
     const sim = cosineSimilarity(queryEmbedding, chunk.embedding);
     const isPageMatch = targetPage !== null && chunk.pageNumber === targetPage;
@@ -401,10 +417,10 @@ export async function retrieveRelevantTextChunks(
     // Keep candidate if semantic similarity passes threshold OR strong lexical match with moderate similarity OR exact page match
     const passesSemantic = sim >= threshold;
     const passesLexicalHybrid = lexicalScore >= 0.35 && sim >= 0.40;
-    const passesVisualOcr = (chunk.sourceType === "image_chunk" || chunk.sourceType === "visual_ocr") && (lexicalScore >= 0.20 || sim >= 0.40);
+    const passesVisualOcr = (chunk.sourceType === "image_chunk" || chunk.sourceType === "visual_ocr" || Boolean(chunk.imageRef?.filename)) && (lexicalScore >= 0.20 || sim >= 0.40);
 
     if (passesSemantic || passesLexicalHybrid || isPageMatch || passesVisualOcr) {
-      scoredCandidates.push({
+      const candidateObj = {
         documentId: chunk.documentId,
         documentName: chunk.documentName,
         pageNumber: chunk.pageNumber,
@@ -416,8 +432,11 @@ export async function retrieveRelevantTextChunks(
         similarity: parseFloat(sim.toFixed(4)),
         lexicalScore: parseFloat(lexicalScore.toFixed(4)),
         rankingScore: parseFloat(hybridScore.toFixed(4)),
-        _isPageMatch: isPageMatch
-      });
+        _isPageMatch: isPageMatch,
+        embedding: chunk.embedding
+      };
+      scoredCandidates.push(candidateObj);
+      candidateByKey.set(dedupeKey, candidateObj);
     }
   }
 
@@ -426,7 +445,7 @@ export async function retrieveRelevantTextChunks(
   const imageChunkCandidates = [];
 
   for (const c of scoredCandidates) {
-    if (c.sourceType === "image_chunk" || c.imageRef) {
+    if (c.sourceType === "image_chunk" || Boolean(c.imageRef?.filename)) {
       imageChunkCandidates.push(c);
     } else {
       textCandidates.push(c);

@@ -20,6 +20,7 @@ const DocumentChunkSchema = new mongoose.Schema(
     },
     department: { type: String, required: true, trim: true, index: true },
     isTestData: { type: Boolean, default: false, index: true },
+    isUseless: { type: Boolean, default: false, index: true },
     sourceType: { type: String, default: "upload" },
     sourcePath: { type: String, default: "" },
     imageRef: {

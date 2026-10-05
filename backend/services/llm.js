@@ -1913,20 +1913,26 @@ export function filterSupportingSources(
 
   const candidateList = supported.length > 0
     ? supported
-    : (targetPage ? sources.filter((s) => s.pageNumber === targetPage) : sources.slice(0, 1));
+    : (targetPage ? sources.filter((s) => s.pageNumber === targetPage) : []);
 
-  // Task 3: Deduplicate the Sources list by (document, page) and show only pages whose chunks supported the final answer
-  const seenPages = new Set();
-  const deduplicated = [];
+  // Task 3 & Requirement 4: Deduplicate the Sources list by (document, page) and merged/deduped chunks must keep imageRef
+  const seenPages = new Map();
   for (const s of candidateList) {
     const key = `${s.documentName}_p${s.pageNumber}`;
     if (!seenPages.has(key)) {
-      seenPages.add(key);
-      deduplicated.push(s);
+      seenPages.set(key, { ...s });
+    } else {
+      const existing = seenPages.get(key);
+      if (s.imageRef?.filename && !existing.imageRef?.filename) {
+        existing.imageRef = s.imageRef;
+        if (s.sourceType === "image_chunk") {
+          existing.sourceType = "image_chunk";
+        }
+      }
     }
   }
 
-  return deduplicated;
+  return Array.from(seenPages.values());
 }
 
 /**

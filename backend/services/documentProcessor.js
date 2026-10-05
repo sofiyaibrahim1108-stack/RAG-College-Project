@@ -13,6 +13,7 @@ import { generateBatchTextEmbeddings } from "./embeddingService.js";
 import { siglipClient } from "./siglipClient.js";
 import { extractOcrText } from "./ocrService.js";
 import { invalidateDepartmentProfilesCache } from "./router.js";
+import { isImageUseful } from "../utils/imageQuality.js";
 import { ENV } from "../config/env.js";
 
 /**
@@ -694,6 +695,15 @@ export async function processDocument(documentId) {
 
     for (const img of extractedData.images) {
       try {
+        // Do not store, index or embed tiny or near-uniform/blank images
+        const quality = await isImageUseful(img.filePath);
+        if (!quality.useful) {
+          console.log(
+            `[DocumentProcessor] Skipping useless image ${img.filename} (${quality.reason}, pixels=${quality.pixels}, variance=${quality.variance?.toFixed(1)})`
+          );
+          continue;
+        }
+
         const siglipEmb =
           img.embedding && Array.isArray(img.embedding) && img.embedding.length > 0
             ? img.embedding
