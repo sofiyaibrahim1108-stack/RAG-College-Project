@@ -168,6 +168,230 @@ function normalizeOp(opStr) {
 }
 
 /**
+ * Generic domain-agnostic function words & query conversational filler terms.
+ */
+export const QUERY_FUNCTION_WORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+  "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+  "being", "have", "has", "had", "do", "does", "did", "it", "its",
+  "this", "that", "these", "those", "i", "me", "my", "we", "our",
+  "you", "your", "he", "she", "they", "them", "their", "who", "whom",
+  "whose", "which", "what", "when", "where", "how", "why",
+  "would", "could", "should", "will", "can", "may", "might",
+  "so", "if", "as", "up", "out", "about", "also", "then", "both",
+  "all", "each", "every", "than", "into", "wanto", "want", "know",
+  "tell", "show", "give", "find", "get", "list", "please", "mark",
+  "marks", "score", "scores", "student", "students", "record",
+  "records", "row", "rows", "value", "values", "data", "table",
+  "details", "information", "info", "person", "people"
+]);
+
+/**
+ * Common query operators, ordinals, and comparison words that are consumed by query plans.
+ */
+export const QUERY_OPERATOR_WORDS = new Set([
+  "above", "greater", "more", "higher", "over", "exceeding", "exceeds",
+  "below", "less", "lower", "under", "fewer", "least", "most",
+  "equal", "equals", "average", "mean", "avg", "sum", "total",
+  "count", "percentage", "percent", "distribution", "min", "minimum",
+  "lowest", "bottom", "max", "maximum", "highest", "top", "rank",
+  "ranked", "order", "ordered", "first", "1st", "second", "2nd",
+  "third", "3rd", "fourth", "4th", "fifth", "5th", "sixth", "6th",
+  "seventh", "7th", "eighth", "8th", "ninth", "9th", "tenth", "10th"
+]);
+
+/**
+ * Finds the closest schema column using exact match, token stemming, or edit distance.
+ */
+export function findClosestColumn(term, colInfo) {
+  if (!term || !colInfo) return null;
+  const t = String(term).toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!t) return null;
+  const minLen = RAG_CONFIG.tabularFuzzyMinLength ?? 3;
+  const maxEdit = RAG_CONFIG.tabularFuzzyMaxEdit ?? 2;
+
+  for (const col of colInfo) {
+    if (matchTokenToColumn(term, col.name)) return col;
+    const c = col.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (t.length >= minLen && Math.abs(t.length - c.length) <= maxEdit) {
+      if (editDistance(t, c) <= maxEdit) return col;
+    }
+    const subtokens = col.name.toLowerCase().split(/[_\-\s]+/).filter(Boolean);
+    for (const sub of subtokens) {
+      const s = sub.replace(/[^a-z0-9]/g, "");
+      if (s.length >= minLen && Math.abs(t.length - s.length) <= maxEdit) {
+        if (editDistance(t, s) <= maxEdit) return col;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Checks if a token plausibly matches a schema column or row value using fuzzy similarity.
+ */
+export function checkPlausibleSchemaMatch(token, colInfo, rows = []) {
+  if (!token) return null;
+  const t = String(token).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const minLen = RAG_CONFIG.tabularFuzzyMinLength ?? 3;
+  if (t.length < minLen) return null;
+
+  const maxEdit = t.length >= 4 ? (RAG_CONFIG.tabularFuzzyMaxEdit ?? 2) : 1;
+
+  // 1. Check against schema column names and subtokens
+  for (const col of colInfo) {
+    const c = col.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (matchTokenToColumn(token, col.name)) {
+      return { match: col.name, type: "column", distance: 0 };
+    }
+    if (Math.abs(t.length - c.length) <= maxEdit) {
+      const d = editDistance(t, c);
+      if (d <= maxEdit) {
+        return { match: col.name, type: "column", distance: d };
+      }
+    }
+    // Subtokens of column name (e.g. "total" and "marks" for "Total_Marks")
+    const subtokens = col.name.toLowerCase().split(/[_\-\s]+/).filter(Boolean);
+    for (const sub of subtokens) {
+      const s = sub.replace(/[^a-z0-9]/g, "");
+      if (s.length >= minLen && Math.abs(t.length - s.length) <= maxEdit) {
+        const d = editDistance(t, s);
+        if (d <= maxEdit) {
+          return { match: col.name, type: "column_subtoken", subtoken: sub, distance: d };
+        }
+      }
+    }
+  }
+
+  // 2. Check against categorical row values
+  for (const col of colInfo) {
+    if (col.isNumeric || !col.distinct) continue;
+    for (const val of col.distinct) {
+      const valStr = String(val).toLowerCase();
+      const valTokens = valStr.split(/[_\-\s]+/).filter(Boolean);
+      for (const vt of valTokens) {
+        const vClean = vt.replace(/[^a-z0-9]/g, "");
+        if (vClean.length >= minLen && Math.abs(t.length - vClean.length) <= maxEdit) {
+          const d = editDistance(t, vClean);
+          if (d <= maxEdit) {
+            return { match: val, type: "row_value", column: col.name, distance: d };
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Requirement 1: Computes plan coverage.
+ * Determines which content tokens of the question were NOT consumed by the plan.
+ * If unconsumed tokens remain that could plausibly refer to schema columns or row values,
+ * the plan is declared "incomplete".
+ */
+export function checkPlanCoverage(question, plan, colInfo, rows = []) {
+  if (!question || !plan) {
+    return { isComplete: false, unconsumedTokens: [], plausibleUnconsumed: [], reason: "no plan or empty question" };
+  }
+
+  // Extract all word tokens from question
+  const qTokens = (question.toLowerCase().match(/[a-z0-9_\-]+/g) || []);
+  if (qTokens.length === 0) {
+    return { isComplete: true, unconsumedTokens: [], plausibleUnconsumed: [] };
+  }
+
+  // Set of consumed tokens from matched columns, values, operators, numbers
+  const consumedTokens = new Set();
+
+  // A. Columns in plan
+  const planCols = [];
+  if (plan.targetColumns && Array.isArray(plan.targetColumns)) {
+    planCols.push(...plan.targetColumns);
+  } else if (plan.targetColumn) {
+    planCols.push(plan.targetColumn);
+  }
+  if (Array.isArray(plan.filters)) {
+    for (const f of plan.filters) {
+      if (f && f.column) planCols.push(f.column);
+    }
+  }
+
+  for (const cName of planCols) {
+    const subtokens = String(cName).toLowerCase().split(/[_\-\s]+/).filter(Boolean);
+    for (const st of subtokens) {
+      consumedTokens.add(st);
+    }
+  }
+
+  // B. Entity / filter values in plan
+  if (Array.isArray(plan.filters)) {
+    for (const f of plan.filters) {
+      if (f && f.value !== undefined && f.value !== null) {
+        const valTokens = String(f.value).toLowerCase().split(/[_\-\s]+/).filter(Boolean);
+        for (const vt of valTokens) {
+          consumedTokens.add(vt);
+        }
+      }
+    }
+  }
+
+  // C. Operators in plan
+  if (plan.operation) {
+    consumedTokens.add(String(plan.operation).toLowerCase());
+  }
+
+  // Find unconsumed content tokens
+  const unconsumedTokens = [];
+
+  for (const rawToken of qTokens) {
+    const token = rawToken.replace(/[^a-z0-9]/g, "");
+    if (!token) continue;
+
+    // 1. Is it a number? Consumed.
+    if (/^\d+(\.\d+)?$/.test(token)) continue;
+
+    // 2. Was it consumed by a column, filter value, or operator?
+    if (consumedTokens.has(token)) continue;
+    let isConsumedByStem = false;
+    for (const ct of consumedTokens) {
+      if (token === ct || stemWord(token) === stemWord(ct) || matchTokenToColumn(token, ct)) {
+        isConsumedByStem = true;
+        break;
+      }
+    }
+    if (isConsumedByStem) continue;
+
+    // 3. Is it an operator word?
+    if (QUERY_OPERATOR_WORDS.has(token)) continue;
+
+    // 4. Is it a generic function / stopword?
+    if (QUERY_FUNCTION_WORDS.has(token)) continue;
+
+    // 5. This is an unconsumed content token!
+    // Check if it plausibly refers to schema columns or row values
+    const match = checkPlausibleSchemaMatch(token, colInfo, rows);
+    if (match) {
+      unconsumedTokens.push({ token, plausibleMatch: match });
+    } else {
+      unconsumedTokens.push({ token, plausibleMatch: null });
+    }
+  }
+
+  const plausibleUnconsumed = unconsumedTokens.filter((u) => u.plausibleMatch !== null);
+  const isComplete = plausibleUnconsumed.length === 0;
+
+  return {
+    isComplete,
+    unconsumedTokens,
+    plausibleUnconsumed,
+    reason: isComplete
+      ? "All content tokens consumed by plan"
+      : `Unconsumed tokens with plausible schema match: ${plausibleUnconsumed.map((u) => `${u.token} -> ${u.plausibleMatch.match}`).join(", ")}`
+  };
+}
+
+/**
  * Fast deterministic parser for structured queries.
  * Identifies column names, comparison operators, thresholds, and target operations directly from table schema.
  */
@@ -354,25 +578,30 @@ export function parseDeterministicQueryPlan(question, colInfo) {
 
   // 4. Resolve operation and target column
   let targetColumn = null;
+  let targetColumns = [];
   const numericFound = foundCols.filter((fc) => fc.col.isNumeric);
 
   // If an entity was matched (e.g. specific entity filter) AND another column was mentioned in the question:
-  // This is a single-cell LOOKUP!
-  const requestedCol = foundCols.find((fc) => fc.col.name !== matchedEntityFilter?.column);
-  if (matchedEntityFilter && requestedCol) {
+  // This is a LOOKUP! Support single or multiple columns.
+  const requestedCols = foundCols.filter((fc) => fc.col.name !== matchedEntityFilter?.column);
+  if (matchedEntityFilter && requestedCols.length > 0) {
     operation = "lookup";
-    targetColumn = requestedCol.col.name;
+    targetColumns = [...new Set(requestedCols.map((rc) => rc.col.name))];
+    targetColumn = targetColumns[0];
   } else if (["average", "sum", "min", "max"].includes(operation)) {
     if (numericFound.length > 0) {
-      targetColumn = numericFound[0].col.name;
+      targetColumns = [numericFound[0].col.name];
+      targetColumn = targetColumns[0];
     }
   } else if (operation === "count") {
     targetColumn = numericFound.length > 0 ? numericFound[0].col.name : (colInfo[0]?.name || null);
+    if (targetColumn) targetColumns = [targetColumn];
   } else if (operation === "filter") {
     const nameCol = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) ||
                     colInfo.find((c) => !c.isNumeric) ||
                     colInfo[0];
     targetColumn = nameCol ? nameCol.name : null;
+    if (targetColumn) targetColumns = [targetColumn];
   }
 
   // Ordinal rank extraction (e.g. "second student", "2nd highest", "top student", "3rd")
@@ -399,19 +628,23 @@ export function parseDeterministicQueryPlan(question, colInfo) {
       : (colInfo.find((c) => c.isNumeric && /total|score|mark|amount|revenue/i.test(c.name))?.name ||
          colInfo.find((c) => c.isNumeric)?.name || null);
     targetColumn = targetNumericCol;
+    if (targetColumn) targetColumns = [targetColumn];
   }
 
   if (!operation) {
-    if (matchedEntityFilter && requestedCol) {
+    if (matchedEntityFilter && requestedCols.length > 0) {
       operation = "lookup";
-      targetColumn = requestedCol.col.name;
+      targetColumns = [...new Set(requestedCols.map((rc) => rc.col.name))];
+      targetColumn = targetColumns[0];
     } else if (filters.length > 0) {
       operation = "filter";
       const nameCol = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric) || colInfo[0];
       targetColumn = nameCol ? nameCol.name : null;
+      if (targetColumn) targetColumns = [targetColumn];
     } else if (numericFound.length === 1) {
       operation = "average";
       targetColumn = numericFound[0].col.name;
+      targetColumns = [targetColumn];
     }
   }
 
@@ -420,11 +653,12 @@ export function parseDeterministicQueryPlan(question, colInfo) {
   return {
     operation,
     targetColumn,
+    targetColumns: targetColumns.length > 0 ? targetColumns : (targetColumn ? [targetColumn] : []),
     rankIndex,
     rankOrder,
     filters,
     isAmbiguous: false,
-    reason: `Deterministic structured parsing: ${operation} on ${targetColumn || "table"} with ${filters.length} filter(s)`
+    reason: `Deterministic structured parsing: ${operation} on ${targetColumns.join(", ") || targetColumn || "table"} with ${filters.length} filter(s)`
   };
 }
 
@@ -441,47 +675,38 @@ export async function parseSemanticQueryPlan(question, documentName, colInfo) {
     samples: c.sampleValues
   }));
 
-  const systemPrompt = `You are an expert tabular query planner.
-Analyze the user's question semantically against the REAL TABLE SCHEMA provided below.
+  const systemPrompt = `Expert tabular query planner. Analyze the user's question semantically against the REAL TABLE SCHEMA below and output strict JSON.
 
 TABLE: "${documentName}"
 SCHEMA:
-${JSON.stringify(schemaSummary, null, 2)}
+${JSON.stringify(schemaSummary)}
 
-ALLOWED OPERATIONS:
-- "average": computes mean/average of a numeric column
-- "sum": computes sum/total of a numeric column
-- "min": finds minimum/lowest value of a numeric column
-- "max": finds maximum/highest value of a numeric column
-- "count": counts rows matching criteria
-- "percentage": computes percentage of rows matching criteria
-- "distribution": groups row counts by a categorical column
-- "lookup": retrieves specific cell value(s) for a filtered entity
-- "none": if the question cannot be answered from this table or is not an analytical query
+ALLOWED OPERATIONS: "lookup", "filter", "average", "sum", "min", "max", "count", "percentage", "distribution", "rank", "none".
 
 CRITICAL INSTRUCTIONS:
-1. "targetColumn" MUST be an exact column name from the SCHEMA above, or null if the requested concept does not exist.
-   - If the user asks about a subject/concept not in the schema (e.g. asking about "History" when no History column exists), "targetColumn" MUST be null. NEVER invent column names. NEVER substitute another subject.
-   - Do NOT choose a column simply because its name matches the operation (e.g. if the user asks for "average Math mark", targetColumn is "Math", NOT a column named "Average").
-2. "filters": extract any row filter criteria mentioned in the question against real schema columns.
-   - "column" must be an exact schema column name.
-   - "op" must be one of: "eq", "gt", "gte", "lt", "lte".
-   - "value" must be the literal filter value (must exist in that categorical column, or be a valid number).
-3. "isAmbiguous": true if multiple columns equally match the concept or the request is unclear.
-4. "reason": explain the semantic mapping or why a column is missing.
+1. "columns": array of exact column names from SCHEMA.
+   - For lookups, include ALL requested columns (e.g. ["Science", "English", "Total_Marks", "Average"]).
+   - For aggregations (average/sum/min/max), include the target numeric column.
+   - Map spelling variations or typos (e.g. "tola" for "Total_Marks") to the correct schema column.
+   - If a requested column does not exist in SCHEMA, do not invent names; add to "unresolved".
+2. "filters": array of { "column": "<exact column>", "op": "eq"|"gt"|"gte"|"lt"|"lte", "value": "<value>" }.
+3. "unresolved": array of unrecognized concepts or missing columns from question.
+4. "reason": concise explanation.
 
 OUTPUT JSON FORMAT ONLY:
 {
-  "operation": "average" | "sum" | "min" | "max" | "count" | "percentage" | "distribution" | "lookup" | "none",
-  "targetColumn": "<exact column name from schema, or null>",
+  "operation": "lookup" | "filter" | "average" | "sum" | "min" | "max" | "count" | "percentage" | "distribution" | "rank" | "none",
+  "columns": ["<exact column name>", ...],
   "filters": [
     { "column": "<exact column name>", "op": "eq"|"gt"|"gte"|"lt"|"lte", "value": "<value>" }
   ],
+  "unresolved": [],
   "isAmbiguous": false,
   "reason": "<explanation>"
 }`;
 
   try {
+    const timeoutMs = RAG_CONFIG.tabularPlannerTimeout || 25000;
     const response = await axios.post(
       `${ENV.OLLAMA_BASE_URL}/api/chat`,
       {
@@ -494,11 +719,11 @@ OUTPUT JSON FORMAT ONLY:
         format: "json",
         options: {
           temperature: 0.0,
-          num_predict: 250
+          num_predict: 120
         },
         keep_alive: "30m"
       },
-      { timeout: 35000 }
+      { timeout: timeoutMs }
     );
 
     const raw = response.data?.message?.content || "{}";
@@ -508,8 +733,10 @@ OUTPUT JSON FORMAT ONLY:
     console.warn(`[Tabular Semantic Parser Notice] LLM parser failed: ${err.message}`);
     return {
       operation: "none",
+      columns: [],
       targetColumn: null,
       filters: [],
+      unresolved: [],
       isAmbiguous: false,
       reason: `LLM semantic parsing failed: ${err.message}`
     };
@@ -567,18 +794,46 @@ export function validateSemanticPlan(plan, colInfo, rows) {
     colByLower.set(c.name.toLowerCase().trim(), c);
   }
 
-  // 2. Validate target column against real schema
-  let validatedTarget = null;
-  if (plan.targetColumn) {
-    const rawTarget = String(plan.targetColumn).trim();
-    validatedTarget = colByName.get(rawTarget) || colByLower.get(rawTarget.toLowerCase());
-    if (!validatedTarget) {
-      return {
-        valid: false,
-        reason: `targetColumn "${plan.targetColumn}" does not exist in table schema`
-      };
+  // 2. Validate columns (support single column and multi-column)
+  let rawCols = [];
+  if (Array.isArray(plan.columns)) {
+    rawCols = plan.columns;
+  } else if (Array.isArray(plan.targetColumns)) {
+    rawCols = plan.targetColumns;
+  } else if (plan.targetColumn) {
+    rawCols = [plan.targetColumn];
+  }
+
+  const validatedColumns = [];
+  const unresolvedColumns = [];
+
+  for (const rawCol of rawCols) {
+    const s = String(rawCol).trim();
+    if (!s) continue;
+    let col = colByName.get(s) || colByLower.get(s.toLowerCase());
+    if (!col) {
+      col = findClosestColumn(s, colInfo);
+    }
+    if (col) {
+      if (!validatedColumns.some((vc) => vc.name === col.name)) {
+        validatedColumns.push(col);
+      }
+    } else {
+      unresolvedColumns.push(s);
     }
   }
+
+  const unresolved = [...unresolvedColumns];
+  if (Array.isArray(plan.unresolved)) {
+    for (const u of plan.unresolved) {
+      const su = String(u).trim();
+      if (su && !unresolved.includes(su)) {
+        unresolved.push(su);
+      }
+    }
+  }
+
+  let validatedTarget = validatedColumns[0] || null;
 
   const needsNumeric = ["average", "sum", "min", "max"].includes(normalizedOp);
   if (needsNumeric) {
@@ -605,7 +860,7 @@ export function validateSemanticPlan(plan, colInfo, rows) {
     }
   }
 
-  if (normalizedOp === "lookup" && !validatedTarget) {
+  if (normalizedOp === "lookup" && validatedColumns.length === 0) {
     return { valid: false, reason: `lookup requires a target column to retrieve` };
   }
 
@@ -631,7 +886,10 @@ export function validateSemanticPlan(plan, colInfo, rows) {
   if (Array.isArray(plan.filters)) {
     for (const f of plan.filters) {
       if (!f || !f.column) continue;
-      const fCol = colByName.get(f.column) || colByLower.get(String(f.column).toLowerCase().trim());
+      let fCol = colByName.get(f.column) || colByLower.get(String(f.column).toLowerCase().trim());
+      if (!fCol) {
+        fCol = findClosestColumn(String(f.column), colInfo);
+      }
       if (!fCol) {
         return { valid: false, reason: `filter column "${f.column}" does not exist in table schema` };
       }
@@ -645,9 +903,27 @@ export function validateSemanticPlan(plan, colInfo, rows) {
         }
         validatedFilters.push({ column: fCol.name, op, value: numVal });
       } else {
-        // Categorical column: value MUST exist in dataset
+        // Categorical column: value MUST exist in dataset or fuzzy match
         const valStr = String(f.value ?? "").trim().toLowerCase();
-        const matchVal = fCol.distinct.find((d) => d.toLowerCase() === valStr);
+        let matchVal = fCol.distinct.find((d) => d.toLowerCase() === valStr);
+        if (!matchVal) {
+          // Fuzzy match against distinct values
+          const minLen = RAG_CONFIG.tabularFuzzyMinLength ?? 3;
+          const maxEdit = RAG_CONFIG.tabularFuzzyMaxEdit ?? 2;
+          let best = null;
+          for (const d of fCol.distinct) {
+            const dl = String(d).toLowerCase().trim();
+            if (valStr.length >= minLen) {
+              const dist = editDistance(valStr, dl);
+              if (dist <= maxEdit && (best === null || dist < best.dist)) {
+                best = { d, dist };
+              }
+            }
+          }
+          if (best) {
+            matchVal = best.d;
+          }
+        }
         if (!matchVal) {
           return {
             valid: false,
@@ -663,7 +939,9 @@ export function validateSemanticPlan(plan, colInfo, rows) {
     valid: true,
     operation: normalizedOp,
     target: validatedTarget,
+    targetColumns: validatedColumns,
     filters: validatedFilters,
+    unresolved,
     reason: plan.reason || null
   };
 }
@@ -801,17 +1079,26 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     semanticPlan = parseDeterministicQueryPlan(fallbackQuestion, colInfo);
     if (semanticPlan) {
       resolvedQuestion = fallbackQuestion;
-      console.log(`[Tabular Processor] Deterministic plan resolved using context: ${semanticPlan.operation} on ${semanticPlan.targetColumn || "table"}`);
+      console.log(`[Tabular Processor] Deterministic plan resolved using context: ${semanticPlan.operation} on ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "table"}`);
     }
   } else if (semanticPlan) {
-    console.log(`[Tabular Processor] Deterministic plan resolved: ${semanticPlan.operation} on ${semanticPlan.targetColumn || "table"}`);
+    console.log(`[Tabular Processor] Deterministic plan resolved: ${semanticPlan.operation} on ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "table"}`);
   }
 
-  if (!semanticPlan) {
-    // Fall back to semantic LLM plan for complex questions
+  // Requirement 1 & 2: Plan coverage check & escalation
+  let coverage = checkPlanCoverage(resolvedQuestion, semanticPlan, colInfo, rows);
+  let usedLlmPlanner = false;
+
+  if (!semanticPlan || !coverage.isComplete) {
     const qForLlm = fallbackQuestion || question;
+    console.log(
+      `[Tabular Processor] Plan ${semanticPlan ? "incomplete" : "null"} (reason: ${coverage.reason}). Escalating to LLM semantic planner.`
+    );
     semanticPlan = await parseSemanticQueryPlan(qForLlm, documentName, colInfo);
     resolvedQuestion = qForLlm;
+    usedLlmPlanner = true;
+  } else {
+    console.log(`[Tabular Processor] Plan complete. Fast path enabled (0 LLM calls).`);
   }
 
   // 3. Strict Programmatic Validation
@@ -821,11 +1108,17 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     documentName,
     operation: validation.operation || semanticPlan.operation || "none",
     column: validation.target ? validation.target.name : null,
+    targetColumns: (validation.targetColumns && validation.targetColumns.length > 0)
+      ? validation.targetColumns.map((tc) => tc.name)
+      : (validation.target ? [validation.target.name] : []),
     filters: validation.filters || [],
     columns,
     totalRows: rows.length,
     rowsUsed: 0,
-    semanticPlan
+    semanticPlan,
+    usedLlmPlanner,
+    coverageDecision: coverage.isComplete ? "complete" : "incomplete",
+    unresolved: validation.unresolved || []
   };
 
   const logTabularSemanticDebug = (computedResult, fallbackReason = null, filteredCount = 0) => {
@@ -833,9 +1126,12 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     console.log(`  - question: "${question}"`);
     console.log(`  - selected document: ${documentName}`);
     console.log(`  - schema: [${columns.join(", ")}]`);
+    console.log(`  - coverage decision: ${coverage.isComplete ? "complete" : "incomplete"}`);
+    console.log(`  - used LLM planner: ${usedLlmPlanner}`);
     console.log(`  - semantic operation: ${semanticPlan.operation}`);
-    console.log(`  - semantic target: ${semanticPlan.targetColumn || "null"}`);
+    console.log(`  - semantic target: ${semanticPlan.targetColumns?.join(", ") || semanticPlan.targetColumn || "null"}`);
     console.log(`  - semantic filters: ${JSON.stringify(semanticPlan.filters || [])}`);
+    console.log(`  - unresolved: ${JSON.stringify(validation.unresolved || [])}`);
     console.log(`  - validation: ${validation.valid ? "passed" : "rejected"}`);
     console.log(`  - validation reason: ${validation.reason || "valid"}`);
     console.log(`  - rows before filters: ${rows.length}`);
@@ -1020,20 +1316,43 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     };
   }
 
-  if (operation === "lookup" && target && filteredRows.length <= 10) {
+  if (operation === "lookup" && (target || (validation.targetColumns && validation.targetColumns.length > 0)) && filteredRows.length <= 10) {
     const label = colInfo.find((c) => /name/i.test(c.name) && !c.isNumeric)?.name || columns[0];
-    const vals = filteredRows.map((r) => `${r[label]}: ${target.name} = ${r[target.name]}`);
-    const lookupVal = filteredRows.length === 1 ? String(filteredRows[0][target.name]) : (vals.length > 0 ? vals.join(", ") : null);
+    const targetCols = (validation.targetColumns && validation.targetColumns.length > 0)
+      ? validation.targetColumns.map((tc) => tc.name)
+      : [target.name];
+
+    let lookupVal;
+    if (filteredRows.length === 1) {
+      const r = filteredRows[0];
+      if (targetCols.length === 1) {
+        lookupVal = String(r[targetCols[0]]);
+      } else {
+        lookupVal = targetCols.map((colName) => `${colName}: ${r[colName]}`).join(", ");
+      }
+    } else {
+      lookupVal = filteredRows.map((r) => `${r[label]}: ` + targetCols.map((colName) => `${colName}=${r[colName]}`).join(", ")).join("; ");
+    }
+
+    const rec = filteredRows[0];
+    const colSummaryDesc = targetCols.map((colName) => `${colName} is ${rec[colName]}`).join(", ");
+    let summaryText = `The ${targetCols.join(", ")} of ${rec?.[label] || "the matching record"} are ${colSummaryDesc} (filters: ${filterText}). Full record: ${JSON.stringify(rec)}.`;
+    if (validation.unresolved && validation.unresolved.length > 0) {
+      summaryText += ` Note: Could not resolve ${validation.unresolved.map((u) => `"${u}"`).join(", ")} against the dataset schema.`;
+    }
+
     logTabularSemanticDebug(lookupVal, null, filteredRows.length);
     return {
       ...base,
       success: true,
       operation: "lookup",
-      column: target.name,
+      column: targetCols[0],
+      targetColumns: targetCols,
       computedValue: lookupVal,
       rowsUsed: filteredRows.length,
       records: filteredRows,
-      summary: `The ${target.name} of ${filteredRows[0]?.[label] || "the matching record"} is ${lookupVal} (filters: ${filterText}). Full record: ${JSON.stringify(filteredRows[0])}.`
+      unresolved: validation.unresolved || [],
+      summary: summaryText
     };
   }
 
@@ -1114,7 +1433,10 @@ export function formatTabularTemplateAnswer(tabularResult, question = "") {
     return null;
   }
 
-  const { operation, column, computedValue, records, filters, summary } = tabularResult;
+  const { operation, column, computedValue, records, filters, summary, unresolved } = tabularResult;
+  const unresolvedNotice = unresolved && unresolved.length > 0
+    ? ` (Note: Could not resolve ${unresolved.map((u) => `"${u}"`).join(", ")} against the dataset schema.)`
+    : "";
 
   if (operation === "entity_not_found") {
     return computedValue;
@@ -1122,40 +1444,54 @@ export function formatTabularTemplateAnswer(tabularResult, question = "") {
 
   if (operation === "filter") {
     const filterDesc = describeFilters(filters);
-    const colName = column || "records";
-    return `The students with ${filterDesc} are: ${computedValue}.`;
+    return `The students with ${filterDesc} are: ${computedValue}.${unresolvedNotice}`;
   }
 
   if (operation === "lookup" && records && records.length > 0) {
     const r = records[0];
     const name = r.Name || r.Student_ID || "The student";
-    return `${name}'s ${column} is ${computedValue}.`;
+    const targetCols = tabularResult.targetColumns && tabularResult.targetColumns.length > 0
+      ? tabularResult.targetColumns
+      : (column ? [column] : []);
+
+    let text = "";
+    if (targetCols.length > 1) {
+      const parts = targetCols.map((c) => `${c} is ${r[c] !== undefined ? r[c] : "N/A"}`);
+      const last = parts.pop();
+      text = `${name}'s ${parts.join(", ")} and ${last}.`;
+    } else if (targetCols.length === 1) {
+      text = `${name}'s ${targetCols[0]} is ${computedValue}.`;
+    } else {
+      text = `${name}: ${computedValue}.`;
+    }
+
+    return `${text}${unresolvedNotice}`;
   }
 
   if (operation === "average" || operation === "mean") {
-    return `The average ${column} is ${computedValue}.`;
+    return `The average ${column} is ${computedValue}.${unresolvedNotice}`;
   }
 
   if (operation === "sum" || operation === "total") {
-    return `The total ${column} is ${computedValue}.`;
+    return `The total ${column} is ${computedValue}.${unresolvedNotice}`;
   }
 
   if (operation === "max" || operation === "highest") {
-    return `The highest ${column} is ${computedValue}.`;
+    return `The highest ${column} is ${computedValue}.${unresolvedNotice}`;
   }
 
   if (operation === "min" || operation === "lowest") {
-    return `The lowest ${column} is ${computedValue}.`;
+    return `The lowest ${column} is ${computedValue}.${unresolvedNotice}`;
   }
 
   if (operation === "count") {
-    return `There are ${computedValue} matching records.`;
+    return `There are ${computedValue} matching records.${unresolvedNotice}`;
   }
 
   if (summary) {
-    return summary;
+    return `${summary}${unresolvedNotice}`;
   }
 
-  return `The result is ${computedValue}.`;
+  return `The result is ${computedValue}.${unresolvedNotice}`;
 }
 

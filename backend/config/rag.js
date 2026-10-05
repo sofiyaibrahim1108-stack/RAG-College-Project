@@ -18,6 +18,9 @@ export const RAG_CONFIG = {
   fuzzyMinTokenLength: 4,
   fuzzyMaxEditDistance: 1,
   fuzzyMaxSuggestions: 3,
+  tabularPlannerTimeout: 25000,
+  tabularFuzzyMaxEdit: 2,
+  tabularFuzzyMinLength: 3,
   historyWindow: 3, // number of previous messages to consider in context
   llm: {
     temperature: 0.2,
