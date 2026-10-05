@@ -1,3 +1,5 @@
+import { RAG_CONFIG } from "../config/rag.js";
+
 /**
  * Constructs the contextual prompt payload for the LLM
  * Combines retrieved text chunks, image references, and deterministic tabular tool results.
@@ -26,8 +28,6 @@ export function buildRAGContext(textChunks = [], images = [], tabularResult = nu
   const contextSections = [];
 
   // 1. Tabular Tool Result Section (Deterministic dataset calculations)
-  // For aggregate operations the tool result is the ONLY authoritative evidence from that dataset:
-  // raw rows are withheld so the LLM cannot substitute one row's value for the aggregate.
   const isAggregateTool = hasTabular && tabularResult.operation !== "preview" && tabularResult.computedValue !== null;
   if (hasTabular && tabularResult.computedValue !== null) {
     contextSections.push("=== AUTHORITATIVE TABULAR TOOL RESULT ===");
@@ -44,7 +44,19 @@ export function buildRAGContext(textChunks = [], images = [], tabularResult = nu
   if (isAggregateTool) {
     textChunks = (textChunks || []).filter((c) => c.documentName !== tabularResult.documentName);
   }
-  const hasTextAfterTool = Array.isArray(textChunks) && textChunks.length > 0;
+
+  // Task 1c: Reduce prompt size: send only the chunks that support the answer after ranking
+  // (not every retained text chunk plus image chunk).
+  const maxTotal = RAG_CONFIG.maxContextChunks || 3;
+  const maxImage = RAG_CONFIG.maxContextImageChunks || 1;
+  const topImageChunks = (textChunks || []).filter((c) => c.sourceType === "image_chunk" || c.imageRef).slice(0, maxImage);
+  const topTextChunks = (textChunks || []).filter((c) => c.sourceType !== "image_chunk" && !c.imageRef).slice(0, Math.max(1, maxTotal - topImageChunks.length));
+  const supportingChunks = [...topTextChunks, ...topImageChunks].sort((a, b) => {
+    if (a._isPageMatch && !b._isPageMatch) return -1;
+    if (!a._isPageMatch && b._isPageMatch) return 1;
+    return (b.rankingScore || b.similarity || 0) - (a.rankingScore || a.similarity || 0);
+  });
+  const hasTextAfterTool = supportingChunks.length > 0;
 
   // Determine if this is a strict visual QA question focused on a screenshot or visual elements
   const isStrictVisualQA = hasImages && (
@@ -58,7 +70,7 @@ export function buildRAGContext(textChunks = [], images = [], tabularResult = nu
     contextSections.push("=== DOCUMENT EXCERPTS ===");
     let sourceIndex = 1;
 
-    textChunks.forEach((chunk) => {
+    supportingChunks.forEach((chunk) => {
       const cleanContent = (chunk.content || "").trim();
       if (!cleanContent) return;
       if (seenContents.has(cleanContent)) return;
@@ -75,7 +87,8 @@ export function buildRAGContext(textChunks = [], images = [], tabularResult = nu
   // 3. Relevant Visual Evidence Section
   if (hasImages) {
     contextSections.push("=== RELEVANT VISUAL EVIDENCE ===");
-    images.forEach((img, index) => {
+    const visualImages = images.slice(0, 2);
+    visualImages.forEach((img, index) => {
       const pageStr = img.pageNumber ? `Page ${img.pageNumber}` : "Page 1";
       const lines = [];
 
@@ -92,28 +105,6 @@ export function buildRAGContext(textChunks = [], images = [], tabularResult = nu
 
       if (img.description && img.description.trim() && (!img.ocrText || !img.description.includes(img.ocrText.slice(0, 50)))) {
         lines.push(`Visual Description: ${img.description.trim()}`);
-      }
-
-      // Attach same-page text chunks ONLY if not strict visual QA
-      if (hasChunks && !isStrictVisualQA) {
-        const samePageChunks = textChunks.filter(
-          (c) =>
-            c.pageNumber === img.pageNumber &&
-            c.documentName === img.documentName &&
-            !c.content?.startsWith("[Visual Screenshot Evidence")
-        );
-
-        if (samePageChunks.length > 0) {
-          const samePageText = samePageChunks
-            .map((c) => (c.content || "").trim())
-            .filter(Boolean)
-            .join("\n")
-            .slice(0, 500);
-
-          if (samePageText) {
-            lines.push(`Same-Page Context:\n${samePageText}`);
-          }
-        }
       }
 
       contextSections.push(lines.join("\n"));

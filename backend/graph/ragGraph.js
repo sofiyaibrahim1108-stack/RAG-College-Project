@@ -3,13 +3,13 @@ import { RAGStateAnnotation } from "./graphState.js";
 import { Message } from "../models/Message.js";
 import { Conversation } from "../models/Conversation.js";
 import { routeDepartment } from "../services/router.js";
-import { processTabularQuery } from "../services/tabularProcessor.js";
+import { processTabularQuery, formatTabularTemplateAnswer } from "../services/tabularProcessor.js";
 import { generateTextEmbedding } from "../services/embeddingService.js";
 import { retrieveWithScopeFallback } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
 import { retrieveRelevantImages, resolveMultimodalAttachments } from "../services/imageRetrieval.js";
 import { buildRAGContext } from "../services/contextBuilder.js";
-import { generateAnswerDetailed, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate, filterSupportingSources } from "../services/llm.js";
+import { generateAnswerDetailed, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate, filterSupportingSources, verifyAnswerGrounding } from "../services/llm.js";
 import { formatSources, formatImageCitations } from "../utils/citations.js";
 import { RAG_CONFIG } from "../config/rag.js";
 import { normalizeUserQuery } from "../services/queryNormalizer.js";
@@ -375,6 +375,34 @@ async function generateAnswerNode(state) {
     };
   }
 
+  // Task 1b: For a successful deterministic tabular result, build the answer text from a template
+  // using the tool result, with no LLM call. Keep the grounding checks consistent.
+  const tool = state.tabularResult;
+  if (tool && tool.success && tool.computedValue !== null && tool.operation !== "preview") {
+    const templateAnswer = formatTabularTemplateAnswer(tool, state.question);
+    const grounding = verifyAnswerGrounding(templateAnswer, tool.summary || state.contextPrompt, state.question);
+    if (grounding.valid) {
+      console.log(`[Generation] 0ms (deterministic tabular template, 0 LLM calls)`);
+      const fromDataset = (state.sources || []).filter((s) => s.documentName === tool.documentName);
+      const finalSources = fromDataset.length > 0
+        ? fromDataset.slice(0, 1)
+        : [{ documentName: tool.documentName, pageNumber: 1, chunkIndex: 0, snippet: tool.summary?.slice(0, 200) }];
+
+      const matchingChunk = (state.retrievedChunks || []).find((c) => c.documentName === tool.documentName);
+      const dept = matchingChunk?.department || (state.routedDepartments && state.routedDepartments[0]);
+      const effectiveDepartments = dept ? [dept] : (state.routedDepartments || []);
+
+      return {
+        finalAnswer: templateAnswer,
+        fallbackReason: null,
+        sources: finalSources,
+        imageCitations: [],
+        routedDepartments: effectiveDepartments,
+        timings: { evidenceGate: 0, generation: 0, llm: 0 }
+      };
+    }
+  }
+
   try {
     const tGen = Date.now();
     let { answer, reason } = await generateAnswerDetailed(
@@ -388,12 +416,14 @@ async function generateAnswerNode(state) {
     console.log(`[Generation] ${genDuration}ms${reason ? ` (withheld: ${reason})` : ""}`);
 
     let isMissing = isFallbackAnswer(answer);
+    let retryDuration = 0;
 
-    // Requirement 2b: For first-turn questions, if the generated answer is the fallback while
-    // the evidence gate passed and relevant evidence exists, retry the generation ONCE with a rewritten standalone question.
+    // Task 1e: Run a second generation only when the first answer is the fallback while strong evidence exists.
     const hasPreviousUserTurns = Array.isArray(state.conversationHistory) && state.conversationHistory.some((m) => m.role === "user");
-    if (isMissing && !hasPreviousUserTurns && gate.supported && (state.retrievedChunks || []).length > 0) {
+    const strongEvidence = topSimilarity >= (RAG_CONFIG.strongEvidenceThreshold || 0.62);
+    if (isMissing && !hasPreviousUserTurns && gate.supported && strongEvidence && (state.retrievedChunks || []).length > 0) {
       console.log(`[Generation Retry] Fallback on first-turn question "${state.question}". Retrying once with rewritten standalone question...`);
+      const tRetry = Date.now();
       const rewrittenQ = await normalizeUserQuery(state.originalQuestion || state.question, state.conversationHistory, true);
       if (rewrittenQ && rewrittenQ !== state.question) {
         const retryResult = await generateAnswerDetailed(
@@ -403,44 +433,39 @@ async function generateAnswerNode(state) {
           state.queryType,
           evidenceMeta
         );
+        retryDuration = Date.now() - tRetry;
         if (!isFallbackAnswer(retryResult.answer)) {
-          console.log(`[Generation Retry] Succeeded with rewritten question: "${rewrittenQ}"`);
+          console.log(`[Generation Retry] Succeeded with rewritten question: "${rewrittenQ}" (${retryDuration}ms)`);
           answer = retryResult.answer;
           reason = retryResult.reason;
           isMissing = false;
         }
+      } else {
+        retryDuration = Date.now() - tRetry;
       }
     }
 
     const finalAnswer = isMissing ? FALLBACK_MESSAGE : answer;
     const fallbackReason = isMissing ? (reason || "insufficient_evidence") : null;
 
+    const tGrounding = Date.now();
     let finalSources = isMissing ? [] : filterSupportingSources(state.sources, finalAnswer, state.retrievedChunks, state.question);
+    const groundingDuration = Date.now() - tGrounding;
+    console.log(`[Grounding] ${groundingDuration}ms`);
+
     let finalImageCitations = [];
     let effectiveDepartments = [];
 
     if (!isMissing) {
-      // Tool-computed answers cite the dataset the tool actually used
-      const tool = state.tabularResult;
-      if (tool && tool.success && tool.operation !== "preview") {
-        const fromDataset = (state.sources || []).filter((s) => s.documentName === tool.documentName);
-        finalSources = fromDataset.length > 0
-          ? fromDataset.slice(0, 1)
-          : [{ documentName: tool.documentName, pageNumber: 1, chunkIndex: 0, snippet: tool.summary?.slice(0, 200) }];
-        finalImageCitations = [];
-
-        const matchingChunk = (state.retrievedChunks || []).find((c) => c.documentName === tool.documentName);
-        const dept = matchingChunk?.department || (state.routedDepartments && state.routedDepartments[0]);
-        effectiveDepartments = dept ? [dept] : (state.routedDepartments || []);
-      } else {
-        // Document QA with shared Multimodal image attachment
-        finalImageCitations = await resolveMultimodalAttachments({
-          survivingSources: finalSources,
-          retrievedChunks: state.retrievedChunks,
-          maxImages: RAG_CONFIG.topKImages,
-          isFallback: isMissing,
-          question: state.originalQuestion || state.question
-        });
+      // Document QA with shared Multimodal image attachment
+      finalImageCitations = await resolveMultimodalAttachments({
+        survivingSources: finalSources,
+        retrievedChunks: state.retrievedChunks,
+        maxImages: RAG_CONFIG.topKImages,
+        isFallback: isMissing,
+        question: state.originalQuestion || state.question,
+        finalAnswer
+      });
 
         const sourceDepts = [...new Set((finalSources || []).map((s) => s.department).filter(Boolean))];
         const chunkDepts = [...new Set((state.retrievedChunks || []).map((c) => c.department).filter(Boolean))];
@@ -451,7 +476,8 @@ async function generateAnswerNode(state) {
           effectiveDepartments = sourceDepts.length > 0 ? sourceDepts : chunkDepts;
         }
       }
-    }
+
+    console.log(`[Stage Timings] retrieval: ${state.timings?.textRetrieval || 0}ms | generation: ${genDuration}ms | retry: ${retryDuration}ms | grounding: ${groundingDuration}ms`);
 
     return {
       finalAnswer,
@@ -459,7 +485,7 @@ async function generateAnswerNode(state) {
       sources: finalSources,
       imageCitations: finalImageCitations,
       routedDepartments: effectiveDepartments,
-      timings: { evidenceGate: gateDuration, generation: genDuration, llm: genDuration }
+      timings: { evidenceGate: gateDuration, generation: genDuration, retry: retryDuration, grounding: groundingDuration, llm: genDuration }
     };
   } catch (err) {
     console.error(`[Node: generateAnswer] Error: ${err.message}`);

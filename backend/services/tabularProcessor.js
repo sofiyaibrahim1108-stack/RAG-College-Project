@@ -494,7 +494,8 @@ OUTPUT JSON FORMAT ONLY:
         options: {
           temperature: 0.0,
           num_predict: 250
-        }
+        },
+        keep_alive: "30m"
       },
       { timeout: 35000 }
     );
@@ -1027,3 +1028,58 @@ export async function processTabularQuery(question = "", targetDepartments = [],
     summary: `Dataset ${documentName} contains ${rows.length} rows with columns: ${columns.join(", ")}.`
   };
 }
+
+/**
+ * Task 1b: For a successful deterministic tabular result, builds answer text
+ * from a structured template using the tool result, with no LLM call.
+ *
+ * @param {Object} tabularResult
+ * @param {string} question
+ * @returns {string}
+ */
+export function formatTabularTemplateAnswer(tabularResult, question = "") {
+  if (!tabularResult || !tabularResult.success || tabularResult.computedValue === null) {
+    return null;
+  }
+
+  const { operation, column, computedValue, records, filters, summary } = tabularResult;
+
+  if (operation === "filter") {
+    const filterDesc = describeFilters(filters);
+    const colName = column || "records";
+    return `The students with ${filterDesc} are: ${computedValue}.`;
+  }
+
+  if (operation === "lookup" && records && records.length > 0) {
+    const r = records[0];
+    const name = r.Name || r.Student_ID || "The student";
+    return `${name}'s ${column} is ${computedValue}.`;
+  }
+
+  if (operation === "average" || operation === "mean") {
+    return `The average ${column} is ${computedValue}.`;
+  }
+
+  if (operation === "sum" || operation === "total") {
+    return `The total ${column} is ${computedValue}.`;
+  }
+
+  if (operation === "max" || operation === "highest") {
+    return `The highest ${column} is ${computedValue}.`;
+  }
+
+  if (operation === "min" || operation === "lowest") {
+    return `The lowest ${column} is ${computedValue}.`;
+  }
+
+  if (operation === "count") {
+    return `There are ${computedValue} matching records.`;
+  }
+
+  if (summary) {
+    return summary;
+  }
+
+  return `The result is ${computedValue}.`;
+}
+

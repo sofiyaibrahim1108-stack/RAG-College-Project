@@ -37,7 +37,8 @@ export async function generateTextEmbedding(text, maxRetries = 3) {
         `${ENV.OLLAMA_BASE_URL}/api/embeddings`,
         {
           model: ENV.OLLAMA_EMBED_MODEL,
-          prompt: promptText
+          prompt: promptText,
+          keep_alive: "30m"
         },
         { timeout: 45000 }
       );

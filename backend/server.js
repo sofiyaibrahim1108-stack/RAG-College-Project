@@ -12,6 +12,7 @@ import chatRoutes from "./routes/chatRoutes.js";
 import departmentRoutes from "./routes/departmentRoutes.js";
 import testDataRoutes from "./routes/testDataRoutes.js";
 import { siglipClient } from "./services/siglipClient.js";
+import { warmOllamaModels } from "./services/llm.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -75,6 +76,7 @@ app.use((err, req, res, next) => {
 async function startServer() {
   try {
     await connectDB();
+    await warmOllamaModels();
     app.listen(ENV.PORT, () => {
       console.log(`===============================================`);
       console.log(`🚀 RAG Knowledge Assistant Backend is LIVE!`);

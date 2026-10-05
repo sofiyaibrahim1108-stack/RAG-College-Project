@@ -168,7 +168,8 @@ export async function resolveMultimodalAttachments({
   retrievedChunks = [],
   maxImages = RAG_CONFIG.topKImages,
   isFallback = false,
-  question = ""
+  question = "",
+  finalAnswer = ""
 }) {
   if (isFallback) {
     console.log("[Multimodal] Attach: Fallback answer detected. No images attached.");
@@ -177,11 +178,15 @@ export async function resolveMultimodalAttachments({
 
   const attached = [];
   const seenImageKeys = new Set();
-  const isExplicitPageRequest = /\b(?:page|p\.?)\s*\d+\b/i.test(question || "");
 
-  // Map surviving source keys by strict chunk identity (documentName + pageNumber + chunkIndex + sourceType)
-  const survivingChunkKeys = new Set(
-    (survivingSources || []).map((s) => `${s.documentName}_p${s.pageNumber || 1}_idx${s.chunkIndex ?? 0}_${s.sourceType || "text"}`)
+  // Task 2a: If the question names a page (page filter), attach only the image(s) of that page.
+  const pageMatch = (question || "").match(/\b(?:page|p\.?)\s*(\d+)\b/i);
+  const targetPage = pageMatch ? parseInt(pageMatch[1], 10) : null;
+  const isExplicitPageRequest = targetPage !== null;
+
+  // Track surviving pages from the filtered sources
+  const survivingPages = new Set(
+    (survivingSources || []).map((s) => `${s.documentName}_p${s.pageNumber || 1}`)
   );
 
   // Stop words for novelty comparison
@@ -198,19 +203,44 @@ export async function resolveMultimodalAttachments({
       .split(/\s+/)
       .filter((w) => w.length >= 3 && !NOVELTY_STOP_WORDS.has(w));
 
-  // Attach images strictly via surviving image-derived chunks (Requirement 4a & 4b)
+  // Attach images strictly via surviving image-derived chunks (Task 2a & 2b)
   for (const chunk of retrievedChunks || []) {
     if (!chunk.imageRef || !chunk.imageRef.filename) continue;
     if (chunk.sourceType !== "image_chunk") continue;
 
-    const chunkKey = `${chunk.documentName}_p${chunk.pageNumber || 1}_idx${chunk.chunkIndex ?? 0}_${chunk.sourceType || "image_chunk"}`;
-    const didSurvive = survivingChunkKeys.has(chunkKey);
+    // Task 2a: If the question names a page (page filter), attach only the image(s) of that page.
+    if (isExplicitPageRequest) {
+      if (chunk.pageNumber !== targetPage && chunk.imageRef?.pageNumber !== targetPage) {
+        continue;
+      }
+    } else {
+      // Task 2b: Otherwise attach only images whose own image_chunk supported the final answer.
+      // Do not attach images of other sections just because they ranked in the pool.
+      const pageKey = `${chunk.documentName}_p${chunk.pageNumber || 1}`;
+      if (!survivingPages.has(pageKey)) {
+        console.log(
+          `[Multimodal] Image dropped: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: page_not_in_surviving_sources)`
+        );
+        continue;
+      }
 
-    if (!didSurvive) {
-      console.log(
-        `[Multimodal] Image dropped: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: did_not_survive_grounding)`
-      );
-      continue;
+      if (finalAnswer) {
+        const answerNumbers = (finalAnswer.match(/\b\d+(?:,\d+)*(?:\.\d+)?%?\b/g) || [])
+          .map((n) => n.replace(/,/g, "").toLowerCase())
+          .filter((n) => n.length >= 2 || n.includes("%"));
+
+        const chunkText = `${chunk.imageRef?.caption || ""} ${chunk.content || ""}`.toLowerCase();
+
+        if (answerNumbers.length > 0) {
+          const hasNumber = answerNumbers.some((num) => chunkText.includes(num));
+          if (!hasNumber) {
+            console.log(
+              `[Multimodal] Image dropped: file "${chunk.imageRef.filename}", page ${chunk.pageNumber} (reason: image_chunk_does_not_support_answer_numbers)`
+            );
+            continue;
+          }
+        }
+      }
     }
 
     // Novelty check (Requirement 4b):

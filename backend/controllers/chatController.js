@@ -2,7 +2,7 @@ import { ragGraph } from "../graph/ragGraph.js";
 import { Message } from "../models/Message.js";
 import { Conversation } from "../models/Conversation.js";
 import { routeDepartment } from "../services/router.js";
-import { processTabularQuery } from "../services/tabularProcessor.js";
+import { processTabularQuery, formatTabularTemplateAnswer } from "../services/tabularProcessor.js";
 import { generateTextEmbedding } from "../services/embeddingService.js";
 import { retrieveWithScopeFallback } from "../services/textRetrieval.js";
 import { siglipClient } from "../services/siglipClient.js";
@@ -13,7 +13,8 @@ import {
   FALLBACK_MESSAGE,
   isFallbackAnswer,
   checkEvidenceSupportGate,
-  filterSupportingSources
+  filterSupportingSources,
+  verifyAnswerGrounding
 } from "../services/llm.js";
 import {
   formatSources,
@@ -788,42 +789,48 @@ export async function askQuestionStream(req, res) {
       });
 
       const tLLM = Date.now();
-
       const meta = {};
 
-
-      fullAnswer =
-        await streamAnswer(
-          effectiveQuestion,
-          context.contextPrompt,
-          history,
-          (token) => {
-            sendEvent("token", {
-              token
-            });
-          },
-          effectiveQueryType,
-          evidenceMeta,
-          meta
-        );
-
-
-      timings.llm =
-        Date.now() - tLLM;
-
-
       // ========================================================
-      // Determine whether this was a successful tabular answer
+      // Task 1b: Tabular Template Answer with zero LLM calls
       // ========================================================
-
       const tool =
         tabularResult &&
         tabularResult.success &&
         tabularResult.computedValue !== null &&
-        tabularResult.operation !==
-          "preview"
+        tabularResult.operation !== "preview"
           ? tabularResult
           : null;
+
+      if (tool) {
+        const templateAnswer = formatTabularTemplateAnswer(tool, effectiveQuestion);
+        const grounding = validateNumericalGrounding(templateAnswer, tool.summary || context.contextPrompt);
+        if (grounding.valid) {
+          timings.llm = 0;
+          fullAnswer = templateAnswer;
+          sendEvent("token", { token: fullAnswer });
+        }
+      }
+
+      if (!fullAnswer) {
+        fullAnswer =
+          await streamAnswer(
+            effectiveQuestion,
+            context.contextPrompt,
+            history,
+            (token) => {
+              sendEvent("token", {
+                token
+              });
+            },
+            effectiveQueryType,
+            evidenceMeta,
+            meta
+          );
+
+        timings.llm =
+          Date.now() - tLLM;
+      }
 
 
       // ========================================================
@@ -913,7 +920,8 @@ export async function askQuestionStream(req, res) {
           retrievedChunks: textChunks,
           maxImages: RAG_CONFIG.topKImages,
           isFallback: false,
-          question: originalQuestion
+          question: originalQuestion,
+          finalAnswer: fullAnswer
         });
 
         const sourceDepts = [...new Set((finalSources || []).map((s) => s.department).filter(Boolean))];

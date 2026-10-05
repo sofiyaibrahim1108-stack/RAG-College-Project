@@ -10,6 +10,10 @@ export const RAG_CONFIG = {
   textSimilarityThreshold: 0.48,
   imageSimilarityThreshold: 0.065,
   minImageNoveltyRatio: 0.15,
+  maxContextChunks: 3,
+  maxContextTextChunks: 2,
+  maxContextImageChunks: 1,
+  strongEvidenceThreshold: 0.62,
   historyWindow: 3, // number of previous messages to consider in context
   llm: {
     temperature: 0.2,

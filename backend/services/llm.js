@@ -1846,6 +1846,9 @@ export function filterSupportingSources(
     return [];
   }
 
+  const pageMatch = question.match(/\b(?:page|p\.?)\s*(\d+)\b/i);
+  const targetPage = pageMatch ? parseInt(pageMatch[1], 10) : null;
+
   const rawAnswerTerms = extractQueryTerms(answer);
   const specificAnswerTerms = rawAnswerTerms.filter((t) => t.length >= 3);
 
@@ -1865,166 +1868,98 @@ export function filterSupportingSources(
         n.includes("%")
     );
 
-  const supported = sources.filter(
-    (source) => {
-      const chunk =
-        retrievedChunks?.find(
-          (c) =>
-            c.documentName === source.documentName &&
-            c.pageNumber === source.pageNumber &&
-            (source.chunkIndex === undefined || c.chunkIndex === source.chunkIndex)
-        ) ||
-        retrievedChunks?.find(
-          (c) =>
-            c.documentName === source.documentName &&
-            c.pageNumber === source.pageNumber
-        );
-
-      const rawText = (
-        chunk?.content ||
-        source.snippet ||
-        ""
-      ).toLowerCase();
-      const text = rawText.replace(/(?<=\d),(?=\d)/g, "");
-
-      const hasNum =
-        significantNums.length > 0 &&
-        significantNums.some(
-          (n) =>
-            text.includes(n)
-        );
-
-      const matchedSpecific =
-        specificAnswerTerms.filter(
-          (t) =>
-            text.includes(t)
-        );
-
-      const ratio =
-        specificAnswerTerms.length >
-        0
-          ? matchedSpecific.length /
-            specificAnswerTerms.length
-          : 0;
-
-      const matchesQ =
-        requiredQTerms.length === 0 ||
-        requiredQTerms.some(
-          (qt) =>
-            text.includes(qt)
-        );
-
-      return (
-        matchesQ &&
-        (
-          hasNum ||
-          ratio >= 0.25 ||
-          (
-            matchedSpecific.length >= 3 &&
-            ratio >= 0.15
-          )
-        )
-      );
+  const supported = sources.filter((source) => {
+    if (targetPage !== null && source.pageNumber !== targetPage) {
+      return false;
     }
-  );
 
-  if (supported.length <= 1) {
-    return supported.length > 0
-      ? supported
-      : sources.slice(0, 1);
-  }
-
-  // Document-level relevance clustering.
-  const docScoreMap =
-    new Map();
-
-  for (const s of supported) {
     const chunk =
       retrievedChunks?.find(
         (c) =>
-          c.documentName ===
-            s.documentName &&
-          c.pageNumber ===
-            s.pageNumber
+          c.documentName === source.documentName &&
+          c.pageNumber === source.pageNumber &&
+          (source.chunkIndex === undefined || c.chunkIndex === source.chunkIndex)
+      ) ||
+      retrievedChunks?.find(
+        (c) =>
+          c.documentName === source.documentName &&
+          c.pageNumber === source.pageNumber
       );
 
-    const text = (
-      chunk?.content ||
-      s.snippet ||
-      ""
-    ).toLowerCase();
+    const rawText = (chunk?.content || source.snippet || "").toLowerCase();
+    const text = rawText.replace(/(?<=\d),(?=\d)/g, "");
 
-    const matchedCount =
-      specificAnswerTerms.filter(
-        (t) =>
-          text.includes(t)
-      ).length;
+    const hasNum =
+      significantNums.length > 0 &&
+      significantNums.some((n) => text.includes(n));
 
-    docScoreMap.set(
-      s.documentName,
-      Math.max(
-        docScoreMap.get(
-          s.documentName
-        ) || 0,
-        matchedCount
-      )
-    );
+    const matchedSpecific = specificAnswerTerms.filter((t) => text.includes(t));
+    const ratio =
+      specificAnswerTerms.length > 0
+        ? matchedSpecific.length / specificAnswerTerms.length
+        : 0;
+
+    const matchesQ =
+      requiredQTerms.length === 0 ||
+      requiredQTerms.some((qt) => text.includes(qt));
+
+    if (significantNums.length > 0) {
+      return hasNum && matchesQ;
+    }
+
+    return matchesQ && (ratio >= 0.25 || (matchedSpecific.length >= 3 && ratio >= 0.15));
+  });
+
+  const candidateList = supported.length > 0
+    ? supported
+    : (targetPage ? sources.filter((s) => s.pageNumber === targetPage) : sources.slice(0, 1));
+
+  // Task 3: Deduplicate the Sources list by (document, page) and show only pages whose chunks supported the final answer
+  const seenPages = new Set();
+  const deduplicated = [];
+  for (const s of candidateList) {
+    const key = `${s.documentName}_p${s.pageNumber}`;
+    if (!seenPages.has(key)) {
+      seenPages.add(key);
+      deduplicated.push(s);
+    }
   }
 
-  const maxDocScore =
-    Math.max(
-      ...Array.from(
-        docScoreMap.values()
-      ),
-      0
-    );
-
-  const minRequiredMatches =
-    Math.max(
-      3,
-      Math.floor(
-        maxDocScore * 0.5
-      )
-    );
-
-  const refined =
-    supported.filter((s) => {
-      const chunk =
-        retrievedChunks?.find(
-          (c) =>
-            c.documentName ===
-              s.documentName &&
-            c.pageNumber ===
-              s.pageNumber
-        );
-
-      const text = (
-        chunk?.content ||
-        s.snippet ||
-        ""
-      ).toLowerCase();
-
-      const hasNum =
-        significantNums.length > 0 &&
-        significantNums.some(
-          (n) =>
-            text.includes(n)
-        );
-
-      const docScore =
-        docScoreMap.get(
-          s.documentName
-        ) || 0;
-
-      return (
-        hasNum ||
-        docScore >=
-          minRequiredMatches
-      );
-    });
-
-  return refined.length > 0
-    ? refined
-    : supported;
+  return deduplicated;
 }
+
+/**
+ * Task 1d: Warm Ollama models once at server start with keep_alive: "30m"
+ */
+export async function warmOllamaModels() {
+  try {
+    console.log(`[Ollama Warmup] Pre-warming LLM (${ENV.OLLAMA_LLM_MODEL}) and Embeddings (${ENV.OLLAMA_EMBED_MODEL})...`);
+    await Promise.allSettled([
+      axios.post(
+        `${ENV.OLLAMA_BASE_URL}/api/chat`,
+        {
+          model: ENV.OLLAMA_LLM_MODEL,
+          messages: [{ role: "user", content: "warmup" }],
+          stream: false,
+          options: { num_predict: 1 },
+          keep_alive: "30m"
+        },
+        { timeout: 15000 }
+      ),
+      axios.post(
+        `${ENV.OLLAMA_BASE_URL}/api/embeddings`,
+        {
+          model: ENV.OLLAMA_EMBED_MODEL,
+          prompt: "warmup",
+          keep_alive: "30m"
+        },
+        { timeout: 15000 }
+      )
+    ]);
+    console.log(`[Ollama Warmup] Complete. Models pre-warmed in memory with keep_alive: 30m.`);
+  } catch (err) {
+    console.warn(`[Ollama Warmup] Notice: ${err.message}`);
+  }
+}
+
 

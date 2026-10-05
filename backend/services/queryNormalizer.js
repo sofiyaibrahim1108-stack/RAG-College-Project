@@ -61,7 +61,8 @@ CRITICAL: Do NOT answer the question or make assertions. Output ONLY the standal
           temperature: 0.1,
           num_predict: 80,
           num_ctx: 1024
-        }
+        },
+        keep_alive: "30m"
       },
       { timeout: 15000 }
     );
