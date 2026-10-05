@@ -14,6 +14,10 @@ export const RAG_CONFIG = {
   maxContextTextChunks: 2,
   maxContextImageChunks: 1,
   strongEvidenceThreshold: 0.62,
+  entityColumnMinDistinct: 8,
+  fuzzyMinTokenLength: 4,
+  fuzzyMaxEditDistance: 1,
+  fuzzyMaxSuggestions: 3,
   historyWindow: 3, // number of previous messages to consider in context
   llm: {
     temperature: 0.2,

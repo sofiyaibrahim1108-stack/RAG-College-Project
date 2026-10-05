@@ -21,7 +21,7 @@ import {
   formatImageCitations
 } from "../utils/citations.js";
 import { RAG_CONFIG } from "../config/rag.js";
-import { normalizeUserQuery } from "../services/queryNormalizer.js";
+import { rewriteRetry } from "../services/rewriteRetry.js";
 
 
 /**
@@ -168,10 +168,8 @@ export async function askQuestionStream(req, res) {
     timings.history = Date.now() - t0;
 
     const originalQuestion = question.trim();
-    const hasPreviousUserTurns = Array.isArray(history) && history.some((m) => m.role === "user");
-    const effectiveQuestion = hasPreviousUserTurns
-      ? await normalizeUserQuery(originalQuestion, history)
-      : originalQuestion;
+    // The original question always runs first; a rewrite happens only after a failed attempt (see retry below).
+    const effectiveQuestion = originalQuestion;
 
     // ==========================================================
     // 2. DEPARTMENT / QUERY ROUTER
@@ -804,7 +802,7 @@ export async function askQuestionStream(req, res) {
 
       if (tool) {
         const templateAnswer = formatTabularTemplateAnswer(tool, effectiveQuestion);
-        const grounding = validateNumericalGrounding(templateAnswer, tool.summary || context.contextPrompt);
+        const grounding = verifyAnswerGrounding(templateAnswer, tool.summary || context.contextPrompt, effectiveQuestion);
         if (grounding.valid) {
           timings.llm = 0;
           fullAnswer = templateAnswer;
@@ -932,6 +930,57 @@ export async function askQuestionStream(req, res) {
         } else {
           effectiveDepartments = sourceDepts.length > 0 ? sourceDepts : chunkDepts;
         }
+      }
+    }
+
+
+    // ==========================================================
+    // 10B. REWRITE-ON-FAILURE (single retry, only after the first attempt failed)
+    // ==========================================================
+
+    if (
+      isFallbackAnswer(fullAnswer) &&
+      !hasAuthoritativeTabular &&
+      !isStrictVisual &&
+      effectiveQueryType !== "out_of_scope"
+    ) {
+      sendEvent("status", { message: "Rephrasing your question..." });
+      const tRetry = Date.now();
+      const retry = await rewriteRetry({
+        originalQuestion,
+        history,
+        chunks: textChunks,
+        contextPrompt: context.contextPrompt,
+        topSimilarity: evidenceMeta.topSimilarity,
+        gateSupported: gate.supported,
+        generate: (q, ctx, meta) =>
+          streamAnswer(q, ctx, history, null, effectiveQueryType, meta, {})
+      });
+      timings.retry = Date.now() - tRetry;
+
+      if (retry) {
+        fullAnswer = retry.answer;
+        fallbackReason = null;
+        finalSources = filterSupportingSources(
+          retry.sources,
+          fullAnswer,
+          retry.chunks,
+          originalQuestion
+        );
+        finalImageCitations = await resolveMultimodalAttachments({
+          survivingSources: finalSources,
+          retrievedChunks: retry.chunks,
+          maxImages: RAG_CONFIG.topKImages,
+          isFallback: false,
+          question: originalQuestion,
+          finalAnswer: fullAnswer
+        });
+        effectiveDepartments = [
+          ...new Set(
+            (finalSources || []).map((s) => s.department).filter(Boolean)
+          )
+        ];
+        timings.llm = (timings.llm || 0) + timings.retry;
       }
     }
 

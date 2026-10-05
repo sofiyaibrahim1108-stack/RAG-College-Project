@@ -12,7 +12,7 @@ import { buildRAGContext } from "../services/contextBuilder.js";
 import { generateAnswerDetailed, FALLBACK_MESSAGE, isFallbackAnswer, checkEvidenceSupportGate, filterSupportingSources, verifyAnswerGrounding } from "../services/llm.js";
 import { formatSources, formatImageCitations } from "../utils/citations.js";
 import { RAG_CONFIG } from "../config/rag.js";
-import { normalizeUserQuery } from "../services/queryNormalizer.js";
+import { rewriteRetry } from "../services/rewriteRetry.js";
 
 /**
  * 1. Node: loadConversationHistory
@@ -52,22 +52,11 @@ async function loadConversationHistoryNode(state) {
  * Keeps originalQuestion for display and logging.
  */
 async function normalizeQueryNode(state) {
+  // The original question always runs first. A rewrite (with history) happens only after the first
+  // attempt fails, inside generateAnswerNode via rewriteRetry.
   const original = state.originalQuestion || state.question;
-  const history = state.conversationHistory || [];
-  const hasPreviousUserTurns = Array.isArray(history) && history.some((m) => m.role === "user");
-
-  // Requirement 2a: Run the rewrite only when the conversation already has previous user turns (for pronouns/follow-ups).
-  // For first-turn questions, skip it.
-  if (!hasPreviousUserTurns) {
-    return {
-      question: original,
-      originalQuestion: original
-    };
-  }
-
-  const normalized = await normalizeUserQuery(original, history);
   return {
-    question: normalized,
+    question: original,
     originalQuestion: original
   };
 }
@@ -362,17 +351,10 @@ async function generateAnswerNode(state) {
   const gateDuration = Date.now() - tGate;
   console.log(`[Evidence Gate] ${gateDuration}ms (result=${gate.reason}, topSim=${topSimilarity.toFixed(3)})`);
 
-  if (!gate.supported) {
-    console.log(`[Evidence Gate] Question "${state.question}" rejected: ${gate.reason}. Skipping LLM call.`);
-    console.log(`[Generation] 0ms`);
-    return {
-      finalAnswer: FALLBACK_MESSAGE,
-      fallbackReason: gate.reason,
-      sources: [],
-      imageCitations: [],
-      routedDepartments: [],
-      timings: { evidenceGate: gateDuration, generation: 0, llm: 0 }
-    };
+  // A gate rejection is a failed first attempt: skip generation but still allow one rewrite retry.
+  const gateRejected = !gate.supported;
+  if (gateRejected) {
+    console.log(`[Evidence Gate] Question "${state.question}" rejected: ${gate.reason}. Skipping first LLM call.`);
   }
 
   // Task 1b: For a successful deterministic tabular result, build the answer text from a template
@@ -405,43 +387,48 @@ async function generateAnswerNode(state) {
 
   try {
     const tGen = Date.now();
-    let { answer, reason } = await generateAnswerDetailed(
-      state.question,
-      state.contextPrompt,
-      state.conversationHistory,
-      state.queryType,
-      evidenceMeta
-    );
+    let answer = FALLBACK_MESSAGE;
+    let reason = gate.reason;
+    if (!gateRejected) {
+      ({ answer, reason } = await generateAnswerDetailed(
+        state.question,
+        state.contextPrompt,
+        state.conversationHistory,
+        state.queryType,
+        evidenceMeta
+      ));
+    }
     let genDuration = Date.now() - tGen;
     console.log(`[Generation] ${genDuration}ms${reason ? ` (withheld: ${reason})` : ""}`);
 
     let isMissing = isFallbackAnswer(answer);
     let retryDuration = 0;
+    let usedChunks = state.retrievedChunks;
+    let usedSources = state.sources;
 
-    // Task 1e: Run a second generation only when the first answer is the fallback while strong evidence exists.
-    const hasPreviousUserTurns = Array.isArray(state.conversationHistory) && state.conversationHistory.some((m) => m.role === "user");
-    const strongEvidence = topSimilarity >= (RAG_CONFIG.strongEvidenceThreshold || 0.62);
-    if (isMissing && !hasPreviousUserTurns && gate.supported && strongEvidence && (state.retrievedChunks || []).length > 0) {
-      console.log(`[Generation Retry] Fallback on first-turn question "${state.question}". Retrying once with rewritten standalone question...`);
+    // Rewrite only after the first attempt failed (fallback with strong evidence, or follow-up with history).
+    if (isMissing && state.queryType !== "out_of_scope") {
       const tRetry = Date.now();
-      const rewrittenQ = await normalizeUserQuery(state.originalQuestion || state.question, state.conversationHistory, true);
-      if (rewrittenQ && rewrittenQ !== state.question) {
-        const retryResult = await generateAnswerDetailed(
-          rewrittenQ,
-          state.contextPrompt,
-          state.conversationHistory,
-          state.queryType,
-          evidenceMeta
-        );
-        retryDuration = Date.now() - tRetry;
-        if (!isFallbackAnswer(retryResult.answer)) {
-          console.log(`[Generation Retry] Succeeded with rewritten question: "${rewrittenQ}" (${retryDuration}ms)`);
-          answer = retryResult.answer;
-          reason = retryResult.reason;
-          isMissing = false;
+      const retry = await rewriteRetry({
+        originalQuestion: state.originalQuestion || state.question,
+        history: state.conversationHistory,
+        chunks: state.retrievedChunks,
+        contextPrompt: state.contextPrompt,
+        topSimilarity,
+        gateSupported: gate.supported,
+        generate: async (q, ctx, meta) => {
+          const r = await generateAnswerDetailed(q, ctx, state.conversationHistory, state.queryType, meta);
+          reason = r.reason;
+          return r.answer;
         }
-      } else {
-        retryDuration = Date.now() - tRetry;
+      });
+      retryDuration = Date.now() - tRetry;
+      if (retry) {
+        answer = retry.answer;
+        usedChunks = retry.chunks;
+        usedSources = retry.sources;
+        isMissing = false;
+        console.log(`[Generation Retry] ${retryDuration}ms`);
       }
     }
 
@@ -449,7 +436,7 @@ async function generateAnswerNode(state) {
     const fallbackReason = isMissing ? (reason || "insufficient_evidence") : null;
 
     const tGrounding = Date.now();
-    let finalSources = isMissing ? [] : filterSupportingSources(state.sources, finalAnswer, state.retrievedChunks, state.question);
+    let finalSources = isMissing ? [] : filterSupportingSources(usedSources, finalAnswer, usedChunks, state.question);
     const groundingDuration = Date.now() - tGrounding;
     console.log(`[Grounding] ${groundingDuration}ms`);
 
@@ -460,7 +447,7 @@ async function generateAnswerNode(state) {
       // Document QA with shared Multimodal image attachment
       finalImageCitations = await resolveMultimodalAttachments({
         survivingSources: finalSources,
-        retrievedChunks: state.retrievedChunks,
+        retrievedChunks: usedChunks,
         maxImages: RAG_CONFIG.topKImages,
         isFallback: isMissing,
         question: state.originalQuestion || state.question,

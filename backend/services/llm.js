@@ -1628,6 +1628,7 @@ export async function streamAnswer(
     `${ENV.OLLAMA_BASE_URL}/api/chat`,
     {
       model: ENV.OLLAMA_LLM_MODEL,
+      keep_alive: "30m",
       messages,
       stream: true,
       options: {

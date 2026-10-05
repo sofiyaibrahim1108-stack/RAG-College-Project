@@ -4,6 +4,7 @@ import axios from "axios";
 import { Document } from "../models/Document.js";
 import { ENV } from "../config/env.js";
 import { generateTextEmbedding } from "./embeddingService.js";
+import { RAG_CONFIG } from "../config/rag.js";
 
 /**
  * Deterministic tabular tool for CSV / spreadsheet datasets with
@@ -703,6 +704,60 @@ export function describeFilters(filters) {
   return [...byCol.values()].map((parts) => (parts.length > 1 ? `(${parts.join(" OR ")})` : parts[0])).join(" AND ");
 }
 
+/**
+ * Detects a person-like value in the question that matches no row of the entity column.
+ * Entity column = non-numeric column with many alphabetic-only distinct values (schema-derived).
+ * Returns close candidates by token overlap / edit distance against the real column values.
+ */
+export function findEntityMiss(question, colInfo, rows, targetColumn = null) {
+  const minDistinct = RAG_CONFIG.entityColumnMinDistinct ?? 8;
+  const minTokenLen = RAG_CONFIG.fuzzyMinTokenLength ?? 4;
+  const maxEdit = RAG_CONFIG.fuzzyMaxEditDistance ?? 1;
+  const maxSuggestions = RAG_CONFIG.fuzzyMaxSuggestions ?? 3;
+
+  const entityCol = colInfo
+    .filter((c) => !c.isNumeric && c.distinct.length >= minDistinct && c.distinct.every((v) => /^[\p{L}\s.'-]+$/u.test(v)))
+    .sort((a, b) => b.distinct.length - a.distinct.length)[0];
+  if (!entityCol) return null;
+
+  const qTokens = (question.match(/\p{L}+/gu) || [])
+    .filter((t) => t.length >= minTokenLen && !colInfo.some((c) => matchTokenToColumn(t, c.name)));
+  if (qTokens.length === 0) return null;
+
+  const scored = [];
+  const matchedQTokens = new Set();
+  for (const value of entityCol.distinct) {
+    const nameTokens = value.toLowerCase().split(/[\s.'-]+/).filter(Boolean);
+    let matched = 0;
+    let editSum = 0;
+    const used = [];
+    for (const nt of nameTokens) {
+      let best = null;
+      for (const qt of qTokens) {
+        const ql = qt.toLowerCase();
+        const d = ql === nt ? 0 : (nt.length >= minTokenLen && editDistance(ql, nt) <= maxEdit ? editDistance(ql, nt) : null);
+        if (d !== null && (best === null || d < best.d)) best = { d, qt };
+      }
+      if (best) { matched++; editSum += best.d; used.push(best.qt); }
+    }
+    if (matched > 0) scored.push({ value, matched, ratio: matched / nameTokens.length, editSum, used });
+  }
+  if (scored.length === 0) return null;
+
+  scored.sort((a, b) => b.matched - a.matched || b.ratio - a.ratio || a.editSum - b.editSum);
+  const top = scored.slice(0, maxSuggestions);
+  top.forEach((s) => s.used.forEach((u) => matchedQTokens.add(u)));
+  const mentioned = qTokens.filter((t) => matchedQTokens.has(t)).join(" ");
+
+  const targetCol = targetColumn ? colInfo.find((c) => c.name === targetColumn && c.isNumeric) : null;
+  const labelled = top.map((s) => {
+    const row = rows.find((r) => String(r[entityCol.name]).trim() === s.value);
+    return targetCol && row ? `${s.value} (${row[targetCol.name]})` : s.value;
+  });
+  const message = `I couldn't find ${mentioned}. Did you mean ${labelled.join(" or ")}?`;
+  return { column: entityCol.name, message, candidates: top.map((s) => s.value) };
+}
+
 // ---------- main entry point ----------
 
 export async function processTabularQuery(question = "", targetDepartments = [], targetDocuments = [], fallbackQuestion = "") {
@@ -800,6 +855,23 @@ export async function processTabularQuery(question = "", targetDepartments = [],
       error: validation.reason,
       summary: `The table tool could not compute this: ${validation.reason}. Available columns in ${documentName}: ${columns.join(", ")}.`
     };
+  }
+
+  // 3b. Name-like value that matches no row: never fall back to an unfiltered aggregate
+  if (validation.filters.length === 0) {
+    const miss = findEntityMiss(question, colInfo, rows, validation.target ? validation.target.name : null);
+    if (miss) {
+      logTabularSemanticDebug(miss.message, "entity_not_found", 0);
+      return {
+        ...base,
+        success: true,
+        operation: "entity_not_found",
+        computedValue: miss.message,
+        rowsUsed: 0,
+        candidates: miss.candidates,
+        summary: miss.message
+      };
+    }
   }
 
   // 4. Apply validated filters
@@ -1043,6 +1115,10 @@ export function formatTabularTemplateAnswer(tabularResult, question = "") {
   }
 
   const { operation, column, computedValue, records, filters, summary } = tabularResult;
+
+  if (operation === "entity_not_found") {
+    return computedValue;
+  }
 
   if (operation === "filter") {
     const filterDesc = describeFilters(filters);
